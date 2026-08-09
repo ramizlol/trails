@@ -35,10 +35,6 @@ DEFAULT_LON = -112.091148
 # The source DEM is still ~30 m resolution.
 ELEVATION_SAMPLE_SPACING_M = 5.0
 
-# Smooth the 5 m samples across ~55 m before accumulating ascent/descent.
-# This reduces staircase/noise inflation from repeatedly sampling a ~30 m DEM.
-ELEVATION_SMOOTHING_POINTS = 11
-
 # GPX points within this distance of an allowed trail count as covered.
 GPX_TRAIL_MATCH_TOLERANCE_M = 25.0
 
@@ -92,8 +88,8 @@ def get_route_profile(target_distance_miles: float):
         return {
             "name": "short-closed-beam",
             "search_radius_m": 1800,
-            "beam_width": 1800,
-            "beam_max_steps": 140,
+            "beam_width": 1200,
+            "beam_max_steps": 120,
         }
 
     if target_distance_miles < 8.0:
@@ -454,23 +450,10 @@ def densify_polyline(coords, spacing_m=ELEVATION_SAMPLE_SPACING_M):
 # DEM SMOOTHING / ASCENT
 # ============================================================
 
-def smooth_elevations(values, window_points=ELEVATION_SMOOTHING_POINTS):
-    """
-    Centered moving average used for both generated routes and GPX analysis.
-
-    With 5 m samples and an 11-point window, the effective smoothing width is
-    about 55 m. This is intentionally wider than one 30 m DEM cell so small
-    raster stair-steps are less likely to be counted as real climbing.
-    """
+def smooth_elevations(values, radius=2):
     if len(values) < 3:
         return [float(v) for v in values]
 
-    window_points = max(1, int(window_points))
-
-    if window_points % 2 == 0:
-        window_points += 1
-
-    radius = window_points // 2
     result = []
 
     for i in range(len(values)):
@@ -631,98 +614,6 @@ def elevations_for_coords(coords):
     return values
 
 
-def route_raw_elevation_samples(G, route_nodes):
-    """
-    Concatenate the raw 5 m DEM samples from every traversed edge into one
-    continuous route profile. This is deliberately done BEFORE smoothing so
-    edge boundaries cannot create artificial ascent/descent resets.
-    """
-    route_coords = []
-    route_elevations = []
-
-    for i in range(len(route_nodes) - 1):
-        u = route_nodes[i]
-        v = route_nodes[i + 1]
-        edge = get_shortest_edge(G, u, v)
-
-        if edge is None:
-            continue
-
-        edge_coords = edge.get("dem_sample_coords")
-        edge_elevations = edge.get("dem_raw_elevations_m")
-
-        # Fallback for any graph created before these cached fields existed.
-        if not edge_coords or not edge_elevations:
-            edge_coords = densify_polyline(
-                oriented_edge_coords(G, u, v, edge),
-                ELEVATION_SAMPLE_SPACING_M,
-            )
-            edge_elevations = elevations_for_coords(edge_coords)
-
-        edge_coords = list(edge_coords)
-        edge_elevations = [float(value) for value in edge_elevations]
-
-        if not edge_coords or not edge_elevations:
-            continue
-
-        # Adjacent directed edges normally share the junction sample.
-        # Drop that one duplicate so it is not over-weighted by smoothing.
-        start_index = 0
-
-        if route_coords:
-            last_lon, last_lat = route_coords[-1]
-            first_lon, first_lat = edge_coords[0]
-
-            if haversine_meters(
-                last_lat,
-                last_lon,
-                first_lat,
-                first_lon,
-            ) < 0.5:
-                start_index = 1
-
-        route_coords.extend(edge_coords[start_index:])
-        route_elevations.extend(edge_elevations[start_index:])
-
-    return route_coords, route_elevations
-
-
-def route_elevation_metrics(G, route_nodes):
-    """
-    Calculate final route ascent/descent from one continuous DEM profile.
-
-    This is the authoritative elevation calculation for generated routes.
-    Edge-level ascent is retained only as a cheap beam-search heuristic.
-    """
-    coords, raw_elevations = route_raw_elevation_samples(G, route_nodes)
-
-    if len(raw_elevations) < 2:
-        return {
-            "ascent_m": 0.0,
-            "descent_m": 0.0,
-            "sample_count": len(raw_elevations),
-            "raw_elevations_m": raw_elevations,
-            "smoothed_elevations_m": raw_elevations,
-            "coords": coords,
-        }
-
-    smoothed = smooth_elevations(
-        raw_elevations,
-        window_points=ELEVATION_SMOOTHING_POINTS,
-    )
-
-    ascent_m, descent_m = calculate_ascent_descent(smoothed)
-
-    return {
-        "ascent_m": float(ascent_m),
-        "descent_m": float(descent_m),
-        "sample_count": len(raw_elevations),
-        "raw_elevations_m": raw_elevations,
-        "smoothed_elevations_m": smoothed,
-        "coords": coords,
-    }
-
-
 # ============================================================
 # ADD ELEVATION TO GRAPH EDGES
 # ============================================================
@@ -783,18 +674,8 @@ def add_local_dem_edge_elevations(G):
             )
             elevations.append(float(elevation_lookup[sample_key]))
 
-        # Keep the raw samples on each directed edge. Generated routes later
-        # concatenate these into one continuous profile and smooth only once.
-        G[u][v][key]["dem_sample_coords"] = list(samples)
-        G[u][v][key]["dem_raw_elevations_m"] = list(elevations)
-
-        # Edge ascent is only a beam-search heuristic. The final route gain is
-        # always recalculated across the whole continuous route profile.
-        heuristic_elevations = smooth_elevations(
-            elevations,
-            window_points=ELEVATION_SMOOTHING_POINTS,
-        )
-        ascent, descent = calculate_ascent_descent(heuristic_elevations)
+        elevations = smooth_elevations(elevations, radius=2)
+        ascent, descent = calculate_ascent_descent(elevations)
 
         G[u][v][key]["ascent_m"] = float(ascent)
         G[u][v][key]["descent_m"] = float(descent)
@@ -813,7 +694,6 @@ def download_trail_graph(lat, lon, radius_meters):
         round(float(lon), 5),
         int(radius_meters),
         ELEVATION_SAMPLE_SPACING_M,
-        ELEVATION_SMOOTHING_POINTS,
     )
 
     if cache_key in GRAPH_CACHE:
@@ -1000,12 +880,7 @@ def count_immediate_reversals(route_nodes):
 
 def route_score(G, route_nodes, target_distance_meters, target_gain_meters):
     total_distance = path_distance_meters(G, route_nodes)
-
-    # Authoritative final elevation calculation: concatenate the entire route's
-    # raw 5 m DEM samples, smooth once across the full route, then accumulate.
-    elevation_metrics = route_elevation_metrics(G, route_nodes)
-    actual_gain = elevation_metrics["ascent_m"]
-    actual_descent = elevation_metrics["descent_m"]
+    actual_gain = path_gain_meters(G, route_nodes)
 
     if total_distance <= 0:
         return float("inf"), {}
@@ -1045,8 +920,6 @@ def route_score(G, route_nodes, target_distance_meters, target_gain_meters):
         {
             "total_distance_meters": total_distance,
             "actual_gain_meters": actual_gain,
-            "actual_descent_meters": actual_descent,
-            "route_elevation_sample_count": elevation_metrics["sample_count"],
             "distance_error_meters": distance_error,
             "gain_error_meters": gain_error,
             "repeated_edges": repeated_edges,
@@ -1098,13 +971,15 @@ def beam_search_short_loop(
         limits["distance_error_limit_miles"] * METERS_PER_MILE
     )
 
+    allowed_gain_error_m = (
+        limits["gain_error_limit_ft"] / FEET_PER_METER
+    )
+
     max_acceptable_distance = (
         target_distance_meters + allowed_distance_error_m
     )
 
-    # IMPORTANT: there is intentionally NO hard elevation prune here.
-    # Partial edge gain is only a heuristic because edge-by-edge DEM ascent can
-    # differ from the final whole-route smoothed elevation calculation.
+    max_allowed_gain = target_gain_meters + allowed_gain_error_m
 
     beam_width = profile["beam_width"]
     max_steps = profile["beam_max_steps"]
@@ -1153,6 +1028,9 @@ def beam_search_short_loop(
                 new_gain = state["gain"] + edge_gain
 
                 if new_distance > max_acceptable_distance:
+                    continue
+
+                if new_gain > max_allowed_gain:
                     continue
 
                 edge_key = undirected_edge_key(current, neighbor)
@@ -1299,16 +1177,14 @@ def beam_search_short_loop(
                     20.0,
                 )
 
-                # Elevation affects ranking, but never permanently deletes a
-                # state. Distance feasibility remains the only major hard prune.
                 priority = (
-                    projected_distance_error * 3.0
-                    + gain_density_error * 0.65
-                    + gain_progress_error * 0.45
-                    + gain_overshoot_ratio * 0.90
-                    + repeat_ratio * 0.25
+                    projected_distance_error * 2.2
+                    + gain_density_error * 1.4
+                    + gain_progress_error * 1.0
+                    + gain_overshoot_ratio * 4.0
+                    + repeat_ratio * 0.30
                     + node_revisit_penalty
-                    + reversals * 0.025
+                    + reversals * 0.03
                 )
 
                 expanded.append(
@@ -1339,9 +1215,7 @@ def beam_search_short_loop(
             previous_node = route[-2] if len(route) >= 2 else None
 
             distance_bucket = int(state["distance"] / 20.0)
-            # Coarser gain buckets keep several structurally different paths
-            # alive without letting noisy heuristic gain dominate deduplication.
-            gain_bucket = int(state["gain"] / 5.0)
+            gain_bucket = int(state["gain"] / 1.0)
             repeat_bucket = int(state["repeat_distance"] / 20.0)
 
             bucket = (
@@ -1395,9 +1269,8 @@ def beam_search_short_loop(
         status_code=400,
         detail=(
             "The beam search never found a closed loop inside the allowed "
-            "distance search space. Elevation is no longer hard-pruned. Use "
-            "Analyze GPX below with a manual route to compare the same DEM and "
-            "allowed trail network."
+            "distance/gain search space. Use Analyze GPX below with a manual "
+            "route to diagnose which search rule is excluding it."
         ),
     )
 
@@ -1786,7 +1659,7 @@ async def analyze_gpx(
         raw_dem_elevations = elevations_for_coords(dense_coords)
         smoothed_dem_elevations = smooth_elevations(
             raw_dem_elevations,
-            window_points=ELEVATION_SMOOTHING_POINTS,
+            radius=2,
         )
 
         ascent_m, descent_m = calculate_ascent_descent(
@@ -1902,10 +1775,7 @@ async def analyze_gpx(
             "graph_from_cache": graph_from_cache,
             "graph_elevation_samples": unique_elevation_samples,
             "elevation_sample_spacing_m": ELEVATION_SAMPLE_SPACING_M,
-            "elevation_smoothing_window_points": ELEVATION_SMOOTHING_POINTS,
-            "elevation_smoothing_window_m_approx": round(
-                ELEVATION_SMOOTHING_POINTS * ELEVATION_SAMPLE_SPACING_M
-            ),
+            "elevation_smoothing_window_points": 5,
             "elevation_source": os.path.basename(DEM_PATH),
             "route": [
                 {
@@ -2022,10 +1892,6 @@ def dem_info():
                 "y": abs(src.transform.e),
             },
             "elevation_sample_spacing_m": ELEVATION_SAMPLE_SPACING_M,
-            "elevation_smoothing_window_points": ELEVATION_SMOOTHING_POINTS,
-            "elevation_smoothing_window_m_approx": round(
-                ELEVATION_SMOOTHING_POINTS * ELEVATION_SAMPLE_SPACING_M
-            ),
         }
 
 
@@ -2178,10 +2044,6 @@ def generate_route(request: RouteRequest):
             metrics["actual_gain_meters"] * FEET_PER_METER
         )
 
-        actual_descent_ft = (
-            metrics.get("actual_descent_meters", 0.0) * FEET_PER_METER
-        )
-
         distance_error_miles = abs(
             route_distance_miles - request.target_distance_miles
         )
@@ -2202,7 +2064,6 @@ def generate_route(request: RouteRequest):
             "distance_error_miles": round(distance_error_miles, 2),
             "requested_gain_ft": request.target_gain_ft,
             "actual_gain_ft": round(actual_gain_ft),
-            "actual_descent_ft": round(actual_descent_ft),
             "elevation_error_ft": round(elevation_error_ft),
             "route_type": route_type,
             "search_method": search_method,
@@ -2233,15 +2094,7 @@ def generate_route(request: RouteRequest):
             "filtered_edges_removed": filtered_edges_removed,
             "graph_from_cache": graph_from_cache,
             "unique_elevation_samples": unique_elevation_samples,
-            "route_elevation_samples": metrics.get(
-                "route_elevation_sample_count",
-                0,
-            ),
             "elevation_sample_spacing_m": ELEVATION_SAMPLE_SPACING_M,
-            "elevation_smoothing_window_points": ELEVATION_SMOOTHING_POINTS,
-            "elevation_smoothing_window_m_approx": round(
-                ELEVATION_SMOOTHING_POINTS * ELEVATION_SAMPLE_SPACING_M
-            ),
             "elevation_source": os.path.basename(DEM_PATH),
             "snapped_start_lat": snapped_start_lat,
             "snapped_start_lon": snapped_start_lon,
@@ -2771,7 +2624,6 @@ async function generateRoute() {
             "<b>Distance error:</b> " + result.distance_error_miles + " mi<br><br>" +
             "<b>Elevation target:</b> " + result.requested_gain_ft + " ft<br>" +
             "<b>Actual elevation gain:</b> " + result.actual_gain_ft + " ft<br>" +
-            "<b>Actual descent:</b> " + result.actual_descent_ft + " ft<br>" +
             "<b>Elevation error:</b> " + result.elevation_error_ft + " ft<br><br>" +
             "<b>Search method:</b> " + result.search_method + "<br>" +
             "<b>Route profile:</b> " + result.route_profile + "<br>" +
@@ -2784,11 +2636,8 @@ async function generateRoute() {
             "<b>Immediate reversals:</b> " + result.immediate_reversals + "<br>" +
             "<b>Route score:</b> " + result.route_score + "<br><br>" +
             "<b>Graph cached:</b> " + result.graph_from_cache + "<br>" +
-            "<b>Graph elevation samples:</b> " + result.unique_elevation_samples + "<br>" +
-            "<b>Route elevation samples:</b> " + result.route_elevation_samples + "<br>" +
+            "<b>Elevation samples:</b> " + result.unique_elevation_samples + "<br>" +
             "<b>Elevation sample spacing:</b> ~" + result.elevation_sample_spacing_m + " m<br>" +
-            "<b>Elevation smoothing:</b> " + result.elevation_smoothing_window_points +
-            " points (~" + result.elevation_smoothing_window_m_approx + " m)<br>" +
             '<span class="small">Elevation source: ' + result.elevation_source + "</span>";
 
     } catch (error) {
@@ -2886,8 +2735,7 @@ async function analyzeGpx() {
             "<b>Raw GPX points:</b> " + result.raw_gpx_points + "<br>" +
             "<b>DEM sample points:</b> " + result.dem_sample_points + "<br>" +
             "<b>Elevation sample spacing:</b> ~" + result.elevation_sample_spacing_m + " m<br>" +
-            "<b>Elevation smoothing window:</b> " + result.elevation_smoothing_window_points +
-            " points (~" + result.elevation_smoothing_window_m_approx + " m)<br>" +
+            "<b>Elevation smoothing window:</b> " + result.elevation_smoothing_window_points + " points<br>" +
             '<span class="small">Blue = manual GPX, red = generated route, gray = allowed trail network.</span>';
 
     } catch (error) {
