@@ -107,10 +107,18 @@ def home():
 # ============================================================
 
 def get_route_profile(target_distance_miles: float):
+
+    # Search radius = 50% of requested route distance.
+    search_radius_m = int(
+        target_distance_miles
+        * 0.5
+        * METERS_PER_MILE
+    )
+
     if target_distance_miles < 4.0:
         return {
             "name": "short-closed-beam",
-            "search_radius_m": 1800,
+            "search_radius_m": search_radius_m,
             "beam_width": 500,
             "beam_max_steps": 80,
             "max_search_seconds": 20.0,
@@ -123,13 +131,11 @@ def get_route_profile(target_distance_miles: float):
     if target_distance_miles < 8.0:
         return {
             "name": "medium-waypoint",
-            "search_radius_m": 2500,
+            "search_radius_m": search_radius_m,
             "attempts": 1200,
             "anchor_counts": [2, 3, 3, 3],
             "min_anchor_distance_m": 150,
             "min_anchor_separation_m": 140,
-            # Generate all attempts cheaply, then run the authoritative
-            # continuous-route DEM calculation only on the best finalists.
             "accurate_finalists": 40,
             "candidate_pool_multiplier": 3,
         }
@@ -137,7 +143,7 @@ def get_route_profile(target_distance_miles: float):
     if target_distance_miles < 15.0:
         return {
             "name": "long-waypoint",
-            "search_radius_m": 3200,
+            "search_radius_m": search_radius_m,
             "attempts": 900,
             "anchor_counts": [3, 4, 4, 4],
             "min_anchor_distance_m": 300,
@@ -148,7 +154,7 @@ def get_route_profile(target_distance_miles: float):
 
     return {
         "name": "ultra-waypoint",
-        "search_radius_m": min(5000, int(target_distance_miles * 300)),
+        "search_radius_m": search_radius_m,
         "attempts": 700,
         "anchor_counts": [4, 4, 5],
         "min_anchor_distance_m": 400,
