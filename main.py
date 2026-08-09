@@ -21,7 +21,7 @@ app = FastAPI()
 # =========================================================
 
 # Your TIFF is in the same folder as main.py.
-DEM_PATH = "output_USGS30m.tif"
+DEM_PATH = "output_USGS10m.tif"
 
 METERS_PER_MILE = 1609.344
 FEET_PER_METER = 3.28084
@@ -30,7 +30,7 @@ SEARCH_RADIUS_METERS = 3000
 
 # Since your DEM is approximately 30 m resolution,
 # sample the trail roughly every 30 m.
-ELEVATION_SAMPLE_SPACING_M = 30.0
+ELEVATION_SAMPLE_SPACING_M = 10.0
 
 # Number of route candidates to test.
 ROUTE_ATTEMPTS = 500
