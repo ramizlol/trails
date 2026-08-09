@@ -3,6 +3,8 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 import osmnx as ox
 import networkx as nx
+import random
+import math
 
 app = FastAPI()
 
@@ -25,20 +27,224 @@ def home():
     }
 
 
+def path_distance_meters(G, route_nodes):
+    total = 0.0
+
+    for i in range(len(route_nodes) - 1):
+        u = route_nodes[i]
+        v = route_nodes[i + 1]
+
+        edge_data = G.get_edge_data(u, v)
+
+        if not edge_data:
+            continue
+
+        shortest_edge = min(
+            edge_data.values(),
+            key=lambda edge: edge.get("length", float("inf"))
+        )
+
+        total += shortest_edge.get("length", 0)
+
+    return total
+
+
+def route_coordinates(G, route_nodes):
+    return [
+        {
+            "lat": float(G.nodes[node]["y"]),
+            "lon": float(G.nodes[node]["x"])
+        }
+        for node in route_nodes
+    ]
+
+
+def generate_distance_loop(
+    G,
+    start_node,
+    target_distance_meters,
+    attempts=500
+):
+    best_route = None
+    best_error = float("inf")
+    best_distance = 0.0
+
+    # We want the outward section to use roughly half
+    # the total distance, then find a path back.
+    outward_target = target_distance_meters * 0.5
+
+    nodes = list(G.nodes)
+
+    for _ in range(attempts):
+
+        current = start_node
+        outward_route = [start_node]
+        outward_distance = 0.0
+
+        visited_edges = set()
+
+        # Random outward exploration
+        for _step in range(250):
+
+            neighbors = list(G.successors(current))
+
+            if not neighbors:
+                break
+
+            candidates = []
+
+            for neighbor in neighbors:
+
+                edge_data = G.get_edge_data(
+                    current,
+                    neighbor
+                )
+
+                if not edge_data:
+                    continue
+
+                edge = min(
+                    edge_data.values(),
+                    key=lambda e: e.get(
+                        "length",
+                        float("inf")
+                    )
+                )
+
+                length = edge.get("length", 0)
+
+                edge_key = (
+                    min(current, neighbor),
+                    max(current, neighbor)
+                )
+
+                # Penalize immediately repeating edges
+                penalty = (
+                    0.2
+                    if edge_key in visited_edges
+                    else 1.0
+                )
+
+                candidates.append(
+                    (
+                        neighbor,
+                        length,
+                        edge_key,
+                        penalty
+                    )
+                )
+
+            if not candidates:
+                break
+
+            weights = [
+                item[3]
+                for item in candidates
+            ]
+
+            chosen = random.choices(
+                candidates,
+                weights=weights,
+                k=1
+            )[0]
+
+            neighbor, length, edge_key, _ = chosen
+
+            outward_route.append(neighbor)
+            outward_distance += length
+            visited_edges.add(edge_key)
+
+            current = neighbor
+
+            # Once reasonably far out,
+            # try connecting back to start.
+            if outward_distance >= outward_target * 0.7:
+
+                try:
+                    return_route = nx.shortest_path(
+                        G,
+                        current,
+                        start_node,
+                        weight="length"
+                    )
+                except nx.NetworkXNoPath:
+                    continue
+
+                return_distance = path_distance_meters(
+                    G,
+                    return_route
+                )
+
+                total_distance = (
+                    outward_distance +
+                    return_distance
+                )
+
+                error = abs(
+                    total_distance -
+                    target_distance_meters
+                )
+
+                if error < best_error:
+
+                    full_route = (
+                        outward_route +
+                        return_route[1:]
+                    )
+
+                    best_route = full_route
+                    best_distance = total_distance
+                    best_error = error
+
+                # Close enough: stop early
+                if error <= 160.9344:
+                    return (
+                        best_route,
+                        best_distance
+                    )
+
+            # Don't wander ridiculously far.
+            if outward_distance > (
+                target_distance_meters * 0.9
+            ):
+                break
+
+    return best_route, best_distance
+
+
 @app.post("/generate-route")
 def generate_route(request: RouteRequest):
-    try:
-        search_radius_meters = 3000
 
-        # Download nearby walkable/trail network from OpenStreetMap
+    try:
+
+        target_distance_meters = (
+            request.target_distance_miles
+            * 1609.344
+        )
+
+        # Make search area scale somewhat
+        # with requested mileage.
+        search_radius_meters = max(
+            3000,
+            min(
+                8000,
+                int(
+                    target_distance_meters
+                    * 0.45
+                )
+            )
+        )
+
         G = ox.graph.graph_from_point(
-            (request.start_lat, request.start_lon),
+            (
+                request.start_lat,
+                request.start_lon
+            ),
             dist=search_radius_meters,
             network_type="walk",
             simplify=True
         )
 
-        # Find graph nodes nearest to requested start/end coordinates
         start_node = ox.distance.nearest_nodes(
             G,
             X=request.start_lon,
@@ -51,61 +257,122 @@ def generate_route(request: RouteRequest):
             Y=request.end_lat
         )
 
-        # Current temporary routing method:
-        # shortest walkable route from start to finish
-        route_nodes = nx.shortest_path(
-            G,
-            start_node,
-            end_node,
-            weight="length"
+        same_point = (
+            abs(
+                request.start_lat -
+                request.end_lat
+            ) < 0.0001
+            and
+            abs(
+                request.start_lon -
+                request.end_lon
+            ) < 0.0001
         )
 
-        # Build route coordinates
-        route_coordinates = []
+        if same_point:
 
-        for node in route_nodes:
-            route_coordinates.append({
-                "lat": float(G.nodes[node]["y"]),
-                "lon": float(G.nodes[node]["x"])
-            })
-
-        # Calculate route distance
-        route_distance_meters = 0.0
-
-        for i in range(len(route_nodes) - 1):
-            u = route_nodes[i]
-            v = route_nodes[i + 1]
-
-            edge_data = G.get_edge_data(u, v)
-
-            if not edge_data:
-                continue
-
-            shortest_edge = min(
-                edge_data.values(),
-                key=lambda edge: edge.get("length", float("inf"))
+            route_nodes, route_distance_meters = (
+                generate_distance_loop(
+                    G,
+                    start_node,
+                    target_distance_meters,
+                    attempts=500
+                )
             )
 
-            route_distance_meters += shortest_edge.get("length", 0)
+            if not route_nodes:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Could not generate a loop "
+                        "near the requested distance."
+                    )
+                )
 
-        route_distance_miles = route_distance_meters / 1609.344
+            route_type = "loop"
+
+        else:
+
+            route_nodes = nx.shortest_path(
+                G,
+                start_node,
+                end_node,
+                weight="length"
+            )
+
+            route_distance_meters = (
+                path_distance_meters(
+                    G,
+                    route_nodes
+                )
+            )
+
+            route_type = "point-to-point"
+
+        route_distance_miles = (
+            route_distance_meters /
+            1609.344
+        )
+
+        distance_error_miles = abs(
+            route_distance_miles -
+            request.target_distance_miles
+        )
 
         return {
-            "requested_distance_miles": request.target_distance_miles,
-            "requested_gain_ft": request.target_gain_ft,
-            "actual_distance_miles": round(route_distance_miles, 2),
-            "route": route_coordinates,
-            "route_nodes": len(route_nodes),
-            "network_nodes": G.number_of_nodes(),
-            "network_edges": G.number_of_edges(),
-            "status": "Route generated"
+            "requested_distance_miles":
+                request.target_distance_miles,
+
+            "requested_gain_ft":
+                request.target_gain_ft,
+
+            "actual_distance_miles":
+                round(
+                    route_distance_miles,
+                    2
+                ),
+
+            "distance_error_miles":
+                round(
+                    distance_error_miles,
+                    2
+                ),
+
+            "route_type":
+                route_type,
+
+            "route":
+                route_coordinates(
+                    G,
+                    route_nodes
+                ),
+
+            "route_nodes":
+                len(route_nodes),
+
+            "network_nodes":
+                G.number_of_nodes(),
+
+            "network_edges":
+                G.number_of_edges(),
+
+            "search_radius_meters":
+                search_radius_meters,
+
+            "status":
+                "Route generated"
         }
 
     except nx.NetworkXNoPath:
         raise HTTPException(
             status_code=400,
-            detail="No connected route was found between those points."
+            detail=(
+                "No connected route was found."
+            )
         )
+
+    except HTTPException:
+        raise
 
     except Exception as e:
         raise HTTPException(
@@ -120,459 +387,409 @@ def route_map():
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="UTF-8">
 
-    <meta
-        name="viewport"
-        content="width=device-width, initial-scale=1.0"
-    >
+<meta charset="UTF-8">
 
-    <title>Trail Running Creator</title>
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
 
-    <link
-        rel="stylesheet"
-        href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
-    >
+<title>Trail Running Creator</title>
 
-    <style>
+<link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+>
 
-        * {
-            box-sizing: border-box;
-        }
+<style>
 
-        body {
-            margin: 0;
-            font-family: Arial, sans-serif;
-            background: #f5f5f5;
-        }
+* {
+    box-sizing: border-box;
+}
 
-        #controls {
-            background: white;
-            padding: 18px;
-            border-bottom: 1px solid #ccc;
-        }
+body {
+    margin: 0;
+    font-family: Arial, sans-serif;
+    background: #f5f5f5;
+}
 
-        h2 {
-            margin-top: 0;
-            margin-bottom: 15px;
-        }
+#controls {
+    padding: 16px;
+    background: white;
+    border-bottom: 1px solid #ccc;
+}
 
-        .input-row {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 12px;
-            margin-bottom: 12px;
-        }
+h2 {
+    margin-top: 0;
+}
 
-        .input-group {
-            display: flex;
-            flex-direction: column;
-        }
+.input-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 12px;
+}
 
-        label {
-            font-size: 13px;
-            margin-bottom: 4px;
-            font-weight: bold;
-        }
+.input-group {
+    display: flex;
+    flex-direction: column;
+}
 
-        input {
-            width: 170px;
-            padding: 8px;
-            border: 1px solid #bbb;
-            border-radius: 4px;
-        }
+label {
+    font-size: 13px;
+    margin-bottom: 4px;
+    font-weight: bold;
+}
 
-        button {
-            padding: 10px 18px;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 15px;
-            background: #222;
-            color: white;
-        }
+input {
+    width: 165px;
+    padding: 8px;
+}
 
-        button:hover {
-            background: #444;
-        }
+button {
+    padding: 10px 18px;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    background: #222;
+    color: white;
+}
 
-        button:disabled {
-            opacity: 0.5;
-            cursor: wait;
-        }
+button:disabled {
+    opacity: 0.5;
+}
 
-        #results {
-            margin-top: 14px;
-            line-height: 1.5;
-        }
+#results {
+    margin-top: 12px;
+    line-height: 1.5;
+}
 
-        #map {
-            height: calc(100vh - 310px);
-            min-height: 500px;
-            width: 100%;
-        }
+#map {
+    height: calc(100vh - 290px);
+    min-height: 500px;
+    width: 100%;
+}
 
-        .error {
-            color: #b00020;
-        }
+.error {
+    color: #b00020;
+}
 
-        .success {
-            color: #166534;
-        }
+.success {
+    color: #166534;
+}
 
-        @media (max-width: 700px) {
+</style>
 
-            input {
-                width: 145px;
-            }
-
-            #map {
-                height: 65vh;
-            }
-
-        }
-
-    </style>
 </head>
 
 <body>
 
 <div id="controls">
 
-    <h2>Trail Running Creator</h2>
+<h2>Trail Running Creator</h2>
 
-    <div class="input-row">
+<div class="input-row">
 
-        <div class="input-group">
-            <label for="start_lat">Start latitude</label>
-            <input
-                id="start_lat"
-                type="number"
-                step="any"
-                value="33.5777"
-            >
-        </div>
+<div class="input-group">
+<label>Start latitude</label>
+<input
+    id="start_lat"
+    type="number"
+    step="any"
+    value="33.5777"
+>
+</div>
 
-        <div class="input-group">
-            <label for="start_lon">Start longitude</label>
-            <input
-                id="start_lon"
-                type="number"
-                step="any"
-                value="-112.0822"
-            >
-        </div>
+<div class="input-group">
+<label>Start longitude</label>
+<input
+    id="start_lon"
+    type="number"
+    step="any"
+    value="-112.0822"
+>
+</div>
 
-        <div class="input-group">
-            <label for="end_lat">End latitude</label>
-            <input
-                id="end_lat"
-                type="number"
-                step="any"
-                value="33.5945"
-            >
-        </div>
+<div class="input-group">
+<label>End latitude</label>
+<input
+    id="end_lat"
+    type="number"
+    step="any"
+    value="33.5777"
+>
+</div>
 
-        <div class="input-group">
-            <label for="end_lon">End longitude</label>
-            <input
-                id="end_lon"
-                type="number"
-                step="any"
-                value="-112.0850"
-            >
-        </div>
-
-    </div>
-
-
-    <div class="input-row">
-
-        <div class="input-group">
-            <label for="distance">Target distance (miles)</label>
-            <input
-                id="distance"
-                type="number"
-                step="0.1"
-                value="10"
-            >
-        </div>
-
-        <div class="input-group">
-            <label for="gain">Target gain (ft)</label>
-            <input
-                id="gain"
-                type="number"
-                step="100"
-                value="2000"
-            >
-        </div>
-
-    </div>
-
-
-    <button id="generateButton">
-        Generate Route
-    </button>
-
-
-    <div id="results">
-        Enter route settings and click Generate Route.
-    </div>
+<div class="input-group">
+<label>End longitude</label>
+<input
+    id="end_lon"
+    type="number"
+    step="any"
+    value="-112.0822"
+>
+</div>
 
 </div>
 
+<div class="input-row">
+
+<div class="input-group">
+<label>Target distance (miles)</label>
+<input
+    id="distance"
+    type="number"
+    step="0.1"
+    value="10"
+>
+</div>
+
+<div class="input-group">
+<label>Target gain (ft)</label>
+<input
+    id="gain"
+    type="number"
+    step="100"
+    value="2000"
+>
+</div>
+
+</div>
+
+<button id="generateButton">
+Generate Route
+</button>
+
+<div id="results">
+Ready.
+</div>
+
+</div>
 
 <div id="map"></div>
 
-
 <script
-    src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js">
+src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js">
 </script>
-
 
 <script>
 
-    const map = L.map("map").setView(
-        [33.586, -112.085],
-        14
+const map = L.map("map").setView(
+    [33.586, -112.085],
+    14
+);
+
+L.tileLayer(
+    "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+    {
+        maxZoom: 19,
+        attribution:
+            "&copy; OpenStreetMap contributors"
+    }
+).addTo(map);
+
+let routeLine = null;
+let startMarker = null;
+let finishMarker = null;
+
+const button =
+    document.getElementById(
+        "generateButton"
     );
 
+button.addEventListener(
+    "click",
+    generateRoute
+);
 
-    L.tileLayer(
-        "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
-        {
-            maxZoom: 19,
-            attribution:
-                "&copy; OpenStreetMap contributors"
+
+async function generateRoute() {
+
+    const results =
+        document.getElementById(
+            "results"
+        );
+
+    const data = {
+
+        start_lat:
+            parseFloat(
+                document.getElementById(
+                    "start_lat"
+                ).value
+            ),
+
+        start_lon:
+            parseFloat(
+                document.getElementById(
+                    "start_lon"
+                ).value
+            ),
+
+        end_lat:
+            parseFloat(
+                document.getElementById(
+                    "end_lat"
+                ).value
+            ),
+
+        end_lon:
+            parseFloat(
+                document.getElementById(
+                    "end_lon"
+                ).value
+            ),
+
+        target_distance_miles:
+            parseFloat(
+                document.getElementById(
+                    "distance"
+                ).value
+            ),
+
+        target_gain_ft:
+            parseFloat(
+                document.getElementById(
+                    "gain"
+                ).value
+            )
+    };
+
+    results.innerHTML =
+        "Generating candidate loops...";
+
+    button.disabled = true;
+
+    try {
+
+        const response = await fetch(
+            "/generate-route",
+            {
+                method: "POST",
+
+                headers: {
+                    "Content-Type":
+                        "application/json"
+                },
+
+                body:
+                    JSON.stringify(data)
+            }
+        );
+
+        const result =
+            await response.json();
+
+        if (!response.ok) {
+
+            throw new Error(
+                result.detail ||
+                "Server error"
+            );
         }
-    ).addTo(map);
 
+        const coordinates =
+            result.route.map(
+                p => [
+                    p.lat,
+                    p.lon
+                ]
+            );
 
-    let routeLine = null;
-    let startMarker = null;
-    let endMarker = null;
+        if (routeLine) {
+            map.removeLayer(
+                routeLine
+            );
+        }
 
+        if (startMarker) {
+            map.removeLayer(
+                startMarker
+            );
+        }
 
-    const generateButton =
-        document.getElementById("generateButton");
+        if (finishMarker) {
+            map.removeLayer(
+                finishMarker
+            );
+        }
 
+        routeLine = L.polyline(
+            coordinates,
+            {
+                weight: 5,
+                opacity: 0.9
+            }
+        ).addTo(map);
 
-    generateButton.addEventListener(
-        "click",
-        generateRoute
-    );
+        startMarker = L.marker(
+            coordinates[0]
+        )
+        .addTo(map)
+        .bindPopup("Start");
 
+        finishMarker = L.marker(
+            coordinates[
+                coordinates.length - 1
+            ]
+        )
+        .addTo(map)
+        .bindPopup("Finish");
 
-    async function generateRoute() {
-
-        const results =
-            document.getElementById("results");
-
-
-        const data = {
-
-            start_lat:
-                parseFloat(
-                    document.getElementById(
-                        "start_lat"
-                    ).value
-                ),
-
-            start_lon:
-                parseFloat(
-                    document.getElementById(
-                        "start_lon"
-                    ).value
-                ),
-
-            end_lat:
-                parseFloat(
-                    document.getElementById(
-                        "end_lat"
-                    ).value
-                ),
-
-            end_lon:
-                parseFloat(
-                    document.getElementById(
-                        "end_lon"
-                    ).value
-                ),
-
-            target_distance_miles:
-                parseFloat(
-                    document.getElementById(
-                        "distance"
-                    ).value
-                ),
-
-            target_gain_ft:
-                parseFloat(
-                    document.getElementById(
-                        "gain"
-                    ).value
-                )
-        };
-
+        map.fitBounds(
+            routeLine.getBounds(),
+            {
+                padding: [30, 30]
+            }
+        );
 
         results.innerHTML =
-            "Downloading trail network and generating route...";
 
-        generateButton.disabled = true;
+            '<span class="success">' +
+            "<b>Route generated</b>" +
+            "</span><br>" +
 
+            "<b>Type:</b> " +
+            result.route_type +
+            "<br>" +
 
-        try {
+            "<b>Target:</b> " +
+            result.requested_distance_miles +
+            " mi<br>" +
 
-            const response = await fetch(
-                "/generate-route",
-                {
-                    method: "POST",
+            "<b>Actual:</b> " +
+            result.actual_distance_miles +
+            " mi<br>" +
 
-                    headers: {
-                        "Content-Type":
-                            "application/json"
-                    },
+            "<b>Difference:</b> " +
+            result.distance_error_miles +
+            " mi<br>" +
 
-                    body: JSON.stringify(data)
-                }
-            );
-
-
-            const result =
-                await response.json();
-
-
-            if (!response.ok) {
-
-                let message =
-                    result.detail ||
-                    "Unknown server error";
-
-                throw new Error(message);
-            }
-
-
-            if (
-                !result.route ||
-                result.route.length === 0
-            ) {
-                throw new Error(
-                    "Server returned an empty route."
-                );
-            }
-
-
-            const coordinates =
-                result.route.map(
-                    point => [
-                        point.lat,
-                        point.lon
-                    ]
-                );
-
-
-            // Remove previous route
-            if (routeLine) {
-                map.removeLayer(routeLine);
-            }
-
-
-            if (startMarker) {
-                map.removeLayer(startMarker);
-            }
-
-
-            if (endMarker) {
-                map.removeLayer(endMarker);
-            }
-
-
-            // Draw continuous route line
-            routeLine = L.polyline(
-                coordinates,
-                {
-                    weight: 5,
-                    opacity: 0.9
-                }
-            ).addTo(map);
-
-
-            // Start marker
-            startMarker = L.marker(
-                coordinates[0]
-            )
-            .addTo(map)
-            .bindPopup("Start");
-
-
-            // Finish marker
-            endMarker = L.marker(
-                coordinates[
-                    coordinates.length - 1
-                ]
-            )
-            .addTo(map)
-            .bindPopup("Finish");
-
-
-            // Zoom map to entire route
-            map.fitBounds(
-                routeLine.getBounds(),
-                {
-                    padding: [40, 40]
-                }
-            );
-
-
-            results.innerHTML =
-
-                '<span class="success">' +
-                "<b>Route generated</b>" +
-                "</span><br>" +
-
-                "<b>Actual distance:</b> " +
-                result.actual_distance_miles +
-                " miles<br>" +
-
-                "<b>Requested distance:</b> " +
-                result.requested_distance_miles +
-                " miles<br>" +
-
-                "<b>Requested gain:</b> " +
-                result.requested_gain_ft +
-                " ft<br>" +
-
-                "<b>Route nodes:</b> " +
-                result.route_nodes +
-                "<br>" +
-
-                "<b>Network nodes:</b> " +
-                result.network_nodes +
-                "<br>" +
-
-                "<b>Network edges:</b> " +
-                result.network_edges;
-
-        }
-
-        catch (error) {
-
-            results.innerHTML =
-                '<span class="error">' +
-                "<b>Error:</b> " +
-                error.message +
-                "</span>";
-
-        }
-
-        finally {
-
-            generateButton.disabled = false;
-
-        }
+            "<b>Target elevation:</b> " +
+            result.requested_gain_ft +
+            " ft" +
+            " (not active yet)";
 
     }
+
+    catch (error) {
+
+        results.innerHTML =
+            '<span class="error">' +
+            "<b>Error:</b> " +
+            error.message +
+            "</span>";
+
+    }
+
+    finally {
+
+        button.disabled = false;
+
+    }
+
+}
 
 </script>
 
