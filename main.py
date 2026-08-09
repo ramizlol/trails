@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import osmnx as ox
+import networkx as nx
 
 app = FastAPI()
 
@@ -16,20 +17,16 @@ class RouteRequest(BaseModel):
 
 @app.get("/")
 def home():
-    return {
-        "status": "Trail Running Creator API is running"
-    }
+    return {"status": "Trail Running Creator API is running"}
 
 
 @app.post("/generate-route")
 def generate_route(request: RouteRequest):
 
     try:
-        # Search radius around the starting point.
-        # 8,000 meters = about 5 miles in every direction.
-        search_radius_meters = 2000
+        search_radius_meters = 3000
 
-        # Download the walkable OpenStreetMap network around the start.
+        # Download nearby walkable/trail network
         G = ox.graph.graph_from_point(
             (request.start_lat, request.start_lon),
             dist=search_radius_meters,
@@ -37,7 +34,7 @@ def generate_route(request: RouteRequest):
             simplify=True
         )
 
-        # Find nearest graph nodes to the requested start/end coordinates.
+        # Find graph nodes closest to requested coordinates
         start_node = ox.distance.nearest_nodes(
             G,
             X=request.start_lon,
@@ -50,30 +47,63 @@ def generate_route(request: RouteRequest):
             Y=request.end_lat
         )
 
+        # Find shortest walkable route
+        route_nodes = nx.shortest_path(
+            G,
+            start_node,
+            end_node,
+            weight="length"
+        )
+
+        # Build coordinate list
+        route_coordinates = []
+
+        for node in route_nodes:
+            route_coordinates.append({
+                "lat": G.nodes[node]["y"],
+                "lon": G.nodes[node]["x"]
+            })
+
+        # Calculate route distance
+        route_distance_meters = 0
+
+        for i in range(len(route_nodes) - 1):
+
+            u = route_nodes[i]
+            v = route_nodes[i + 1]
+
+            edge_data = G.get_edge_data(u, v)
+
+            shortest_edge = min(
+                edge_data.values(),
+                key=lambda edge: edge.get("length", float("inf"))
+            )
+
+            route_distance_meters += shortest_edge.get("length", 0)
+
+        route_distance_miles = route_distance_meters / 1609.344
+
         return {
             "requested_distance_miles": request.target_distance_miles,
             "requested_gain_ft": request.target_gain_ft,
 
-            "start": {
-                "lat": request.start_lat,
-                "lon": request.start_lon
-            },
+            "actual_distance_miles": round(route_distance_miles, 2),
 
-            "end": {
-                "lat": request.end_lat,
-                "lon": request.end_lon
-            },
+            "route": route_coordinates,
 
-            "osm_start_node": int(start_node),
-            "osm_end_node": int(end_node),
+            "route_nodes": len(route_nodes),
 
             "network_nodes": G.number_of_nodes(),
             "network_edges": G.number_of_edges(),
 
-            "search_radius_meters": search_radius_meters,
-
-            "status": "Trail network successfully downloaded"
+            "status": "Route generated"
         }
+
+    except nx.NetworkXNoPath:
+        raise HTTPException(
+            status_code=400,
+            detail="No connected trail route was found."
+        )
 
     except Exception as e:
         raise HTTPException(
