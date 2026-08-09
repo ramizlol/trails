@@ -43,7 +43,13 @@ GPX_TRAIL_MATCH_TOLERANCE_M = 25.0
 MAX_CACHED_GRAPHS = 5
 GRAPH_CACHE = {}
 
-APP_VERSION = "2026-08-09-exact-gpx-start-v4-gpx-export"
+# Cache DEM values by rounded lat/lon. Graph construction already samples
+# most trail points, so later route scoring can reuse those values instead
+# of reopening/resampling the GeoTIFF for every finalist.
+DEM_POINT_CACHE = {}
+MAX_DEM_POINT_CACHE = 250000
+
+APP_VERSION = "2026-08-09-v6-fast-waypoint-coros-gpx"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
 
@@ -112,6 +118,10 @@ def get_route_profile(target_distance_miles: float):
             "anchor_counts": [2, 3, 3, 3],
             "min_anchor_distance_m": 150,
             "min_anchor_separation_m": 140,
+            # Generate all attempts cheaply, then run the authoritative
+            # continuous-route DEM calculation only on the best finalists.
+            "accurate_finalists": 40,
+            "candidate_pool_multiplier": 3,
         }
 
     if target_distance_miles < 15.0:
@@ -122,6 +132,8 @@ def get_route_profile(target_distance_miles: float):
             "anchor_counts": [3, 4, 4, 4],
             "min_anchor_distance_m": 300,
             "min_anchor_separation_m": 250,
+            "accurate_finalists": 50,
+            "candidate_pool_multiplier": 3,
         }
 
     return {
@@ -131,6 +143,8 @@ def get_route_profile(target_distance_miles: float):
         "anchor_counts": [4, 4, 5],
         "min_anchor_distance_m": 400,
         "min_anchor_separation_m": 300,
+        "accurate_finalists": 60,
+        "candidate_pool_multiplier": 3,
     }
 
 
@@ -817,6 +831,13 @@ def dem_value_to_meters(src, value):
 # ============================================================
 
 def sample_dem_points(points):
+    """
+    Return DEM elevation values for lon/lat points.
+
+    Values are cached by rounded coordinate. This preserves the exact same
+    DEM source and precision while avoiding repeated raster reads during
+    finalist scoring.
+    """
     if not os.path.exists(DEM_PATH):
         raise HTTPException(
             status_code=500,
@@ -824,7 +845,6 @@ def sample_dem_points(points):
         )
 
     unique = {}
-
     for lon, lat in points:
         key = (
             round(float(lat), 7),
@@ -832,88 +852,102 @@ def sample_dem_points(points):
         )
         unique[key] = (float(lon), float(lat))
 
-    keys = list(unique.keys())
-    lons = [unique[key][0] for key in keys]
-    lats = [unique[key][1] for key in keys]
+    lookup = {}
+    missing = {}
 
-    with rasterio.open(DEM_PATH) as src:
-        if src.crs is None:
-            raise HTTPException(
-                status_code=500,
-                detail="DEM has no CRS information.",
+    for key, point in unique.items():
+        if key in DEM_POINT_CACHE:
+            lookup[key] = float(DEM_POINT_CACHE[key])
+        else:
+            missing[key] = point
+
+    if missing:
+        keys = list(missing.keys())
+        lons = [missing[key][0] for key in keys]
+        lats = [missing[key][1] for key in keys]
+
+        with rasterio.open(DEM_PATH) as src:
+            if src.crs is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail="DEM has no CRS information.",
+                )
+
+            xs, ys = rio_transform(
+                "EPSG:4326",
+                src.crs,
+                lons,
+                lats,
             )
 
-        xs, ys = rio_transform(
-            "EPSG:4326",
-            src.crs,
-            lons,
-            lats,
-        )
+            outside = []
+            for key, x, y in zip(keys, xs, ys):
+                if not (
+                    src.bounds.left <= x <= src.bounds.right
+                    and src.bounds.bottom <= y <= src.bounds.top
+                ):
+                    outside.append(key)
 
-        outside = []
+            if outside:
+                first_lat, first_lon = outside[0]
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "DEM does not cover the entire requested area. "
+                        f"First uncovered point: {first_lat}, {first_lon}"
+                    ),
+                )
 
-        for key, x, y in zip(keys, xs, ys):
-            if not (
-                src.bounds.left <= x <= src.bounds.right
-                and src.bounds.bottom <= y <= src.bounds.top
-            ):
-                outside.append(key)
-
-        if outside:
-            first_lat, first_lon = outside[0]
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    "DEM does not cover the entire requested area. "
-                    f"First uncovered point: {first_lat}, {first_lon}"
-                ),
+            samples = list(
+                src.sample(
+                    zip(xs, ys),
+                    indexes=1,
+                    masked=True,
+                )
             )
 
-        samples = list(
-            src.sample(
-                zip(xs, ys),
-                indexes=1,
-                masked=True,
-            )
-        )
+            for key, sample in zip(keys, samples):
+                value = sample[0]
 
-        lookup = {}
+                if np.ma.is_masked(value):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="DEM contains NoData.",
+                    )
 
-        for key, sample in zip(keys, samples):
-            value = sample[0]
+                value = float(value)
 
-            if np.ma.is_masked(value):
-                raise HTTPException(
-                    status_code=400,
-                    detail="DEM contains NoData.",
-                )
+                if not math.isfinite(value):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="DEM returned invalid elevation.",
+                    )
 
-            value = float(value)
+                if (
+                    src.nodata is not None
+                    and math.isclose(
+                        value,
+                        float(src.nodata),
+                        rel_tol=0.0,
+                        abs_tol=1e-6,
+                    )
+                ):
+                    raise HTTPException(
+                        status_code=400,
+                        detail="DEM contains NoData.",
+                    )
 
-            if not math.isfinite(value):
-                raise HTTPException(
-                    status_code=400,
-                    detail="DEM returned invalid elevation.",
-                )
+                meters = dem_value_to_meters(src, value)
+                lookup[key] = meters
 
-            if (
-                src.nodata is not None
-                and math.isclose(
-                    value,
-                    float(src.nodata),
-                    rel_tol=0.0,
-                    abs_tol=1e-6,
-                )
-            ):
-                raise HTTPException(
-                    status_code=400,
-                    detail="DEM contains NoData.",
-                )
+                # Keep the cache bounded. Clearing is intentionally simple;
+                # the graph cache still prevents expensive network rebuilds.
+                if len(DEM_POINT_CACHE) >= MAX_DEM_POINT_CACHE:
+                    DEM_POINT_CACHE.clear()
 
-            lookup[key] = dem_value_to_meters(src, value)
+                DEM_POINT_CACHE[key] = meters
 
     return lookup
-
 
 def elevations_for_coords(coords):
     lookup = sample_dem_points(coords)
@@ -1914,6 +1948,60 @@ def waypoint_path(S, source, target, used_edges):
     )
 
 
+def cheap_waypoint_score(
+    G,
+    route_nodes,
+    target_distance_meters,
+    target_gain_meters,
+):
+    """
+    Fast exploratory score using values already stored on graph edges.
+
+    This intentionally avoids route geometry densification and GeoTIFF reads.
+    Finalists are rescored later with the authoritative continuous-route DEM
+    calculation, so this is only a ranking heuristic.
+    """
+    total_distance = path_distance_meters(G, route_nodes)
+    approximate_gain = path_gain_meters(G, route_nodes)
+
+    if total_distance <= 0:
+        return float("inf"), {}
+
+    distance_ratio = abs(total_distance - target_distance_meters) / max(
+        target_distance_meters,
+        1.0,
+    )
+
+    if target_gain_meters > 0:
+        gain_ratio = abs(approximate_gain - target_gain_meters) / target_gain_meters
+    else:
+        gain_ratio = approximate_gain / 30.48
+
+    repeated_edges, repeated_distance = repeated_edge_stats(G, route_nodes)
+    repeat_ratio = repeated_distance / max(total_distance, 1.0)
+    repeated_nodes = repeated_node_occurrences(route_nodes)
+    immediate_reversals = count_immediate_reversals(route_nodes)
+
+    # Distance and approximate elevation are the primary exploratory goals.
+    # Repetition remains a meaningful but secondary penalty.
+    score = (
+        distance_ratio * 190.0
+        + gain_ratio * 150.0
+        + repeat_ratio * 170.0
+        + repeated_nodes * 12.0
+        + immediate_reversals * 10.0
+    )
+
+    return score, {
+        "total_distance_meters": total_distance,
+        "approximate_gain_meters": approximate_gain,
+        "repeated_edges": repeated_edges,
+        "repeated_distance_meters": repeated_distance,
+        "repeated_nodes": repeated_nodes,
+        "immediate_reversals": immediate_reversals,
+    }
+
+
 def generate_waypoint_loop(
     G,
     start_node,
@@ -1922,6 +2010,17 @@ def generate_waypoint_loop(
     profile,
     limits,
 ):
+    """
+    Two-stage waypoint search for 4+ mile loops.
+
+    Stage 1:
+      Generate every configured waypoint attempt and score it cheaply using
+      edge length + cached edge ascent. No whole-route DEM sampling occurs.
+
+    Stage 2:
+      Rescore only the best diverse finalists using the authoritative
+      continuous 5 m DEM profile + ~55 m smoothing.
+    """
     S = make_simple_routing_graph(G)
 
     start_lat = float(G.nodes[start_node]["y"])
@@ -1957,13 +2056,12 @@ def generate_waypoint_loop(
             detail="Not enough trail junctions for this route.",
         )
 
-    best_route = None
-    best_metrics = None
-    best_score = float("inf")
+    accurate_finalists = int(profile.get("accurate_finalists", 40))
+    pool_multiplier = int(profile.get("candidate_pool_multiplier", 3))
+    pool_limit = max(accurate_finalists, accurate_finalists * pool_multiplier)
 
-    best_any_route = None
-    best_any_metrics = None
-    best_any_score = float("inf")
+    exploratory = []
+    seen_routes = set()
 
     for _ in range(profile["attempts"]):
         anchor_count = random.choice(profile["anchor_counts"])
@@ -2035,20 +2133,99 @@ def generate_waypoint_loop(
         if failed:
             continue
 
-        score, metrics = route_score(
+        route_key = tuple(route)
+        if route_key in seen_routes:
+            continue
+        seen_routes.add(route_key)
+
+        cheap_score, cheap_metrics = cheap_waypoint_score(
             G,
             route,
             target_distance_meters,
             target_gain_meters,
         )
 
-        distance = metrics["total_distance_meters"]
+        distance = cheap_metrics.get("total_distance_meters", 0.0)
 
         if (
             distance < target_distance_meters * 0.72
             or distance > target_distance_meters * 1.25
         ):
             continue
+
+        # Preserve the best cheap candidates. We periodically trim instead of
+        # allowing all 1200 routes to accumulate unnecessarily.
+        exploratory.append((cheap_score, route, cheap_metrics))
+
+        if len(exploratory) > pool_limit * 4:
+            exploratory.sort(key=lambda item: item[0])
+            exploratory = exploratory[:pool_limit]
+
+    if not exploratory:
+        raise HTTPException(
+            status_code=400,
+            detail="No suitable waypoint route found.",
+        )
+
+    exploratory.sort(key=lambda item: item[0])
+
+    # Add simple distance/gain buckets so the exact finalists are not all
+    # near-duplicates of one cheap optimum.
+    finalists = []
+    seen_buckets = set()
+
+    for cheap_score, route, cheap_metrics in exploratory:
+        distance_bucket = int(cheap_metrics["total_distance_meters"] / 100.0)
+        gain_bucket = int(cheap_metrics["approximate_gain_meters"] / 15.0)
+        repeat_bucket = int(cheap_metrics["repeated_distance_meters"] / 100.0)
+        bucket = (distance_bucket, gain_bucket, repeat_bucket)
+
+        if bucket in seen_buckets and len(finalists) >= accurate_finalists // 2:
+            continue
+
+        seen_buckets.add(bucket)
+        finalists.append((cheap_score, route))
+
+        if len(finalists) >= accurate_finalists:
+            break
+
+    # If diversity filtering left too few, fill from the best remaining routes.
+    if len(finalists) < accurate_finalists:
+        selected = {tuple(route) for _, route in finalists}
+        for cheap_score, route, _ in exploratory:
+            if tuple(route) in selected:
+                continue
+            finalists.append((cheap_score, route))
+            selected.add(tuple(route))
+            if len(finalists) >= accurate_finalists:
+                break
+
+    best_route = None
+    best_metrics = None
+    best_score = float("inf")
+
+    best_any_route = None
+    best_any_metrics = None
+    best_any_score = float("inf")
+
+    accurately_scored = 0
+
+    for cheap_score, route in finalists:
+        score, metrics = route_score(
+            G,
+            route,
+            target_distance_meters,
+            target_gain_meters,
+        )
+        accurately_scored += 1
+
+        if not metrics:
+            continue
+
+        metrics["waypoint_attempts"] = profile["attempts"]
+        metrics["waypoint_unique_candidates"] = len(exploratory)
+        metrics["waypoint_accurate_finalists"] = accurately_scored
+        metrics["waypoint_cheap_score"] = cheap_score
 
         if score < best_any_score:
             best_any_score = score
@@ -2073,6 +2250,7 @@ def generate_waypoint_loop(
                 best_metrics = metrics
 
     if best_route is not None:
+        best_metrics["waypoint_accurate_finalists"] = accurately_scored
         return (
             best_route,
             best_metrics,
@@ -2092,16 +2270,16 @@ def generate_waypoint_loop(
             status_code=400,
             detail=(
                 "No route met the requested quality limits. "
-                f"Best candidate was {best_distance:.2f} mi / "
-                f"{round(best_gain)} ft gain."
+                f"Best accurately scored candidate was {best_distance:.2f} mi / "
+                f"{round(best_gain)} ft gain after "
+                f"{accurately_scored} full DEM finalist evaluations."
             ),
         )
 
     raise HTTPException(
         status_code=400,
-        detail="No suitable waypoint route found.",
+        detail="No suitable waypoint route found after finalist scoring.",
     )
-
 
 # ============================================================
 # GPX PARSING / ANALYSIS
@@ -3022,11 +3200,11 @@ def dem_info():
 
 def build_gpx_export_points(coords):
     """
-    Build one dense GPX-ready route profile.
+    Build the COROS GPX track as coordinates only.
 
-    Both downloadable GPX files use these exact same points.
-    The elevation version adds the smoothed DEM elevation as <ele>;
-    the no-elevation version simply omits <ele>.
+    The route is densified to ~5 m for a faithful track shape, but no <ele>
+    values are calculated or embedded. COROS can calculate route elevation
+    using its own processing when the file is imported.
     """
     if not coords or len(coords) < 2:
         return []
@@ -3041,21 +3219,13 @@ def build_gpx_export_points(coords):
         ELEVATION_SAMPLE_SPACING_M,
     )
 
-    raw_elevations = elevations_for_coords(dense)
-    smoothed_elevations = smooth_elevations(
-        raw_elevations,
-        radius=ELEVATION_SMOOTHING_RADIUS,
-    )
-
     return [
         {
             "lat": float(lat),
             "lon": float(lon),
-            "ele_m": round(float(ele), 2),
         }
-        for (lon, lat), ele in zip(dense, smoothed_elevations)
+        for lon, lat in dense
     ]
-
 
 # ============================================================
 # GENERATE ROUTE
@@ -3217,10 +3387,9 @@ def generate_route(request: RouteRequest):
 
         coords = metrics.get("route_coordinates") or route_coordinates(G, route_nodes)
 
-        # Build a single dense export track only after the winning route has
-        # been selected. This does not change the route search. Both GPX
-        # download options use the same points; one includes DEM elevation
-        # and one omits it.
+        # Build the no-elevation COROS GPX track only after the winning route
+        # has been selected. This is geometry-only and performs no extra DEM
+        # raster sampling.
         gpx_export_points = build_gpx_export_points(coords)
 
         return {
@@ -3255,6 +3424,8 @@ def generate_route(request: RouteRequest):
             ),
             "search_steps": search_steps,
             "states_expanded": states_expanded,
+            "waypoint_unique_candidates": metrics.get("waypoint_unique_candidates"),
+            "waypoint_accurate_finalists": metrics.get("waypoint_accurate_finalists"),
             "search_radius_m": profile["search_radius_m"],
             "network_nodes": G.number_of_nodes(),
             "network_edges": G.number_of_edges(),
@@ -3474,8 +3645,7 @@ button:disabled {
 </div>
 
 <button id="generateButton">Generate Trail Route</button>
-<button id="downloadGpxButton" disabled>Download GPX</button>
-<button id="downloadGpxElevationButton" disabled>Download GPX + DEM Elevation</button>
+<button id="downloadGpxButton" disabled>Download GPX for COROS</button>
 <button id="networkButton">Reload Allowed Trails</button>
 
 <div class="network-control">
@@ -3537,7 +3707,6 @@ let snapLine = null;
 
 const generateButton = document.getElementById("generateButton");
 const downloadGpxButton = document.getElementById("downloadGpxButton");
-const downloadGpxElevationButton = document.getElementById("downloadGpxElevationButton");
 const networkButton = document.getElementById("networkButton");
 const analyzeGpxButton = document.getElementById("analyzeGpxButton");
 const testGpxButton = document.getElementById("testGpxButton");
@@ -3546,8 +3715,7 @@ const showNetworkCheckbox = document.getElementById("showNetwork");
 
 
 generateButton.addEventListener("click", generateRoute);
-downloadGpxButton.addEventListener("click", () => downloadGeneratedGpx(false));
-downloadGpxElevationButton.addEventListener("click", () => downloadGeneratedGpx(true));
+downloadGpxButton.addEventListener("click", downloadGeneratedGpx);
 networkButton.addEventListener("click", reloadNetwork);
 analyzeGpxButton.addEventListener("click", analyzeGpx);
 testGpxButton.addEventListener("click", testGpxAgainstGenerator);
@@ -3565,16 +3733,10 @@ function escapeXml(value) {
 }
 
 
-function buildGpxXml(points, routeName, includeElevation) {
+function buildGpxXml(points, routeName) {
     const trackPoints = points.map(point => {
         const lat = Number(point.lat).toFixed(7);
         const lon = Number(point.lon).toFixed(7);
-
-        if (includeElevation && Number.isFinite(Number(point.ele_m))) {
-            const ele = Number(point.ele_m).toFixed(2);
-            return `      <trkpt lat="${lat}" lon="${lon}"><ele>${ele}</ele></trkpt>`;
-        }
-
         return `      <trkpt lat="${lat}" lon="${lon}"></trkpt>`;
     }).join("\n");
 
@@ -3609,7 +3771,7 @@ function triggerTextDownload(filename, contents, mimeType) {
 }
 
 
-function downloadGeneratedGpx(includeElevation) {
+function downloadGeneratedGpx() {
     if (!lastGeneratedRoute) {
         return;
     }
@@ -3623,17 +3785,12 @@ function downloadGeneratedGpx(includeElevation) {
 
     const distance = Number(lastGeneratedRoute.actual_distance_miles).toFixed(2);
     const gain = Math.round(Number(lastGeneratedRoute.actual_gain_ft));
-    const routeName = includeElevation
-        ? `Trail Route ${distance} mi ${gain} ft - DEM elevation`
-        : `Trail Route ${distance} mi ${gain} ft - no elevation`;
-
-    const suffix = includeElevation ? "with-dem-elevation" : "no-elevation";
-    const filename = `trail-route-${distance}mi-${gain}ft-${suffix}.gpx`;
-    const xml = buildGpxXml(points, routeName, includeElevation);
+    const routeName = `Trail Route ${distance} mi - COROS`;
+    const filename = `trail-route-${distance}mi-${gain}ft-coros.gpx`;
+    const xml = buildGpxXml(points, routeName);
 
     triggerTextDownload(filename, xml, "application/gpx+xml;charset=utf-8");
 }
-
 
 function updateNetworkVisibility() {
     if (showNetworkCheckbox.checked) {
@@ -3841,7 +3998,6 @@ async function generateRoute() {
     generateButton.disabled = true;
     lastGeneratedRoute = null;
     downloadGpxButton.disabled = true;
-    downloadGpxElevationButton.disabled = true;
 
     try {
         await loadTrailNetwork(data);
@@ -3871,7 +4027,6 @@ async function generateRoute() {
 
         lastGeneratedRoute = result;
         downloadGpxButton.disabled = false;
-        downloadGpxElevationButton.disabled = false;
 
         const coordinates = result.route.map(
             point => [point.lat, point.lon]
@@ -3937,8 +4092,11 @@ async function generateRoute() {
             "<b>Elevation smoothing:</b> ~" + result.elevation_smoothing_distance_m + " m (" + result.elevation_smoothing_window_points + " points)<br>" +
             "<b>Version:</b> " + result.version + "<br>" +
             "<b>GPX export points:</b> " + result.gpx_export_points.length + "<br>" +
-            '<span class="small">Use Download GPX for coordinates only, or Download GPX + DEM Elevation for the same track with &lt;ele&gt; values.</span><br>' +
-            '<span class="small">Elevation source: ' + result.elevation_source + "</span>";
+            (result.waypoint_accurate_finalists !== null && result.waypoint_accurate_finalists !== undefined
+                ? "<b>Accurate waypoint finalists:</b> " + result.waypoint_accurate_finalists + "<br>"
+                : "") +
+            '<span class="small">Download GPX exports coordinates only for COROS; no elevation is embedded.</span><br>' +
+            '<span class="small">Elevation source used for route selection: ' + result.elevation_source + "</span>";
 
     } catch (error) {
         results.innerHTML =
