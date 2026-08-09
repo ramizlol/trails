@@ -32,11 +32,12 @@ DEM_PATH = os.path.join(
 METERS_PER_MILE = 1609.344
 FEET_PER_METER = 3.28084
 
-# User-requested sampling spacing.
+# Your requested trail sampling spacing.
 #
-# IMPORTANT:
-# This samples the 30 m DEM every 5 m along the trail.
-# It does NOT turn the source DEM into a true 5 m DEM.
+# Note:
+# The source DEM is still ~30 m resolution.
+# Sampling every 5 m makes sure we inspect the
+# terrain continuously along curved trails.
 ELEVATION_SAMPLE_SPACING_M = 5.0
 
 MAX_CACHED_GRAPHS = 5
@@ -45,7 +46,15 @@ GRAPH_CACHE = {}
 
 
 # =========================================================
-# REQUEST MODEL
+# DEFAULT TEST LOCATION
+# =========================================================
+
+DEFAULT_LAT = 33.589281
+DEFAULT_LON = -112.091148
+
+
+# =========================================================
+# REQUEST
 # =========================================================
 
 class RouteRequest(BaseModel):
@@ -68,6 +77,7 @@ class RouteRequest(BaseModel):
 def home():
 
     return {
+
         "status":
             "Trail Running Creator API is running",
 
@@ -78,355 +88,17 @@ def home():
             "/docs",
 
         "dem_info":
-            "/dem-info"
-    }
+            "/dem-info",
 
+        "default_start": {
 
-# =========================================================
-# ADAPTIVE ROUTE PROFILE
-# =========================================================
+            "lat":
+                DEFAULT_LAT,
 
-def get_route_profile(
-    target_distance_miles
-):
-    """
-    Different route lengths need different
-    search behavior.
-
-    Short routes:
-        smaller OSM graph
-        fewer waypoints
-        much closer waypoints
-        many cheap candidate searches
-
-    Long routes:
-        larger graph
-        more waypoints
-        wider geographic spread
-    """
-
-    if target_distance_miles < 4.0:
-
-        return {
-
-            "name":
-                "short",
-
-            "search_radius_m":
-                1600,
-
-            "anchor_counts":
-                [2, 2, 2, 3],
-
-            "attempts":
-                1200,
-
-            "min_anchor_distance_ratio":
-                0.02,
-
-            "min_anchor_distance_floor_m":
-                80,
-
-            "max_anchor_distance_ratio":
-                0.34,
-
-            "max_anchor_distance_ceiling_m":
-                1350,
-
-            "min_anchor_separation_ratio":
-                0.025,
-
-            "min_anchor_separation_floor_m":
-                90,
-
-            "candidate_min_ratio":
-                0.72,
-
-            "candidate_max_ratio":
-                1.20
+            "lon":
+                DEFAULT_LON
         }
-
-
-    if target_distance_miles < 8.0:
-
-        return {
-
-            "name":
-                "medium",
-
-            "search_radius_m":
-                2400,
-
-            "anchor_counts":
-                [2, 3, 3, 3],
-
-            "attempts":
-                900,
-
-            "min_anchor_distance_ratio":
-                0.03,
-
-            "min_anchor_distance_floor_m":
-                150,
-
-            "max_anchor_distance_ratio":
-                0.31,
-
-            "max_anchor_distance_ceiling_m":
-                2200,
-
-            "min_anchor_separation_ratio":
-                0.03,
-
-            "min_anchor_separation_floor_m":
-                150,
-
-            "candidate_min_ratio":
-                0.74,
-
-            "candidate_max_ratio":
-                1.22
-        }
-
-
-    if target_distance_miles < 15.0:
-
-        return {
-
-            "name":
-                "long",
-
-            "search_radius_m":
-                3200,
-
-            "anchor_counts":
-                [3, 4, 4, 4],
-
-            "attempts":
-                700,
-
-            "min_anchor_distance_ratio":
-                0.04,
-
-            "min_anchor_distance_floor_m":
-                300,
-
-            "max_anchor_distance_ratio":
-                0.29,
-
-            "max_anchor_distance_ceiling_m":
-                3100,
-
-            "min_anchor_separation_ratio":
-                0.025,
-
-            "min_anchor_separation_floor_m":
-                250,
-
-            "candidate_min_ratio":
-                0.76,
-
-            "candidate_max_ratio":
-                1.24
-        }
-
-
-    return {
-
-        "name":
-            "ultra",
-
-        "search_radius_m":
-            min(
-                5000,
-                int(
-                    target_distance_miles
-                    *
-                    300
-                )
-            ),
-
-        "anchor_counts":
-            [4, 4, 5],
-
-        "attempts":
-            600,
-
-        "min_anchor_distance_ratio":
-            0.04,
-
-        "min_anchor_distance_floor_m":
-            400,
-
-        "max_anchor_distance_ratio":
-            0.27,
-
-        "max_anchor_distance_ceiling_m":
-            4800,
-
-        "min_anchor_separation_ratio":
-            0.025,
-
-        "min_anchor_separation_floor_m":
-            300,
-
-        "candidate_min_ratio":
-            0.77,
-
-        "candidate_max_ratio":
-            1.25
     }
-
-
-# =========================================================
-# ROUTE QUALITY LIMITS
-# =========================================================
-
-def get_route_quality_limits(
-    target_distance_miles,
-    target_gain_ft
-):
-    """
-    Hard limits prevent the server from returning
-    terrible routes merely because they were the
-    best of a bad candidate set.
-    """
-
-    distance_error_limit_miles = min(
-
-        0.50,
-
-        max(
-            0.25,
-            target_distance_miles
-            *
-            0.08
-        )
-    )
-
-
-    if target_gain_ft <= 300:
-
-        gain_error_limit_ft = max(
-            100,
-            target_gain_ft
-            *
-            0.50
-        )
-
-    elif target_gain_ft <= 1000:
-
-        gain_error_limit_ft = max(
-            125,
-            target_gain_ft
-            *
-            0.30
-        )
-
-    else:
-
-        gain_error_limit_ft = max(
-            175,
-            target_gain_ft
-            *
-            0.25
-        )
-
-
-    # Excellent-route thresholds used for
-    # early stopping.
-    excellent_distance_error_miles = max(
-
-        0.08,
-
-        min(
-            0.15,
-            target_distance_miles
-            *
-            0.03
-        )
-    )
-
-
-    excellent_gain_error_ft = max(
-
-        50,
-
-        target_gain_ft
-        *
-        0.10
-    )
-
-
-    return {
-
-        "distance_error_limit_miles":
-            distance_error_limit_miles,
-
-        "gain_error_limit_ft":
-            gain_error_limit_ft,
-
-        "excellent_distance_error_miles":
-            excellent_distance_error_miles,
-
-        "excellent_gain_error_ft":
-            excellent_gain_error_ft
-    }
-
-
-# =========================================================
-# CLIMB PREFERENCE
-# =========================================================
-
-def get_climb_penalty_factor(
-    target_distance_miles,
-    target_gain_ft
-):
-    """
-    Routing itself should know whether we're trying
-    to build a flat route.
-
-    ascent_m * this factor gets added to routing cost.
-
-    A 2.5 mi / 200 ft request is ~80 ft/mile, so
-    climbing is strongly penalized.
-
-    A mountainous route with 300+ ft/mile receives
-    very little climb penalty.
-    """
-
-    if target_distance_miles <= 0:
-        return 0.0
-
-
-    gain_per_mile = (
-        target_gain_ft
-        /
-        target_distance_miles
-    )
-
-
-    if gain_per_mile <= 100:
-
-        return 14.0
-
-
-    if gain_per_mile <= 175:
-
-        return 8.0
-
-
-    if gain_per_mile <= 250:
-
-        return 4.0
-
-
-    if gain_per_mile <= 350:
-
-        return 1.5
-
-
-    return 0.25
 
 
 # =========================================================
@@ -458,7 +130,10 @@ def normalize_tag_values(value):
 
         for part in str(item).split(";"):
 
-            part = part.strip().lower()
+            part = (
+                part.strip().lower()
+            )
+
 
             if part:
 
@@ -535,13 +210,9 @@ def haversine_meters(
     return (
 
         2.0
-
         *
-
         radius
-
         *
-
         math.atan2(
 
             math.sqrt(a),
@@ -598,6 +269,207 @@ def node_angle_from_start(
         y,
         x
     )
+
+
+# =========================================================
+# ROUTE PROFILE
+# =========================================================
+
+def get_route_profile(
+    target_distance_miles
+):
+
+    # Short routes use beam search.
+    if target_distance_miles < 4.0:
+
+        return {
+
+            "name":
+                "short-beam",
+
+            "search_radius_m":
+                1800,
+
+            "beam_width":
+                450,
+
+            "beam_max_steps":
+                80,
+
+            "candidate_max_ratio":
+                1.16
+        }
+
+
+    # Medium routes still use the waypoint system.
+    if target_distance_miles < 8.0:
+
+        return {
+
+            "name":
+                "medium-waypoint",
+
+            "search_radius_m":
+                2500,
+
+            "attempts":
+                1200,
+
+            "anchor_counts":
+                [2, 3, 3, 3],
+
+            "min_anchor_distance_m":
+                150,
+
+            "min_anchor_separation_m":
+                140
+        }
+
+
+    if target_distance_miles < 15.0:
+
+        return {
+
+            "name":
+                "long-waypoint",
+
+            "search_radius_m":
+                3200,
+
+            "attempts":
+                900,
+
+            "anchor_counts":
+                [3, 4, 4, 4],
+
+            "min_anchor_distance_m":
+                300,
+
+            "min_anchor_separation_m":
+                250
+        }
+
+
+    return {
+
+        "name":
+            "ultra-waypoint",
+
+        "search_radius_m":
+            min(
+                5000,
+                int(
+                    target_distance_miles
+                    *
+                    300
+                )
+            ),
+
+        "attempts":
+            700,
+
+        "anchor_counts":
+            [4, 4, 5],
+
+        "min_anchor_distance_m":
+            400,
+
+        "min_anchor_separation_m":
+            300
+    }
+
+
+# =========================================================
+# QUALITY LIMITS
+# =========================================================
+
+def get_route_quality_limits(
+    target_distance_miles,
+    target_gain_ft
+):
+
+    # Short routes should be quite close
+    # to the requested mileage.
+    if target_distance_miles < 4:
+
+        distance_error_limit_miles = max(
+
+            0.15,
+
+            target_distance_miles
+            *
+            0.08
+        )
+
+
+    else:
+
+        distance_error_limit_miles = min(
+
+            0.50,
+
+            max(
+                0.20,
+                target_distance_miles
+                *
+                0.06
+            )
+        )
+
+
+    if target_gain_ft <= 300:
+
+        gain_error_limit_ft = 100
+
+
+    elif target_gain_ft <= 1000:
+
+        gain_error_limit_ft = max(
+
+            125,
+
+            target_gain_ft
+            *
+            0.25
+        )
+
+
+    else:
+
+        gain_error_limit_ft = max(
+
+            150,
+
+            target_gain_ft
+            *
+            0.18
+        )
+
+
+    return {
+
+        "distance_error_limit_miles":
+            distance_error_limit_miles,
+
+        "gain_error_limit_ft":
+            gain_error_limit_ft,
+
+        "excellent_distance_error_miles":
+            max(
+                0.06,
+                target_distance_miles
+                *
+                0.025
+            ),
+
+        "excellent_gain_error_ft":
+            max(
+                40,
+                target_gain_ft
+                *
+                0.08
+            )
+    }
 
 
 # =========================================================
@@ -684,7 +556,7 @@ def path_gain_meters(
     route_nodes
 ):
 
-    total_gain = 0.0
+    total = 0.0
 
 
     for i in range(
@@ -705,7 +577,7 @@ def path_gain_meters(
 
         if edge is not None:
 
-            total_gain += float(
+            total += float(
 
                 edge.get(
                     "ascent_m",
@@ -718,182 +590,11 @@ def path_gain_meters(
             )
 
 
-    return total_gain
+    return total
 
 
 # =========================================================
-# SIMPLE ROUTING GRAPH
-# =========================================================
-
-def make_simple_routing_graph(G):
-
-    S = nx.DiGraph()
-
-
-    S.add_nodes_from(
-        G.nodes(
-            data=True
-        )
-    )
-
-
-    for (
-        u,
-        v,
-        data
-    ) in G.edges(
-        data=True
-    ):
-
-        length = float(
-
-            data.get(
-                "length",
-                0
-            )
-
-            or
-
-            0
-        )
-
-
-        ascent = float(
-
-            data.get(
-                "ascent_m",
-                0
-            )
-
-            or
-
-            0
-        )
-
-
-        if length <= 0:
-            continue
-
-
-        if not S.has_edge(
-            u,
-            v
-        ):
-
-            S.add_edge(
-
-                u,
-                v,
-
-                length=
-                    length,
-
-                ascent_m=
-                    ascent
-            )
-
-
-        else:
-
-            old_length = float(
-                S[u][v].get(
-                    "length",
-                    float("inf")
-                )
-            )
-
-
-            if length < old_length:
-
-                S[u][v][
-                    "length"
-                ] = length
-
-                S[u][v][
-                    "ascent_m"
-                ] = ascent
-
-
-    return S
-
-
-# =========================================================
-# PENALIZED PATH SEARCH
-# =========================================================
-
-def penalized_shortest_path(
-    S,
-    source,
-    target,
-    used_edges,
-    climb_penalty_factor
-):
-
-    def weight(
-        u,
-        v,
-        data
-    ):
-
-        length = float(
-            data.get(
-                "length",
-                1.0
-            )
-        )
-
-
-        ascent = float(
-            data.get(
-                "ascent_m",
-                0.0
-            )
-        )
-
-
-        cost = (
-
-            length
-
-            +
-
-            ascent
-            *
-            climb_penalty_factor
-        )
-
-
-        edge_key = (
-            undirected_edge_key(
-                u,
-                v
-            )
-        )
-
-
-        if edge_key in used_edges:
-
-            cost *= 50.0
-
-
-        return cost
-
-
-    return nx.shortest_path(
-
-        S,
-
-        source,
-
-        target,
-
-        weight=
-            weight
-    )
-
-
-# =========================================================
-# FULL OSM GEOMETRY
+# OSM GEOMETRY
 # =========================================================
 
 def oriented_edge_coords(
@@ -967,7 +668,6 @@ def oriented_edge_coords(
         coords[0]
     )
 
-
     last_lon, last_lat = (
         coords[-1]
     )
@@ -1022,7 +722,10 @@ def route_coordinates(
     ):
 
         u = route_nodes[i]
-        v = route_nodes[i + 1]
+
+        v = route_nodes[
+            i + 1
+        ]
 
 
         edge = get_shortest_edge(
@@ -1242,7 +945,7 @@ def edge_is_allowed_trail(data):
 
 
 # =========================================================
-# DENSIFY TRAIL
+# DENSIFY TRAIL GEOMETRY
 # =========================================================
 
 def densify_polyline(
@@ -1318,8 +1021,11 @@ def densify_polyline(
 
 
             lon = (
+
                 lon1
+
                 +
+
                 (
                     lon2 - lon1
                 )
@@ -1329,8 +1035,11 @@ def densify_polyline(
 
 
             lat = (
+
                 lat1
+
                 +
+
                 (
                     lat2 - lat1
                 )
@@ -1354,9 +1063,7 @@ def densify_polyline(
 # DEM SMOOTHING
 # =========================================================
 
-def smooth_elevations(
-    values
-):
+def smooth_elevations(values):
 
     if len(values) < 5:
 
@@ -1366,7 +1073,7 @@ def smooth_elevations(
         ]
 
 
-    result = []
+    smoothed = []
 
 
     for i in range(
@@ -1377,6 +1084,7 @@ def smooth_elevations(
             0,
             i - 2
         )
+
 
         end = min(
             len(values),
@@ -1389,11 +1097,12 @@ def smooth_elevations(
         ]
 
 
-        result.append(
+        smoothed.append(
 
             sum(
                 float(v)
-                for v in window
+                for v
+                in window
             )
 
             /
@@ -1402,11 +1111,11 @@ def smooth_elevations(
         )
 
 
-    return result
+    return smoothed
 
 
 # =========================================================
-# DEM UNIT HANDLING
+# DEM UNIT
 # =========================================================
 
 def dem_value_to_meters(
@@ -1446,25 +1155,25 @@ def dem_value_to_meters(
     ):
 
         return (
+
             float(value)
+
             /
+
             FEET_PER_METER
         )
 
 
-    # USGS DEM elevation is normally meters.
     return float(
         value
     )
 
 
 # =========================================================
-# LOCAL DEM SAMPLING
+# DEM SAMPLING
 # =========================================================
 
-def sample_dem_points(
-    points
-):
+def sample_dem_points(points):
 
     if not os.path.exists(
         DEM_PATH
@@ -1518,7 +1227,8 @@ def sample_dem_points(
 
         unique[key][0]
 
-        for key in keys
+        for key
+        in keys
     ]
 
 
@@ -1526,7 +1236,8 @@ def sample_dem_points(
 
         unique[key][1]
 
-        for key in keys
+        for key
+        in keys
     ]
 
 
@@ -1542,7 +1253,7 @@ def sample_dem_points(
                 status_code=500,
 
                 detail=(
-                    "DEM does not contain CRS information."
+                    "DEM has no CRS information."
                 )
             )
 
@@ -1596,7 +1307,7 @@ def sample_dem_points(
 
         if outside:
 
-            lat, lon = (
+            first_lat, first_lon = (
                 outside[0]
             )
 
@@ -1607,23 +1318,13 @@ def sample_dem_points(
 
                 detail=(
 
-                    "The USGS DEM does not cover "
-                    "the entire requested trail area. "
+                    "DEM does not cover the entire "
+                    "requested trail graph. First "
+                    "uncovered point: "
 
                     +
 
-                    str(
-                        len(outside)
-                    )
-
-                    +
-
-                    " sample points are outside the TIFF. "
-                    "First uncovered point: "
-
-                    +
-
-                    str(lat)
+                    str(first_lat)
 
                     +
 
@@ -1631,7 +1332,7 @@ def sample_dem_points(
 
                     +
 
-                    str(lon)
+                    str(first_lon)
                 )
             )
 
@@ -1698,9 +1399,7 @@ def sample_dem_points(
                     status_code=400,
 
                     detail=(
-                        "DEM returned invalid elevation at "
-                        +
-                        str(key)
+                        "DEM returned invalid elevation."
                     )
                 )
 
@@ -1730,9 +1429,7 @@ def sample_dem_points(
                     status_code=400,
 
                     detail=(
-                        "DEM contains NoData at "
-                        +
-                        str(key)
+                        "DEM contains NoData."
                     )
                 )
 
@@ -1749,12 +1446,10 @@ def sample_dem_points(
 
 
 # =========================================================
-# ADD ELEVATION TO GRAPH
+# ADD ELEVATION TO EDGES
 # =========================================================
 
-def add_local_dem_edge_elevations(
-    G
-):
+def add_local_dem_edge_elevations(G):
 
     edge_samples = {}
 
@@ -1823,7 +1518,9 @@ def add_local_dem_edge_elevations(
                 v,
                 key
             )
-        ] = samples
+        ] = (
+            samples
+        )
 
 
         all_points.extend(
@@ -1838,7 +1535,31 @@ def add_local_dem_edge_elevations(
     )
 
 
-    # Add elevation to graph nodes.
+    # Node elevations
+    node_points = [
+
+        (
+            float(
+                G.nodes[node]["x"]
+            ),
+
+            float(
+                G.nodes[node]["y"]
+            )
+        )
+
+        for node
+        in G.nodes
+    ]
+
+
+    node_lookup = (
+        sample_dem_points(
+            node_points
+        )
+    )
+
+
     for node in G.nodes:
 
         lat = float(
@@ -1850,7 +1571,7 @@ def add_local_dem_edge_elevations(
         )
 
 
-        key = (
+        node_key = (
 
             round(
                 lat,
@@ -1864,44 +1585,16 @@ def add_local_dem_edge_elevations(
         )
 
 
-        if key in elevation_lookup:
-
-            elevation = (
-                elevation_lookup[
-                    key
-                ]
-            )
-
-
-        else:
-
-            node_lookup = (
-                sample_dem_points(
-                    [
-                        (
-                            lon,
-                            lat
-                        )
-                    ]
-                )
-            )
-
-
-            elevation = (
-                node_lookup[
-                    key
-                ]
-            )
-
-
         G.nodes[node][
             "elevation"
         ] = float(
-            elevation
+            node_lookup[
+                node_key
+            ]
         )
 
 
-    # Calculate ascent and descent for every edge.
+    # Directed ascent/descent.
     for (
         (
             u,
@@ -1956,7 +1649,7 @@ def add_local_dem_edge_elevations(
             len(elevations) - 1
         ):
 
-            difference = (
+            delta = (
 
                 elevations[
                     i + 1
@@ -1968,17 +1661,15 @@ def add_local_dem_edge_elevations(
             )
 
 
-            if difference > 0:
+            if delta > 0:
 
-                ascent += (
-                    difference
-                )
+                ascent += delta
 
 
-            elif difference < 0:
+            elif delta < 0:
 
                 descent += (
-                    -difference
+                    -delta
                 )
 
 
@@ -2012,7 +1703,7 @@ def add_local_dem_edge_elevations(
 
 
 # =========================================================
-# GRAPH DOWNLOAD / CACHE
+# GRAPH DOWNLOAD
 # =========================================================
 
 def download_trail_graph(
@@ -2025,12 +1716,12 @@ def download_trail_graph(
 
         round(
             float(lat),
-            4
+            5
         ),
 
         round(
             float(lon),
-            4
+            5
         ),
 
         int(
@@ -2141,7 +1832,7 @@ def download_trail_graph(
     )
 
 
-    edges_to_remove = []
+    remove_edges = []
 
 
     for (
@@ -2158,7 +1849,7 @@ def download_trail_graph(
             data
         ):
 
-            edges_to_remove.append(
+            remove_edges.append(
                 (
                     u,
                     v,
@@ -2168,7 +1859,7 @@ def download_trail_graph(
 
 
     G.remove_edges_from(
-        edges_to_remove
+        remove_edges
     )
 
 
@@ -2192,8 +1883,7 @@ def download_trail_graph(
             status_code=400,
 
             detail=(
-                "No usable trail network remained "
-                "after trail filtering."
+                "No usable trail network found."
             )
         )
 
@@ -2210,24 +1900,24 @@ def download_trail_graph(
     )
 
 
-    undirected = (
-        G.to_undirected(
-            as_view=True
-        )
-    )
-
-
     component = (
         nx.node_connected_component(
-            undirected,
+
+            G.to_undirected(
+                as_view=True
+            ),
+
             nearest
         )
     )
 
 
-    G = G.subgraph(
-        component
-    ).copy()
+    G = (
+        G.subgraph(
+            component
+        )
+        .copy()
+    )
 
 
     filtered_edges_removed = (
@@ -2256,15 +1946,14 @@ def download_trail_graph(
         MAX_CACHED_GRAPHS
     ):
 
-        oldest_key = next(
+        oldest = next(
             iter(
                 GRAPH_CACHE
             )
         )
 
-
         GRAPH_CACHE.pop(
-            oldest_key
+            oldest
         )
 
 
@@ -2296,6 +1985,89 @@ def download_trail_graph(
 
 
 # =========================================================
+# SIMPLE ROUTING GRAPH
+# =========================================================
+
+def make_simple_routing_graph(G):
+
+    S = nx.DiGraph()
+
+
+    S.add_nodes_from(
+        G.nodes(
+            data=True
+        )
+    )
+
+
+    for (
+        u,
+        v,
+        data
+    ) in G.edges(
+        data=True
+    ):
+
+        length = float(
+
+            data.get(
+                "length",
+                0
+            )
+
+            or
+
+            0
+        )
+
+
+        ascent = float(
+
+            data.get(
+                "ascent_m",
+                0
+            )
+
+            or
+
+            0
+        )
+
+
+        if length <= 0:
+            continue
+
+
+        if (
+            not S.has_edge(
+                u,
+                v
+            )
+
+            or
+
+            length
+            <
+            S[u][v]["length"]
+        ):
+
+            S.add_edge(
+
+                u,
+                v,
+
+                length=
+                    length,
+
+                ascent_m=
+                    ascent
+            )
+
+
+    return S
+
+
+# =========================================================
 # REPEAT METRICS
 # =========================================================
 
@@ -2305,7 +2077,6 @@ def repeated_edge_stats(
 ):
 
     counts = {}
-
     lengths = {}
 
 
@@ -2320,7 +2091,7 @@ def repeated_edge_stats(
         ]
 
 
-        key = (
+        edge_key = (
             undirected_edge_key(
                 u,
                 v
@@ -2335,14 +2106,9 @@ def repeated_edge_stats(
         )
 
 
-        if edge is None:
+        length = (
 
-            length = 0.0
-
-        else:
-
-            length = float(
-
+            float(
                 edge.get(
                     "length",
                     0
@@ -2353,11 +2119,18 @@ def repeated_edge_stats(
                 0
             )
 
+            if edge
 
-        counts[key] = (
+            else
+
+            0.0
+        )
+
+
+        counts[edge_key] = (
 
             counts.get(
-                key,
+                edge_key,
                 0
             )
 
@@ -2367,32 +2140,31 @@ def repeated_edge_stats(
         )
 
 
-        lengths[key] = (
+        lengths[edge_key] = (
             length
         )
 
 
-    repeated_edges = 0
-
-    repeated_distance = 0.0
+    repeat_edges = 0
+    repeat_distance = 0.0
 
 
     for (
-        key,
+        edge_key,
         count
     ) in counts.items():
 
         if count > 1:
 
-            repeated_edges += (
+            repeat_edges += (
                 count - 1
             )
 
 
-            repeated_distance += (
+            repeat_distance += (
 
                 lengths.get(
-                    key,
+                    edge_key,
                     0
                 )
 
@@ -2405,21 +2177,14 @@ def repeated_edge_stats(
 
 
     return (
-
-        repeated_edges,
-
-        repeated_distance
+        repeat_edges,
+        repeat_distance
     )
 
 
 def repeated_node_occurrences(
     route_nodes
 ):
-
-    if len(route_nodes) <= 2:
-
-        return 0
-
 
     counts = {}
 
@@ -2522,7 +2287,7 @@ def route_score(
     )
 
 
-    distance_error_ratio = (
+    distance_ratio = (
 
         distance_error
 
@@ -2544,7 +2309,7 @@ def route_score(
 
     if target_gain_meters > 0:
 
-        gain_error_ratio = (
+        gain_ratio = (
 
             gain_error
 
@@ -2553,11 +2318,10 @@ def route_score(
             target_gain_meters
         )
 
+
     else:
 
-        # If zero gain requested, directly penalize
-        # actual climbing.
-        gain_error_ratio = (
+        gain_ratio = (
 
             actual_gain
 
@@ -2593,19 +2357,6 @@ def route_score(
     )
 
 
-    repeated_node_ratio = (
-
-        repeated_nodes
-
-        /
-
-        max(
-            1,
-            len(route_nodes) - 2
-        )
-    )
-
-
     immediate_reversals = (
         count_immediate_reversals(
             route_nodes
@@ -2613,276 +2364,1204 @@ def route_score(
     )
 
 
-    # Distance and elevation dominate.
-    # Repetition remains expensive but not so expensive
-    # that we choose a completely wrong distance/gain.
+    # Short routes must be allowed to share
+    # a short access stem.
+    if (
+        target_distance_meters
+        <
+        4
+        *
+        METERS_PER_MILE
+    ):
+
+        repeat_weight = 100.0
+        node_weight = 20.0
+
+
+    else:
+
+        repeat_weight = 320.0
+        node_weight = 60.0
+
+
     score = (
 
-        distance_error_ratio
-        *
-        150.0
-
-        +
-
-        gain_error_ratio
+        distance_ratio
         *
         180.0
 
         +
 
-        repeat_ratio
+        gain_ratio
         *
-        320.0
+        220.0
 
         +
 
-        repeated_node_ratio
+        repeat_ratio
         *
-        80.0
+        repeat_weight
+
+        +
+
+        repeated_nodes
+        *
+        node_weight
 
         +
 
         immediate_reversals
         *
-        35.0
+        30.0
     )
-
-
-    metrics = {
-
-        "total_distance_meters":
-            total_distance,
-
-        "actual_gain_meters":
-            actual_gain,
-
-        "distance_error_meters":
-            distance_error,
-
-        "gain_error_meters":
-            gain_error,
-
-        "repeated_edges":
-            repeated_edges,
-
-        "repeated_distance_meters":
-            repeated_distance,
-
-        "repeat_ratio":
-            repeat_ratio,
-
-        "repeated_nodes":
-            repeated_nodes,
-
-        "immediate_reversals":
-            immediate_reversals,
-
-        "score":
-            score
-    }
 
 
     return (
+
         score,
-        metrics
+
+        {
+
+            "total_distance_meters":
+                total_distance,
+
+            "actual_gain_meters":
+                actual_gain,
+
+            "distance_error_meters":
+                distance_error,
+
+            "gain_error_meters":
+                gain_error,
+
+            "repeated_edges":
+                repeated_edges,
+
+            "repeated_distance_meters":
+                repeated_distance,
+
+            "repeat_ratio":
+                repeat_ratio,
+
+            "repeated_nodes":
+                repeated_nodes,
+
+            "immediate_reversals":
+                immediate_reversals,
+
+            "score":
+                score
+        }
     )
 
 
 # =========================================================
-# ANCHOR POOL
+# SHORT ROUTE BEAM SEARCH
 # =========================================================
 
-def build_anchor_candidates(
+def beam_search_short_loop(
     G,
-    S,
     start_node,
     target_distance_meters,
     target_gain_meters,
+    target_distance_miles,
+    target_gain_ft,
+    limits,
     profile
 ):
+    """
+    Search trail SEGMENTS directly.
 
-    start_lat = float(
-        G.nodes[start_node]["y"]
+    This is very different from the waypoint method.
+
+    Each state represents an actual partial walk through
+    the trail network.
+
+    We keep the best partial possibilities, expand one
+    trail segment at a time, and constantly test whether
+    they can return to the start near the requested
+    distance/elevation.
+    """
+
+    S = (
+        make_simple_routing_graph(
+            G
+        )
     )
 
-    start_lon = float(
-        G.nodes[start_node]["x"]
+
+    reverse_S = (
+        S.reverse(
+            copy=False
+        )
     )
 
 
-    start_elevation = float(
-        G.nodes[start_node].get(
-            "elevation",
+    try:
+
+        (
+            return_distances,
+            reverse_paths
+        ) = nx.single_source_dijkstra(
+
+            reverse_S,
+
+            start_node,
+
+            weight="length"
+        )
+
+
+    except Exception as exc:
+
+        raise HTTPException(
+
+            status_code=500,
+
+            detail=(
+                "Could not prepare short-route "
+                "return paths: "
+                +
+                str(exc)
+            )
+        )
+
+
+    # Convert paths in reversed graph:
+    #
+    # reversed graph:
+    # START -> X -> CURRENT
+    #
+    # original graph:
+    # CURRENT -> X -> START
+    return_paths = {}
+
+
+    for (
+        node,
+        reversed_path
+    ) in reverse_paths.items():
+
+        return_paths[node] = (
+            list(
+                reversed(
+                    reversed_path
+                )
+            )
+        )
+
+
+    distance_limit_m = (
+
+        limits[
+            "distance_error_limit_miles"
+        ]
+
+        *
+
+        METERS_PER_MILE
+    )
+
+
+    gain_limit_m = (
+
+        limits[
+            "gain_error_limit_ft"
+        ]
+
+        /
+
+        FEET_PER_METER
+    )
+
+
+    max_route_distance = (
+
+        target_distance_meters
+
+        +
+
+        distance_limit_m
+    )
+
+
+    max_route_gain = (
+
+        target_gain_meters
+
+        +
+
+        gain_limit_m
+    )
+
+
+    beam_width = (
+        profile[
+            "beam_width"
+        ]
+    )
+
+
+    max_steps = (
+        profile[
+            "beam_max_steps"
+        ]
+    )
+
+
+    # State fields:
+    #
+    # route
+    # node
+    # distance
+    # gain
+    # used_edges
+    # visited_nodes
+    # repeated_distance
+    # reversals
+
+    initial_state = {
+
+        "route":
+            (
+                start_node,
+            ),
+
+        "node":
+            start_node,
+
+        "distance":
+            0.0,
+
+        "gain":
+            0.0,
+
+        "used_edges":
+            frozenset(),
+
+        "visited_nodes":
+            frozenset(
+                {
+                    start_node
+                }
+            ),
+
+        "repeated_distance":
+            0.0,
+
+        "reversals":
             0
-        )
+    }
+
+
+    beam = [
+        initial_state
+    ]
+
+
+    best_route = None
+    best_metrics = None
+    best_score = float(
+        "inf"
     )
 
 
-    min_distance = max(
+    best_any_route = None
+    best_any_metrics = None
+    best_any_score = float(
+        "inf"
+    )
 
-        profile[
-            "min_anchor_distance_floor_m"
-        ],
+
+    target_gain_density = (
+
+        target_gain_meters
+
+        /
 
         target_distance_meters
-        *
-        profile[
-            "min_anchor_distance_ratio"
-        ]
     )
 
 
-    max_distance = min(
+    for depth in range(
+        max_steps
+    ):
 
-        profile[
-            "max_anchor_distance_ceiling_m"
-        ],
+        expanded = []
 
-        target_distance_meters
-        *
-        profile[
-            "max_anchor_distance_ratio"
-        ]
+
+        for state in beam:
+
+            current = (
+                state["node"]
+            )
+
+
+            for neighbor in S.successors(
+                current
+            ):
+
+                edge_data = (
+                    S[current][neighbor]
+                )
+
+
+                edge_length = float(
+
+                    edge_data.get(
+                        "length",
+                        0
+                    )
+                )
+
+
+                edge_gain = float(
+
+                    edge_data.get(
+                        "ascent_m",
+                        0
+                    )
+                )
+
+
+                if edge_length <= 0:
+                    continue
+
+
+                new_distance = (
+
+                    state["distance"]
+
+                    +
+
+                    edge_length
+                )
+
+
+                new_gain = (
+
+                    state["gain"]
+
+                    +
+
+                    edge_gain
+                )
+
+
+                # If we already exceeded the maximum
+                # acceptable gain, no continuation can
+                # fix it because ascent never decreases.
+                if (
+                    new_gain
+                    >
+                    max_route_gain
+                ):
+
+                    continue
+
+
+                # Distance can't shrink either.
+                if (
+                    new_distance
+                    >
+                    max_route_distance
+                ):
+
+                    continue
+
+
+                edge_key = (
+                    undirected_edge_key(
+                        current,
+                        neighbor
+                    )
+                )
+
+
+                already_used = (
+
+                    edge_key
+
+                    in
+
+                    state[
+                        "used_edges"
+                    ]
+                )
+
+
+                repeated_distance = (
+
+                    state[
+                        "repeated_distance"
+                    ]
+
+                    +
+
+                    (
+                        edge_length
+
+                        if already_used
+
+                        else
+
+                        0
+                    )
+                )
+
+
+                reversal = 0
+
+
+                route = (
+                    state["route"]
+                )
+
+
+                if (
+                    len(route) >= 2
+
+                    and
+
+                    neighbor
+                    ==
+                    route[-2]
+                ):
+
+                    reversal = 1
+
+
+                new_reversals = (
+
+                    state["reversals"]
+
+                    +
+
+                    reversal
+                )
+
+
+                new_route = (
+
+                    route
+
+                    +
+
+                    (
+                        neighbor,
+                    )
+                )
+
+
+                used_edges = set(
+                    state[
+                        "used_edges"
+                    ]
+                )
+
+
+                used_edges.add(
+                    edge_key
+                )
+
+
+                visited_nodes = set(
+                    state[
+                        "visited_nodes"
+                    ]
+                )
+
+
+                node_revisited = (
+
+                    neighbor
+
+                    in
+
+                    visited_nodes
+                )
+
+
+                visited_nodes.add(
+                    neighbor
+                )
+
+
+                # -----------------------------------------
+                # CAN WE STILL GET HOME?
+                # -----------------------------------------
+
+                if neighbor not in return_distances:
+
+                    continue
+
+
+                return_distance = float(
+                    return_distances[
+                        neighbor
+                    ]
+                )
+
+
+                minimum_final_distance = (
+
+                    new_distance
+
+                    +
+
+                    return_distance
+                )
+
+
+                # Even the shortest route home would
+                # make us too long.
+                if (
+                    minimum_final_distance
+
+                    >
+
+                    max_route_distance
+                ):
+
+                    continue
+
+
+                # -----------------------------------------
+                # TEST CLOSING THIS ROUTE
+                # -----------------------------------------
+
+                if neighbor == start_node:
+
+                    candidate_route = list(
+                        new_route
+                    )
+
+
+                else:
+
+                    return_route = (
+                        return_paths[
+                            neighbor
+                        ]
+                    )
+
+
+                    candidate_route = (
+
+                        list(
+                            new_route
+                        )
+
+                        +
+
+                        return_route[
+                            1:
+                        ]
+                    )
+
+
+                candidate_distance = (
+                    path_distance_meters(
+                        G,
+                        candidate_route
+                    )
+                )
+
+
+                # Don't spend CPU scoring candidates
+                # nowhere near the desired mileage.
+                if (
+
+                    candidate_distance
+
+                    >=
+
+                    target_distance_meters
+                    *
+                    0.72
+
+                    and
+
+                    candidate_distance
+
+                    <=
+
+                    max_route_distance
+                ):
+
+                    (
+                        score,
+                        metrics
+                    ) = route_score(
+
+                        G,
+
+                        candidate_route,
+
+                        target_distance_meters,
+
+                        target_gain_meters
+                    )
+
+
+                    if score < best_any_score:
+
+                        best_any_score = (
+                            score
+                        )
+
+                        best_any_route = (
+                            candidate_route
+                        )
+
+                        best_any_metrics = (
+                            metrics
+                        )
+
+
+                    distance_error_miles = (
+
+                        metrics[
+                            "distance_error_meters"
+                        ]
+
+                        /
+
+                        METERS_PER_MILE
+                    )
+
+
+                    gain_error_ft = (
+
+                        metrics[
+                            "gain_error_meters"
+                        ]
+
+                        *
+
+                        FEET_PER_METER
+                    )
+
+
+                    acceptable = (
+
+                        distance_error_miles
+
+                        <=
+
+                        limits[
+                            "distance_error_limit_miles"
+                        ]
+
+                        and
+
+                        gain_error_ft
+
+                        <=
+
+                        limits[
+                            "gain_error_limit_ft"
+                        ]
+                    )
+
+
+                    if acceptable:
+
+                        if score < best_score:
+
+                            best_score = (
+                                score
+                            )
+
+                            best_route = (
+                                candidate_route
+                            )
+
+                            best_metrics = (
+                                metrics
+                            )
+
+
+                        excellent_distance = (
+
+                            distance_error_miles
+
+                            <=
+
+                            limits[
+                                "excellent_distance_error_miles"
+                            ]
+                        )
+
+
+                        excellent_gain = (
+
+                            gain_error_ft
+
+                            <=
+
+                            limits[
+                                "excellent_gain_error_ft"
+                            ]
+                        )
+
+
+                        if (
+
+                            excellent_distance
+
+                            and
+
+                            excellent_gain
+
+                            and
+
+                            metrics[
+                                "immediate_reversals"
+                            ]
+                            <=
+                            1
+                        ):
+
+                            return (
+
+                                best_route,
+
+                                best_metrics,
+
+                                depth + 1,
+
+                                "beam"
+                            )
+
+
+                # -----------------------------------------
+                # PARTIAL STATE PRIORITY
+                # -----------------------------------------
+
+                # Estimated final mileage using the
+                # shortest possible path back to start.
+                estimated_final_distance = (
+                    minimum_final_distance
+                )
+
+
+                distance_priority = abs(
+
+                    estimated_final_distance
+
+                    -
+
+                    target_distance_meters
+                ) / target_distance_meters
+
+
+                if new_distance > 0:
+
+                    current_gain_density = (
+
+                        new_gain
+
+                        /
+
+                        new_distance
+                    )
+
+
+                else:
+
+                    current_gain_density = 0.0
+
+
+                # This is key for requests such as
+                # 2.5 mi / 200 ft.
+                #
+                # Flat partial routes remain near the
+                # front of the beam instead of getting
+                # discarded in favor of steep mountain
+                # routes.
+                density_denominator = max(
+
+                    target_gain_density,
+
+                    0.005
+                )
+
+
+                gain_density_priority = abs(
+
+                    current_gain_density
+
+                    -
+
+                    target_gain_density
+
+                ) / density_denominator
+
+
+                repeat_priority = (
+
+                    repeated_distance
+
+                    /
+
+                    max(
+                        new_distance,
+                        1
+                    )
+                )
+
+
+                revisit_penalty = (
+
+                    0.04
+
+                    if node_revisited
+
+                    else
+
+                    0.0
+                )
+
+
+                reversal_penalty = (
+
+                    new_reversals
+
+                    *
+                    0.08
+                )
+
+
+                # Overshooting gain is especially bad.
+                gain_overshoot = max(
+
+                    0.0,
+
+                    new_gain
+                    -
+                    target_gain_meters
+                )
+
+
+                gain_overshoot_priority = (
+
+                    gain_overshoot
+
+                    /
+
+                    max(
+                        target_gain_meters,
+                        20
+                    )
+                )
+
+
+                priority = (
+
+                    distance_priority
+                    *
+                    3.0
+
+                    +
+
+                    gain_density_priority
+                    *
+                    1.8
+
+                    +
+
+                    gain_overshoot_priority
+                    *
+                    4.0
+
+                    +
+
+                    repeat_priority
+                    *
+                    0.8
+
+                    +
+
+                    revisit_penalty
+
+                    +
+
+                    reversal_penalty
+                )
+
+
+                expanded.append(
+
+                    (
+                        priority,
+
+                        {
+
+                            "route":
+                                new_route,
+
+                            "node":
+                                neighbor,
+
+                            "distance":
+                                new_distance,
+
+                            "gain":
+                                new_gain,
+
+                            "used_edges":
+                                frozenset(
+                                    used_edges
+                                ),
+
+                            "visited_nodes":
+                                frozenset(
+                                    visited_nodes
+                                ),
+
+                            "repeated_distance":
+                                repeated_distance,
+
+                            "reversals":
+                                new_reversals
+                        }
+                    )
+                )
+
+
+        if not expanded:
+            break
+
+
+        # ---------------------------------------------
+        # DEDUPLICATE SIMILAR PARTIAL ROUTES
+        # ---------------------------------------------
+
+        expanded.sort(
+            key=lambda item:
+                item[0]
+        )
+
+
+        next_beam = []
+
+        seen_buckets = set()
+
+
+        for (
+            priority,
+            state
+        ) in expanded:
+
+            distance_bucket = int(
+
+                state["distance"]
+
+                /
+                75.0
+            )
+
+
+            gain_bucket = int(
+
+                state["gain"]
+
+                /
+                5.0
+            )
+
+
+            bucket = (
+
+                state["node"],
+
+                distance_bucket,
+
+                gain_bucket
+            )
+
+
+            if bucket in seen_buckets:
+                continue
+
+
+            seen_buckets.add(
+                bucket
+            )
+
+
+            next_beam.append(
+                state
+            )
+
+
+            if (
+                len(next_beam)
+                >=
+                beam_width
+            ):
+
+                break
+
+
+        beam = (
+            next_beam
+        )
+
+
+    # Return only an acceptable route.
+    if best_route is not None:
+
+        return (
+
+            best_route,
+
+            best_metrics,
+
+            max_steps,
+
+            "beam"
+        )
+
+
+    # Give useful information if search found
+    # something but couldn't meet limits.
+    if best_any_route is not None:
+
+        best_distance = (
+
+            best_any_metrics[
+                "total_distance_meters"
+            ]
+
+            /
+
+            METERS_PER_MILE
+        )
+
+
+        best_gain = (
+
+            best_any_metrics[
+                "actual_gain_meters"
+            ]
+
+            *
+
+            FEET_PER_METER
+        )
+
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail=(
+
+                "Beam search could not find a "
+                "trail-only route within the quality "
+                "limits. Best candidate was "
+
+                +
+
+                str(
+                    round(
+                        best_distance,
+                        2
+                    )
+                )
+
+                +
+
+                " mi / "
+
+                +
+
+                str(
+                    round(
+                        best_gain
+                    )
+                )
+
+                +
+
+                " ft gain."
+            )
+        )
+
+
+    raise HTTPException(
+
+        status_code=400,
+
+        detail=(
+            "Beam search could not find a "
+            "suitable loop."
+        )
     )
 
 
-    if max_distance <= min_distance:
+# =========================================================
+# LONG ROUTE PATH SEARCH
+# =========================================================
 
-        max_distance = (
-            min_distance
-            +
-            250
-        )
+def waypoint_path(
+    S,
+    source,
+    target,
+    used_edges
+):
 
+    def weight(
+        u,
+        v,
+        data
+    ):
 
-    candidates = []
-
-
-    for node in S.nodes:
-
-        if node == start_node:
-            continue
-
-
-        node_lat = float(
-            G.nodes[node]["y"]
-        )
-
-        node_lon = float(
-            G.nodes[node]["x"]
-        )
-
-
-        radial_distance = (
-            haversine_meters(
-
-                start_lat,
-
-                start_lon,
-
-                node_lat,
-
-                node_lon
+        cost = float(
+            data.get(
+                "length",
+                1
             )
         )
 
 
         if (
-            radial_distance
-            <
-            min_distance
+            undirected_edge_key(
+                u,
+                v
+            )
 
-            or
+            in
 
-            radial_distance
-            >
-            max_distance
+            used_edges
         ):
 
-            continue
+            cost *= 40.0
 
 
-        elevation = float(
-            G.nodes[node].get(
-                "elevation",
-                start_elevation
-            )
-        )
+        return cost
 
 
-        elevation_delta = abs(
+    return nx.shortest_path(
 
-            elevation
+        S,
 
-            -
+        source,
 
-            start_elevation
-        )
+        target,
 
-
-        candidates.append(
-
-            {
-
-                "node":
-                    node,
-
-                "distance":
-                    radial_distance,
-
-                "elevation_delta":
-                    elevation_delta
-            }
-        )
-
-
-    # For low-elevation routes, favor anchors that
-    # are not dramatically above/below the start.
-    if (
-        target_gain_meters
-        <=
-        120
-    ):
-
-        allowed_delta = max(
-
-            25.0,
-
-            target_gain_meters
-            *
-            1.25
-        )
-
-
-        flatter = [
-
-            item
-
-            for item in candidates
-
-            if item[
-                "elevation_delta"
-            ]
-            <=
-            allowed_delta
-        ]
-
-
-        if len(flatter) >= 4:
-
-            candidates = (
-                flatter
-            )
-
-
-    return candidates
+        weight=
+            weight
+    )
 
 
 # =========================================================
-# LOOP GENERATOR
+# LONG/MEDIUM WAYPOINT SEARCH
 # =========================================================
 
-def generate_adaptive_loop(
+def generate_waypoint_loop(
     G,
     start_node,
     target_distance_meters,
@@ -2900,35 +3579,88 @@ def generate_adaptive_loop(
     )
 
 
-    anchor_candidates = (
-        build_anchor_candidates(
+    start_lat = float(
+        G.nodes[start_node]["y"]
+    )
 
-            G,
-
-            S,
-
-            start_node,
-
-            target_distance_meters,
-
-            target_gain_meters,
-
-            profile
-        )
+    start_lon = float(
+        G.nodes[start_node]["x"]
     )
 
 
-    max_anchor_count = max(
+    candidates = []
+
+
+    max_radial_distance = min(
+
         profile[
-            "anchor_counts"
+            "search_radius_m"
         ]
+        *
+        0.90,
+
+        target_distance_meters
+        *
+        0.32
     )
+
+
+    for node in S.nodes:
+
+        if node == start_node:
+            continue
+
+
+        radial = (
+            haversine_meters(
+
+                start_lat,
+
+                start_lon,
+
+                float(
+                    G.nodes[node]["y"]
+                ),
+
+                float(
+                    G.nodes[node]["x"]
+                )
+            )
+        )
+
+
+        if (
+
+            radial
+
+            >=
+
+            profile[
+                "min_anchor_distance_m"
+            ]
+
+            and
+
+            radial
+
+            <=
+
+            max_radial_distance
+        ):
+
+            candidates.append(
+                node
+            )
 
 
     if (
-        len(anchor_candidates)
+        len(candidates)
         <
-        max_anchor_count
+        max(
+            profile[
+                "anchor_counts"
+            ]
+        )
     ):
 
         raise HTTPException(
@@ -2936,56 +3668,30 @@ def generate_adaptive_loop(
             status_code=400,
 
             detail=(
-                "Not enough suitable trail junctions "
-                "were found near the start for this "
-                "requested route length."
+                "Not enough trail junctions "
+                "were found for this route."
             )
         )
 
 
-    min_anchor_separation = max(
-
-        profile[
-            "min_anchor_separation_floor_m"
-        ],
-
-        target_distance_meters
-        *
-        profile[
-            "min_anchor_separation_ratio"
-        ]
-    )
-
-
-    climb_penalty_factor = (
-        get_climb_penalty_factor(
-
-            target_distance_miles,
-
-            target_gain_ft
-        )
-    )
-
-
     best_route = None
     best_metrics = None
-    best_score = float("inf")
-
-
-    best_acceptable_route = None
-    best_acceptable_metrics = None
-    best_acceptable_score = float(
+    best_score = float(
         "inf"
     )
 
 
-    attempts = profile[
-        "attempts"
-    ]
+    best_any_route = None
+    best_any_metrics = None
+    best_any_score = float(
+        "inf"
+    )
 
 
     for _ in range(
-        attempts
+        profile[
+            "attempts"
+        ]
     ):
 
         anchor_count = random.choice(
@@ -2995,28 +3701,14 @@ def generate_adaptive_loop(
         )
 
 
-        chosen_objects = (
-            random.sample(
-
-                anchor_candidates,
-
-                anchor_count
-            )
+        anchors = random.sample(
+            candidates,
+            anchor_count
         )
 
 
-        anchors = [
-
-            item["node"]
-
-            for item
-            in chosen_objects
-        ]
-
-
-        # Reject anchors that are too close
-        # to each other.
-        bad_spacing = False
+        # Reject anchors too close together.
+        spacing_bad = False
 
 
         for i in range(
@@ -3055,25 +3747,28 @@ def generate_adaptive_loop(
 
 
                 if (
+
                     separation
+
                     <
-                    min_anchor_separation
+
+                    profile[
+                        "min_anchor_separation_m"
+                    ]
                 ):
 
-                    bad_spacing = True
+                    spacing_bad = True
                     break
 
 
-            if bad_spacing:
+            if spacing_bad:
                 break
 
 
-        if bad_spacing:
+        if spacing_bad:
             continue
 
 
-        # Geographic ordering reduces crossing
-        # and star-shaped routes.
         anchors.sort(
 
             key=lambda node:
@@ -3094,21 +3789,7 @@ def generate_adaptive_loop(
             anchors.reverse()
 
 
-        # Slight variation improves candidate diversity.
-        route_climb_penalty = (
-
-            climb_penalty_factor
-
-            *
-
-            random.uniform(
-                0.80,
-                1.20
-            )
-        )
-
-
-        route_nodes = [
+        route = [
             start_node
         ]
 
@@ -3120,21 +3801,16 @@ def generate_adaptive_loop(
         failed = False
 
 
-        destinations = (
+        for destination in (
             anchors
-
             +
-
             [start_node]
-        )
-
-
-        for destination in destinations:
+        ):
 
             try:
 
                 leg = (
-                    penalized_shortest_path(
+                    waypoint_path(
 
                         S,
 
@@ -3142,9 +3818,7 @@ def generate_adaptive_loop(
 
                         destination,
 
-                        used_edges,
-
-                        route_climb_penalty
+                        used_edges
                     )
                 )
 
@@ -3153,12 +3827,6 @@ def generate_adaptive_loop(
 
                 failed = True
                 break
-
-
-            if len(leg) < 2:
-
-                current = destination
-                continue
 
 
             for i in range(
@@ -3178,7 +3846,7 @@ def generate_adaptive_loop(
                 )
 
 
-            route_nodes.extend(
+            route.extend(
                 leg[1:]
             )
 
@@ -3190,10 +3858,6 @@ def generate_adaptive_loop(
             continue
 
 
-        if len(route_nodes) < 4:
-            continue
-
-
         (
             score,
             metrics
@@ -3201,7 +3865,7 @@ def generate_adaptive_loop(
 
             G,
 
-            route_nodes,
+            route,
 
             target_distance_meters,
 
@@ -3209,55 +3873,48 @@ def generate_adaptive_loop(
         )
 
 
-        total_distance = (
+        distance = (
             metrics[
                 "total_distance_meters"
             ]
         )
 
 
-        distance_ratio = (
+        if (
 
-            total_distance
+            distance
 
-            /
+            <
 
             target_distance_meters
-        )
-
-
-        if (
-            distance_ratio
-            <
-            profile[
-                "candidate_min_ratio"
-            ]
+            *
+            0.72
 
             or
 
-            distance_ratio
+            distance
+
             >
-            profile[
-                "candidate_max_ratio"
-            ]
+
+            target_distance_meters
+            *
+            1.25
         ):
 
             continue
 
 
-        # Keep the best candidate of any quality
-        # so error messages can tell us what happened.
-        if score < best_score:
+        if score < best_any_score:
 
-            best_score = (
+            best_any_score = (
                 score
             )
 
-            best_route = (
-                route_nodes
+            best_any_route = (
+                route
             )
 
-            best_metrics = (
+            best_any_metrics = (
                 metrics
             )
 
@@ -3286,10 +3943,12 @@ def generate_adaptive_loop(
         )
 
 
-        acceptable = (
+        if (
 
             distance_error_miles
+
             <=
+
             limits[
                 "distance_error_limit_miles"
             ]
@@ -3297,126 +3956,50 @@ def generate_adaptive_loop(
             and
 
             gain_error_ft
+
             <=
+
             limits[
                 "gain_error_limit_ft"
             ]
-        )
+        ):
 
+            if score < best_score:
 
-        if acceptable:
-
-            if (
-                score
-                <
-                best_acceptable_score
-            ):
-
-                best_acceptable_score = (
+                best_score = (
                     score
                 )
 
-                best_acceptable_route = (
-                    route_nodes
+                best_route = (
+                    route
                 )
 
-                best_acceptable_metrics = (
+                best_metrics = (
                     metrics
                 )
 
 
-            excellent_distance = (
-
-                distance_error_miles
-
-                <=
-
-                limits[
-                    "excellent_distance_error_miles"
-                ]
-            )
-
-
-            excellent_gain = (
-
-                gain_error_ft
-
-                <=
-
-                limits[
-                    "excellent_gain_error_ft"
-                ]
-            )
-
-
-            excellent_repeat = (
-
-                metrics[
-                    "repeat_ratio"
-                ]
-
-                <=
-
-                0.025
-            )
-
-
-            if (
-
-                excellent_distance
-
-                and
-
-                excellent_gain
-
-                and
-
-                excellent_repeat
-
-                and
-
-                metrics[
-                    "immediate_reversals"
-                ]
-                ==
-                0
-            ):
-
-                return (
-
-                    best_acceptable_route,
-
-                    best_acceptable_metrics,
-
-                    attempts,
-
-                    climb_penalty_factor
-                )
-
-
-    # Return only a route that passed the
-    # hard quality requirements.
-    if best_acceptable_route is not None:
+    if best_route is not None:
 
         return (
 
-            best_acceptable_route,
+            best_route,
 
-            best_acceptable_metrics,
+            best_metrics,
 
-            attempts,
+            profile[
+                "attempts"
+            ],
 
-            climb_penalty_factor
+            "waypoint"
         )
 
 
-    # If we found candidates but none were good enough,
-    # tell the user what the best one looked like.
-    if best_route is not None:
+    if best_any_route is not None:
 
-        best_distance_miles = (
+        best_distance = (
 
-            best_metrics[
+            best_any_metrics[
                 "total_distance_meters"
             ]
 
@@ -3426,9 +4009,9 @@ def generate_adaptive_loop(
         )
 
 
-        best_gain_ft = (
+        best_gain = (
 
-            best_metrics[
+            best_any_metrics[
                 "actual_gain_meters"
             ]
 
@@ -3444,14 +4027,14 @@ def generate_adaptive_loop(
 
             detail=(
 
-                "No trail-only route met the requested "
-                "quality limits. Best candidate was "
+                "No route met the requested quality "
+                "limits. Best candidate was "
 
                 +
 
                 str(
                     round(
-                        best_distance_miles,
+                        best_distance,
                         2
                     )
                 )
@@ -3464,14 +4047,13 @@ def generate_adaptive_loop(
 
                 str(
                     round(
-                        best_gain_ft
+                        best_gain
                     )
                 )
 
                 +
 
-                " ft gain. Try slightly increasing "
-                "distance or elevation gain."
+                " ft gain."
             )
         )
 
@@ -3481,8 +4063,7 @@ def generate_adaptive_loop(
         status_code=400,
 
         detail=(
-            "No suitable trail loop could be generated "
-            "for these targets."
+            "No suitable waypoint route found."
         )
     )
 
@@ -3505,9 +4086,7 @@ def dem_info():
             status_code=404,
 
             detail=(
-                "DEM file not found: "
-                +
-                DEM_PATH
+                "DEM file not found."
             )
         )
 
@@ -3516,26 +4095,12 @@ def dem_info():
         DEM_PATH
     ) as src:
 
-        vertical_unit = None
-
-
-        try:
-
-            if src.units:
-
-                vertical_unit = (
-                    src.units[0]
-                )
-
-        except Exception:
-
-            vertical_unit = None
-
-
         return {
 
             "file":
-                DEM_PATH,
+                os.path.basename(
+                    DEM_PATH
+                ),
 
             "crs":
                 str(
@@ -3576,19 +4141,13 @@ def dem_info():
                     )
             },
 
-            "vertical_unit":
-                vertical_unit,
-
-            "nodata":
-                src.nodata,
-
-            "trail_sample_spacing_m":
+            "elevation_sample_spacing_m":
                 ELEVATION_SAMPLE_SPACING_M
         }
 
 
 # =========================================================
-# API
+# GENERATE ROUTE
 # =========================================================
 
 @app.post(
@@ -3611,51 +4170,21 @@ def generate_route(
                 status_code=400,
 
                 detail=(
-                    "Target distance must "
-                    "be greater than 0."
+                    "Distance must be greater than 0."
                 )
             )
 
 
-        if (
-            request.target_gain_ft
-            <
-            0
-        ):
+        if request.target_gain_ft < 0:
 
             raise HTTPException(
 
                 status_code=400,
 
                 detail=(
-                    "Elevation gain cannot "
-                    "be negative."
+                    "Elevation gain cannot be negative."
                 )
             )
-
-
-        profile = (
-            get_route_profile(
-                request.target_distance_miles
-            )
-        )
-
-
-        limits = (
-            get_route_quality_limits(
-
-                request.target_distance_miles,
-
-                request.target_gain_ft
-            )
-        )
-
-
-        search_radius_meters = (
-            profile[
-                "search_radius_m"
-            ]
-        )
 
 
         target_distance_meters = (
@@ -3678,6 +4207,23 @@ def generate_route(
         )
 
 
+        profile = (
+            get_route_profile(
+                request.target_distance_miles
+            )
+        )
+
+
+        limits = (
+            get_route_quality_limits(
+
+                request.target_distance_miles,
+
+                request.target_gain_ft
+            )
+        )
+
+
         (
             G,
             filtered_edges_removed,
@@ -3689,7 +4235,9 @@ def generate_route(
 
             request.start_lon,
 
-            search_radius_meters
+            profile[
+                "search_radius_m"
+            ]
         )
 
 
@@ -3739,45 +4287,89 @@ def generate_route(
         )
 
 
-        # =================================================
-        # LOOP
-        # =================================================
-
         if same_point:
 
-            (
-                route_nodes,
-                metrics,
-                route_attempts,
-                climb_penalty_factor
-            ) = generate_adaptive_loop(
+            # -----------------------------------------
+            # SHORT ROUTES:
+            # SEGMENT-BY-SEGMENT BEAM SEARCH
+            # -----------------------------------------
 
-                G,
+            if (
+                request.target_distance_miles
+                <
+                4.0
+            ):
 
-                start_node,
+                (
+                    route_nodes,
+                    metrics,
+                    search_steps,
+                    search_method
+                ) = beam_search_short_loop(
 
-                target_distance_meters,
+                    G,
 
-                target_gain_meters,
+                    start_node,
 
-                request.target_distance_miles,
+                    target_distance_meters,
 
-                request.target_gain_ft,
+                    target_gain_meters,
 
-                profile,
+                    request.target_distance_miles,
 
-                limits
-            )
+                    request.target_gain_ft,
+
+                    limits,
+
+                    profile
+                )
 
 
-            route_type = (
-                "adaptive distance + elevation trail loop"
-            )
+                route_type = (
+                    "short trail-segment beam loop"
+                )
 
 
-        # =================================================
+            # -----------------------------------------
+            # LONGER ROUTES:
+            # WAYPOINT SEARCH
+            # -----------------------------------------
+
+            else:
+
+                (
+                    route_nodes,
+                    metrics,
+                    search_steps,
+                    search_method
+                ) = generate_waypoint_loop(
+
+                    G,
+
+                    start_node,
+
+                    target_distance_meters,
+
+                    target_gain_meters,
+
+                    request.target_distance_miles,
+
+                    request.target_gain_ft,
+
+                    profile,
+
+                    limits
+                )
+
+
+                route_type = (
+                    "adaptive waypoint trail loop"
+                )
+
+
+        # ---------------------------------------------
         # POINT TO POINT
-        # =================================================
+        # ---------------------------------------------
 
         else:
 
@@ -3788,20 +4380,10 @@ def generate_route(
             )
 
 
-            climb_penalty_factor = (
-                get_climb_penalty_factor(
-
-                    request.target_distance_miles,
-
-                    request.target_gain_ft
-                )
-            )
-
-
             try:
 
                 route_nodes = (
-                    penalized_shortest_path(
+                    nx.shortest_path(
 
                         S,
 
@@ -3809,9 +4391,7 @@ def generate_route(
 
                         end_node,
 
-                        set(),
-
-                        climb_penalty_factor
+                        weight="length"
                     )
                 )
 
@@ -3823,8 +4403,8 @@ def generate_route(
                     status_code=400,
 
                     detail=(
-                        "No connected trail route "
-                        "was found between these points."
+                        "No connected trail route found "
+                        "between start and finish."
                     )
                 )
 
@@ -3844,8 +4424,11 @@ def generate_route(
             )
 
 
-            route_attempts = 1
+            search_steps = 1
 
+            search_method = (
+                "point-to-point"
+            )
 
             route_type = (
                 "trail point-to-point"
@@ -3951,6 +4534,14 @@ def generate_route(
             "route_type":
                 route_type,
 
+            "search_method":
+                search_method,
+
+            "route_profile":
+                profile[
+                    "name"
+                ],
+
             "route":
                 coords,
 
@@ -3993,23 +4584,6 @@ def generate_route(
                     2
                 ),
 
-            "route_profile":
-                profile[
-                    "name"
-                ],
-
-            "search_radius_m":
-                search_radius_meters,
-
-            "route_attempts":
-                route_attempts,
-
-            "climb_penalty_factor":
-                round(
-                    climb_penalty_factor,
-                    2
-                ),
-
             "max_allowed_distance_error_miles":
                 round(
                     limits[
@@ -4024,6 +4598,14 @@ def generate_route(
                         "gain_error_limit_ft"
                     ]
                 ),
+
+            "search_steps":
+                search_steps,
+
+            "search_radius_m":
+                profile[
+                    "search_radius_m"
+                ],
 
             "network_nodes":
                 G.number_of_nodes(),
@@ -4049,7 +4631,7 @@ def generate_route(
                 ),
 
             "status":
-                "Adaptive trail route generated"
+                "Route generated"
         }
 
 
@@ -4144,7 +4726,7 @@ label {
 }
 
 input {
-    width: 165px;
+    width: 170px;
     padding: 8px;
     border: 1px solid #aaa;
     border-radius: 4px;
@@ -4171,7 +4753,7 @@ button:disabled {
 }
 
 #map {
-    height: calc(100vh - 490px);
+    height: calc(100vh - 510px);
     min-height: 500px;
     width: 100%;
 }
@@ -4191,17 +4773,6 @@ button:disabled {
 .small {
     font-size: 12px;
     color: #666;
-}
-
-@media (max-width: 700px) {
-
-    input {
-        width: 145px;
-    }
-
-    #map {
-        height: 65vh;
-    }
 }
 
 </style>
@@ -4231,12 +4802,28 @@ Start latitude
     value="33.589281"
 >
 
+</div>
+
+<div class="input-group">
+
+<label for="start_lon">
+Start longitude
+</label>
+
 <input
     id="start_lon"
     type="number"
     step="any"
     value="-112.091148"
 >
+
+</div>
+
+<div class="input-group">
+
+<label for="end_lat">
+End latitude
+</label>
 
 <input
     id="end_lat"
@@ -4245,12 +4832,21 @@ Start latitude
     value="33.589281"
 >
 
+</div>
+
+<div class="input-group">
+
+<label for="end_lon">
+End longitude
+</label>
+
 <input
     id="end_lon"
     type="number"
     step="any"
     value="-112.091148"
 >
+
 </div>
 
 </div>
@@ -4268,7 +4864,7 @@ Target distance (miles)
     type="number"
     step="0.1"
     min="0.1"
-    value="10"
+    value="2.5"
 >
 
 </div>
@@ -4284,7 +4880,7 @@ Target elevation gain (ft)
     type="number"
     step="50"
     min="0"
-    value="2000"
+    value="200"
 >
 
 </div>
@@ -4315,10 +4911,10 @@ const map =
     )
     .setView(
         [
-            33.586,
-            -112.085
+            33.589281,
+            -112.091148
         ],
-        14
+        15
     );
 
 
@@ -4326,6 +4922,7 @@ L.tileLayer(
     "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
     {
         maxZoom: 19,
+
         attribution:
             "&copy; OpenStreetMap contributors"
     }
@@ -4405,8 +5002,8 @@ async function generateRoute() {
 
     results.innerHTML =
         '<span class="warning">' +
-        "Loading trails and terrain, then searching " +
-        "for a route that matches both distance and elevation..." +
+        "Loading trails and elevation, then searching " +
+        "trail-segment combinations..." +
         "</span>";
 
 
@@ -4434,11 +5031,11 @@ async function generateRoute() {
             );
 
 
-        const responseText =
+        const text =
             await response.text();
 
 
-        if (!responseText) {
+        if (!text) {
 
             throw new Error(
                 "Server returned an empty response."
@@ -4451,10 +5048,9 @@ async function generateRoute() {
 
         try {
 
-            result =
-                JSON.parse(
-                    responseText
-                );
+            result = JSON.parse(
+                text
+            );
 
         }
 
@@ -4463,7 +5059,7 @@ async function generateRoute() {
             throw new Error(
                 "Invalid server response: "
                 +
-                responseText.substring(
+                text.substring(
                     0,
                     500
                 )
@@ -4495,14 +5091,18 @@ async function generateRoute() {
 
         const coordinates =
             result.route.map(
+
                 point => [
+
                     point.lat,
+
                     point.lon
                 ]
             );
 
 
         if (routeLine) {
+
             map.removeLayer(
                 routeLine
             );
@@ -4510,6 +5110,7 @@ async function generateRoute() {
 
 
         if (startMarker) {
+
             map.removeLayer(
                 startMarker
             );
@@ -4517,6 +5118,7 @@ async function generateRoute() {
 
 
         if (finishMarker) {
+
             map.removeLayer(
                 finishMarker
             );
@@ -4570,9 +5172,7 @@ async function generateRoute() {
         results.innerHTML =
 
             '<span class="success">' +
-
             "<b>Route generated</b>" +
-
             "</span><br>" +
 
             "<b>Distance target:</b> " +
@@ -4585,10 +5185,6 @@ async function generateRoute() {
 
             "<b>Distance error:</b> " +
             result.distance_error_miles +
-            " mi<br>" +
-
-            "<b>Allowed distance error:</b> ±" +
-            result.max_allowed_distance_error_miles +
             " mi<br><br>" +
 
             "<b>Elevation target:</b> " +
@@ -4601,11 +5197,15 @@ async function generateRoute() {
 
             "<b>Elevation error:</b> " +
             result.elevation_error_ft +
-            " ft<br>" +
-
-            "<b>Allowed elevation error:</b> ±" +
-            result.max_allowed_gain_error_ft +
             " ft<br><br>" +
+
+            "<b>Search method:</b> " +
+            result.search_method +
+            "<br>" +
+
+            "<b>Route profile:</b> " +
+            result.route_profile +
+            "<br>" +
 
             "<b>Repeated trail distance:</b> " +
             result.repeated_distance_miles +
@@ -4627,20 +5227,12 @@ async function generateRoute() {
             result.route_score +
             "<br><br>" +
 
-            "<b>Route profile:</b> " +
-            result.route_profile +
-            "<br>" +
-
             "<b>Search radius:</b> " +
             result.search_radius_m +
             " m<br>" +
 
-            "<b>Candidate search attempts:</b> " +
-            result.route_attempts +
-            "<br>" +
-
-            "<b>Climb penalty:</b> " +
-            result.climb_penalty_factor +
+            "<b>Search steps:</b> " +
+            result.search_steps +
             "<br>" +
 
             "<b>Graph cached:</b> " +
@@ -4653,13 +5245,11 @@ async function generateRoute() {
 
             "<b>Elevation sample spacing:</b> ~" +
             result.elevation_sample_spacing_m +
-            " m<br><br>" +
+            " m<br>" +
 
             '<span class="small">' +
-
             "Elevation source: " +
             result.elevation_source +
-
             "</span>";
 
     }
