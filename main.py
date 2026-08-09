@@ -5,7 +5,6 @@ from pydantic import BaseModel
 import math
 import os
 import random
-import time
 import xml.etree.ElementTree as ET
 
 import networkx as nx
@@ -31,15 +30,10 @@ FEET_PER_METER = 3.28084
 
 DEFAULT_LAT = 33.589281
 DEFAULT_LON = -112.091148
-APP_VERSION = "2026-08-09-search-budget-v2"
 
 # Sample along trail/GPX geometry every 5 m.
 # The source DEM is still ~30 m resolution.
 ELEVATION_SAMPLE_SPACING_M = 5.0
-
-# Smooth the 5 m samples across ~55 m before accumulating ascent/descent.
-# This reduces staircase/noise inflation from repeatedly sampling a ~30 m DEM.
-ELEVATION_SMOOTHING_POINTS = 11
 
 # GPX points within this distance of an allowed trail count as covered.
 GPX_TRAIL_MATCH_TOLERANCE_M = 25.0
@@ -75,7 +69,6 @@ class TrailNetworkRequest(BaseModel):
 def home():
     return {
         "status": "Trail Running Creator API is running",
-        "version": APP_VERSION,
         "map": "/map",
         "docs": "/docs",
         "dem_info": "/dem-info",
@@ -95,18 +88,8 @@ def get_route_profile(target_distance_miles: float):
         return {
             "name": "short-closed-beam",
             "search_radius_m": 1800,
-
-            # Keep the short-route search manageable on Render.
-            "beam_width": 500,
-            "beam_max_steps": 80,
-
-            # Hard computation budgets.
-            "max_search_seconds": 18.0,
-            "max_expanded_states": 100000,
-
-            # Only run the expensive whole-route elevation calculation
-            # on the best closed-loop candidates.
-            "max_closed_candidates": 60,
+            "beam_width": 1200,
+            "beam_max_steps": 120,
         }
 
     if target_distance_miles < 8.0:
@@ -467,23 +450,10 @@ def densify_polyline(coords, spacing_m=ELEVATION_SAMPLE_SPACING_M):
 # DEM SMOOTHING / ASCENT
 # ============================================================
 
-def smooth_elevations(values, window_points=ELEVATION_SMOOTHING_POINTS):
-    """
-    Centered moving average used for both generated routes and GPX analysis.
-
-    With 5 m samples and an 11-point window, the effective smoothing width is
-    about 55 m. This is intentionally wider than one 30 m DEM cell so small
-    raster stair-steps are less likely to be counted as real climbing.
-    """
+def smooth_elevations(values, radius=2):
     if len(values) < 3:
         return [float(v) for v in values]
 
-    window_points = max(1, int(window_points))
-
-    if window_points % 2 == 0:
-        window_points += 1
-
-    radius = window_points // 2
     result = []
 
     for i in range(len(values)):
@@ -644,98 +614,6 @@ def elevations_for_coords(coords):
     return values
 
 
-def route_raw_elevation_samples(G, route_nodes):
-    """
-    Concatenate the raw 5 m DEM samples from every traversed edge into one
-    continuous route profile. This is deliberately done BEFORE smoothing so
-    edge boundaries cannot create artificial ascent/descent resets.
-    """
-    route_coords = []
-    route_elevations = []
-
-    for i in range(len(route_nodes) - 1):
-        u = route_nodes[i]
-        v = route_nodes[i + 1]
-        edge = get_shortest_edge(G, u, v)
-
-        if edge is None:
-            continue
-
-        edge_coords = edge.get("dem_sample_coords")
-        edge_elevations = edge.get("dem_raw_elevations_m")
-
-        # Fallback for any graph created before these cached fields existed.
-        if not edge_coords or not edge_elevations:
-            edge_coords = densify_polyline(
-                oriented_edge_coords(G, u, v, edge),
-                ELEVATION_SAMPLE_SPACING_M,
-            )
-            edge_elevations = elevations_for_coords(edge_coords)
-
-        edge_coords = list(edge_coords)
-        edge_elevations = [float(value) for value in edge_elevations]
-
-        if not edge_coords or not edge_elevations:
-            continue
-
-        # Adjacent directed edges normally share the junction sample.
-        # Drop that one duplicate so it is not over-weighted by smoothing.
-        start_index = 0
-
-        if route_coords:
-            last_lon, last_lat = route_coords[-1]
-            first_lon, first_lat = edge_coords[0]
-
-            if haversine_meters(
-                last_lat,
-                last_lon,
-                first_lat,
-                first_lon,
-            ) < 0.5:
-                start_index = 1
-
-        route_coords.extend(edge_coords[start_index:])
-        route_elevations.extend(edge_elevations[start_index:])
-
-    return route_coords, route_elevations
-
-
-def route_elevation_metrics(G, route_nodes):
-    """
-    Calculate final route ascent/descent from one continuous DEM profile.
-
-    This is the authoritative elevation calculation for generated routes.
-    Edge-level ascent is retained only as a cheap beam-search heuristic.
-    """
-    coords, raw_elevations = route_raw_elevation_samples(G, route_nodes)
-
-    if len(raw_elevations) < 2:
-        return {
-            "ascent_m": 0.0,
-            "descent_m": 0.0,
-            "sample_count": len(raw_elevations),
-            "raw_elevations_m": raw_elevations,
-            "smoothed_elevations_m": raw_elevations,
-            "coords": coords,
-        }
-
-    smoothed = smooth_elevations(
-        raw_elevations,
-        window_points=ELEVATION_SMOOTHING_POINTS,
-    )
-
-    ascent_m, descent_m = calculate_ascent_descent(smoothed)
-
-    return {
-        "ascent_m": float(ascent_m),
-        "descent_m": float(descent_m),
-        "sample_count": len(raw_elevations),
-        "raw_elevations_m": raw_elevations,
-        "smoothed_elevations_m": smoothed,
-        "coords": coords,
-    }
-
-
 # ============================================================
 # ADD ELEVATION TO GRAPH EDGES
 # ============================================================
@@ -796,18 +674,8 @@ def add_local_dem_edge_elevations(G):
             )
             elevations.append(float(elevation_lookup[sample_key]))
 
-        # Keep the raw samples on each directed edge. Generated routes later
-        # concatenate these into one continuous profile and smooth only once.
-        G[u][v][key]["dem_sample_coords"] = list(samples)
-        G[u][v][key]["dem_raw_elevations_m"] = list(elevations)
-
-        # Edge ascent is only a beam-search heuristic. The final route gain is
-        # always recalculated across the whole continuous route profile.
-        heuristic_elevations = smooth_elevations(
-            elevations,
-            window_points=ELEVATION_SMOOTHING_POINTS,
-        )
-        ascent, descent = calculate_ascent_descent(heuristic_elevations)
+        elevations = smooth_elevations(elevations, radius=2)
+        ascent, descent = calculate_ascent_descent(elevations)
 
         G[u][v][key]["ascent_m"] = float(ascent)
         G[u][v][key]["descent_m"] = float(descent)
@@ -826,7 +694,6 @@ def download_trail_graph(lat, lon, radius_meters):
         round(float(lon), 5),
         int(radius_meters),
         ELEVATION_SAMPLE_SPACING_M,
-        ELEVATION_SMOOTHING_POINTS,
     )
 
     if cache_key in GRAPH_CACHE:
@@ -1013,12 +880,7 @@ def count_immediate_reversals(route_nodes):
 
 def route_score(G, route_nodes, target_distance_meters, target_gain_meters):
     total_distance = path_distance_meters(G, route_nodes)
-
-    # Authoritative final elevation calculation: concatenate the entire route's
-    # raw 5 m DEM samples, smooth once across the full route, then accumulate.
-    elevation_metrics = route_elevation_metrics(G, route_nodes)
-    actual_gain = elevation_metrics["ascent_m"]
-    actual_descent = elevation_metrics["descent_m"]
+    actual_gain = path_gain_meters(G, route_nodes)
 
     if total_distance <= 0:
         return float("inf"), {}
@@ -1058,8 +920,6 @@ def route_score(G, route_nodes, target_distance_meters, target_gain_meters):
         {
             "total_distance_meters": total_distance,
             "actual_gain_meters": actual_gain,
-            "actual_descent_meters": actual_descent,
-            "route_elevation_sample_count": elevation_metrics["sample_count"],
             "distance_error_meters": distance_error,
             "gain_error_meters": gain_error,
             "repeated_edges": repeated_edges,
@@ -1085,18 +945,11 @@ def beam_search_short_loop(
     profile,
 ):
     """
-    Time/state-budgeted true closed-loop beam search.
+    Explore actual trail edges one at a time.
 
-    During exploration:
-      - trail distance is exact
-      - edge ascent is only a cheap heuristic
-      - there is no hard elevation prune
-      - whole-route 5 m DEM elevation is NOT recalculated for every loop
-
-    Once the search budget ends:
-      - retain the best closed-loop candidates
-      - accurately score only those finalists using the same continuous
-        5 m DEM profile + smoothing pipeline used by GPX analysis
+    A candidate is scored only when the search itself returns
+    to start_node. A shortest path home is used only as a
+    DISTANCE lower bound for pruning and is never appended.
     """
 
     S = make_simple_routing_graph(G)
@@ -1118,26 +971,20 @@ def beam_search_short_loop(
         limits["distance_error_limit_miles"] * METERS_PER_MILE
     )
 
+    allowed_gain_error_m = (
+        limits["gain_error_limit_ft"] / FEET_PER_METER
+    )
+
     max_acceptable_distance = (
         target_distance_meters + allowed_distance_error_m
     )
 
-    beam_width = int(profile.get("beam_width", 500))
-    max_steps = int(profile.get("beam_max_steps", 80))
-    max_search_seconds = float(profile.get("max_search_seconds", 18.0))
-    max_expanded_states = int(profile.get("max_expanded_states", 100000))
-    max_closed_candidates = int(profile.get("max_closed_candidates", 60))
+    max_allowed_gain = target_gain_meters + allowed_gain_error_m
 
-    target_gain_density = (
-        target_gain_meters / target_distance_meters
-        if target_distance_meters > 0
-        else 0.0
-    )
+    beam_width = profile["beam_width"]
+    max_steps = profile["beam_max_steps"]
 
-    start_time = time.perf_counter()
-    states_expanded = 0
-    last_depth = 0
-    budget_reached = False
+    target_gain_density = target_gain_meters / target_distance_meters
 
     beam = [
         {
@@ -1151,44 +998,24 @@ def beam_search_short_loop(
         }
     ]
 
-    # Closed loops are initially ranked with cheap metrics only.
-    # Accurate whole-route elevation is deferred until the search ends.
-    closed_candidates = []
-    closed_routes_seen = set()
+    best_acceptable_route = None
+    best_acceptable_metrics = None
+    best_acceptable_score = float("inf")
+
+    best_closed_route = None
+    best_closed_metrics = None
+    best_closed_score = float("inf")
+
+    states_expanded = 0
 
     for depth in range(max_steps):
-        last_depth = depth + 1
         expanded = []
 
-        if time.perf_counter() - start_time >= max_search_seconds:
-            budget_reached = True
-            break
-
-        if states_expanded >= max_expanded_states:
-            budget_reached = True
-            break
-
         for state in beam:
-            if time.perf_counter() - start_time >= max_search_seconds:
-                budget_reached = True
-                break
-
-            if states_expanded >= max_expanded_states:
-                budget_reached = True
-                break
-
             current = state["node"]
 
             for neighbor in S.successors(current):
                 states_expanded += 1
-
-                if states_expanded >= max_expanded_states:
-                    budget_reached = True
-                    break
-
-                if time.perf_counter() - start_time >= max_search_seconds:
-                    budget_reached = True
-                    break
 
                 edge_data = S[current][neighbor]
                 edge_length = float(edge_data.get("length", 0) or 0)
@@ -1200,8 +1027,10 @@ def beam_search_short_loop(
                 new_distance = state["distance"] + edge_length
                 new_gain = state["gain"] + edge_gain
 
-                # Distance is safe to hard-prune because it can never decrease.
                 if new_distance > max_acceptable_distance:
+                    continue
+
+                if new_gain > max_allowed_gain:
                     continue
 
                 edge_key = undirected_edge_key(current, neighbor)
@@ -1224,72 +1053,77 @@ def beam_search_short_loop(
                 reversals = state["reversals"] + immediate_reversal
                 new_route = route + (neighbor,)
 
-                # ---------------------------------------------------------
-                # A real closed loop has physically returned to start_node.
-                # ---------------------------------------------------------
+                # ------------------------------------------------
+                # Candidate only when the search physically returns
+                # to the start node.
+                # ------------------------------------------------
                 if neighbor == start_node:
-                    # Ignore tiny accidental circles near the trailhead.
                     if new_distance < target_distance_meters * 0.50:
                         continue
 
-                    route_key = tuple(new_route)
-                    if route_key in closed_routes_seen:
-                        continue
-
-                    closed_routes_seen.add(route_key)
-
-                    distance_error_ratio = (
-                        abs(new_distance - target_distance_meters)
-                        / max(target_distance_meters, 1.0)
+                    candidate_route = list(new_route)
+                    score, metrics = route_score(
+                        G,
+                        candidate_route,
+                        target_distance_meters,
+                        target_gain_meters,
                     )
 
-                    if target_gain_meters > 0:
-                        approximate_gain_error_ratio = (
-                            abs(new_gain - target_gain_meters)
-                            / target_gain_meters
+                    if score < best_closed_score:
+                        best_closed_score = score
+                        best_closed_route = candidate_route
+                        best_closed_metrics = metrics
+
+                    distance_error_miles = (
+                        metrics["distance_error_meters"] / METERS_PER_MILE
+                    )
+
+                    gain_error_ft = (
+                        metrics["gain_error_meters"] * FEET_PER_METER
+                    )
+
+                    acceptable = (
+                        distance_error_miles
+                        <= limits["distance_error_limit_miles"]
+                        and gain_error_ft
+                        <= limits["gain_error_limit_ft"]
+                    )
+
+                    if acceptable and score < best_acceptable_score:
+                        best_acceptable_score = score
+                        best_acceptable_route = candidate_route
+                        best_acceptable_metrics = metrics
+
+                    if acceptable:
+                        excellent_distance = (
+                            distance_error_miles
+                            <= limits["excellent_distance_error_miles"]
                         )
-                    else:
-                        approximate_gain_error_ratio = new_gain / 30.48
 
-                    repeat_ratio = (
-                        repeat_distance / max(new_distance, 1.0)
-                    )
+                        excellent_gain = (
+                            gain_error_ft
+                            <= limits["excellent_gain_error_ft"]
+                        )
 
-                    # Cheap pre-score. Distance is trusted. Edge-level elevation
-                    # is deliberately weak because final elevation is calculated
-                    # from one continuous whole-route DEM profile later.
-                    cheap_score = (
-                        distance_error_ratio * 200.0
-                        + approximate_gain_error_ratio * 25.0
-                        + repeat_ratio * 35.0
-                        + reversals * 5.0
-                    )
+                        if excellent_distance and excellent_gain:
+                            return (
+                                best_acceptable_route,
+                                best_acceptable_metrics,
+                                depth + 1,
+                                states_expanded,
+                            )
 
-                    closed_candidates.append(
-                        (cheap_score, list(new_route))
-                    )
-
-                    # Keep candidate storage bounded during the search.
-                    if (
-                        len(closed_candidates)
-                        > max_closed_candidates * 4
-                    ):
-                        closed_candidates.sort(key=lambda item: item[0])
-                        closed_candidates = closed_candidates[
-                            :max_closed_candidates
-                        ]
-
-                    # Do not continue through the trailhead into a second loop.
+                    # Do not start a second loop through the trailhead.
                     continue
 
-                # ---------------------------------------------------------
-                # Shortest distance home is only a lower-bound feasibility test.
-                # The shortest path itself is NEVER appended to the route.
-                # ---------------------------------------------------------
+                # ------------------------------------------------
+                # Distance-to-home is ONLY a lower-bound prune.
+                # ------------------------------------------------
                 if neighbor not in return_distance:
                     continue
 
                 distance_home_lower_bound = float(return_distance[neighbor])
+
                 minimum_possible_final_distance = (
                     new_distance + distance_home_lower_bound
                 )
@@ -1297,16 +1131,9 @@ def beam_search_short_loop(
                 if minimum_possible_final_distance > max_acceptable_distance:
                     continue
 
-                # ---------------------------------------------------------
-                # Cheap partial-state priority.
-                # ---------------------------------------------------------
-                projected_distance_error = (
-                    abs(
-                        minimum_possible_final_distance
-                        - target_distance_meters
-                    )
-                    / max(target_distance_meters, 1.0)
-                )
+                projected_distance_error = abs(
+                    minimum_possible_final_distance - target_distance_meters
+                ) / target_distance_meters
 
                 if new_distance > 0:
                     current_gain_density = new_gain / new_distance
@@ -1318,27 +1145,46 @@ def beam_search_short_loop(
                     0.004,
                 )
 
-                gain_density_error = (
-                    abs(current_gain_density - target_gain_density)
-                    / gain_density_denominator
+                gain_density_error = abs(
+                    current_gain_density - target_gain_density
+                ) / gain_density_denominator
+
+                distance_progress = min(
+                    1.0,
+                    new_distance / target_distance_meters,
                 )
 
-                repeat_ratio = (
-                    repeat_distance / max(new_distance, 1.0)
-                )
+                if target_gain_meters > 0:
+                    gain_progress = new_gain / target_gain_meters
+                    gain_progress_error = abs(
+                        gain_progress - distance_progress
+                    )
+                else:
+                    gain_progress_error = new_gain / 30.48
+
+                repeat_ratio = repeat_distance / max(new_distance, 1.0)
 
                 node_revisited = neighbor in route
-                node_revisit_penalty = 0.02 if node_revisited else 0.0
+                node_revisit_penalty = 0.03 if node_revisited else 0.0
 
-                # Elevation is intentionally a weak ranking heuristic and never
-                # a hard prune. This keeps potentially good low-vert routes alive
-                # even when edge-level DEM ascent is noisy.
+                gain_overshoot = max(
+                    0.0,
+                    new_gain - target_gain_meters,
+                )
+
+                gain_overshoot_ratio = gain_overshoot / max(
+                    target_gain_meters,
+                    20.0,
+                )
+
                 priority = (
-                    projected_distance_error * 4.0
-                    + gain_density_error * 0.20
-                    + repeat_ratio * 0.20
+                    projected_distance_error * 2.2
+                    + gain_density_error * 1.4
+                    + gain_progress_error * 1.0
+                    + gain_overshoot_ratio * 4.0
+                    + repeat_ratio * 0.30
                     + node_revisit_penalty
-                    + reversals * 0.02
+                    + reversals * 0.03
                 )
 
                 expanded.append(
@@ -1356,19 +1202,9 @@ def beam_search_short_loop(
                     )
                 )
 
-            if budget_reached:
-                break
-
-        if budget_reached:
-            break
-
         if not expanded:
             break
 
-        # -------------------------------------------------------------
-        # Beam reduction / state deduplication.
-        # Preserve multiple materially different ways to reach a node.
-        # -------------------------------------------------------------
         expanded.sort(key=lambda item: item[0])
 
         next_beam = []
@@ -1378,9 +1214,9 @@ def beam_search_short_loop(
             route = state["route"]
             previous_node = route[-2] if len(route) >= 2 else None
 
-            distance_bucket = int(state["distance"] / 30.0)
-            gain_bucket = int(state["gain"] / 10.0)
-            repeat_bucket = int(state["repeat_distance"] / 30.0)
+            distance_bucket = int(state["distance"] / 20.0)
+            gain_bucket = int(state["gain"] / 1.0)
+            repeat_bucket = int(state["repeat_distance"] / 20.0)
 
             bucket = (
                 state["node"],
@@ -1401,108 +1237,46 @@ def beam_search_short_loop(
 
         beam = next_beam
 
-    # =============================================================
-    # ACCURATE FINAL SCORING
-    # =============================================================
-    # Run the expensive 5 m continuous-route DEM + ~55 m smoothing
-    # only on the best closed-loop finalists.
-
-    if closed_candidates:
-        closed_candidates.sort(key=lambda item: item[0])
-        closed_candidates = closed_candidates[:max_closed_candidates]
-
-    best_acceptable_route = None
-    best_acceptable_metrics = None
-    best_acceptable_score = float("inf")
-
-    best_closed_route = None
-    best_closed_metrics = None
-    best_closed_score = float("inf")
-
-    for cheap_score, candidate_route in closed_candidates:
-        score, metrics = route_score(
-            G,
-            candidate_route,
-            target_distance_meters,
-            target_gain_meters,
-        )
-
-        if score < best_closed_score:
-            best_closed_score = score
-            best_closed_route = candidate_route
-            best_closed_metrics = metrics
-
-        distance_error_miles = (
-            metrics["distance_error_meters"] / METERS_PER_MILE
-        )
-
-        gain_error_ft = (
-            metrics["gain_error_meters"] * FEET_PER_METER
-        )
-
-        acceptable = (
-            distance_error_miles
-            <= limits["distance_error_limit_miles"]
-            and gain_error_ft
-            <= limits["gain_error_limit_ft"]
-        )
-
-        if acceptable and score < best_acceptable_score:
-            best_acceptable_score = score
-            best_acceptable_route = candidate_route
-            best_acceptable_metrics = metrics
-
     if best_acceptable_route is not None:
         return (
             best_acceptable_route,
             best_acceptable_metrics,
-            last_depth,
+            max_steps,
             states_expanded,
         )
 
     if best_closed_route is not None:
-        best_distance_miles = (
+        best_distance = (
             best_closed_metrics["total_distance_meters"] / METERS_PER_MILE
         )
 
-        best_gain_ft = (
+        best_gain = (
             best_closed_metrics["actual_gain_meters"] * FEET_PER_METER
-        )
-
-        budget_text = (
-            " Search budget was reached."
-            if budget_reached
-            else ""
         )
 
         raise HTTPException(
             status_code=400,
             detail=(
-                "Closed loops were found, but none met the requested "
-                "quality limits. Best accurately scored route was "
-                f"{best_distance_miles:.2f} mi / "
-                f"{round(best_gain_ft)} ft gain."
-                + budget_text
+                "True closed-loop beam search did not find a route inside "
+                "the quality limits. Best closed route found was "
+                f"{best_distance:.2f} mi / {round(best_gain)} ft gain. "
+                "Use Analyze GPX below with a manual route to compare the "
+                "same DEM and allowed trail network."
             ),
         )
-
-    budget_text = (
-        " Search budget was reached."
-        if budget_reached
-        else ""
-    )
 
     raise HTTPException(
         status_code=400,
         detail=(
-            "No closed loop was found within the search budget."
-            + budget_text
+            "The beam search never found a closed loop inside the allowed "
+            "distance/gain search space. Use Analyze GPX below with a manual "
+            "route to diagnose which search rule is excluding it."
         ),
     )
 
 
 # ============================================================
-# LONGER-ROUTE WAYPOINT PATH SEARCH
+# WAYPOINT SEARCH FOR 4+ MILE ROUTES
 # ============================================================
 
 def waypoint_path(S, source, target, used_edges):
@@ -1885,7 +1659,7 @@ async def analyze_gpx(
         raw_dem_elevations = elevations_for_coords(dense_coords)
         smoothed_dem_elevations = smooth_elevations(
             raw_dem_elevations,
-            window_points=ELEVATION_SMOOTHING_POINTS,
+            radius=2,
         )
 
         ascent_m, descent_m = calculate_ascent_descent(
@@ -2001,10 +1775,7 @@ async def analyze_gpx(
             "graph_from_cache": graph_from_cache,
             "graph_elevation_samples": unique_elevation_samples,
             "elevation_sample_spacing_m": ELEVATION_SAMPLE_SPACING_M,
-            "elevation_smoothing_window_points": ELEVATION_SMOOTHING_POINTS,
-            "elevation_smoothing_window_m_approx": round(
-                ELEVATION_SMOOTHING_POINTS * ELEVATION_SAMPLE_SPACING_M
-            ),
+            "elevation_smoothing_window_points": 5,
             "elevation_source": os.path.basename(DEM_PATH),
             "route": [
                 {
@@ -2121,10 +1892,6 @@ def dem_info():
                 "y": abs(src.transform.e),
             },
             "elevation_sample_spacing_m": ELEVATION_SAMPLE_SPACING_M,
-            "elevation_smoothing_window_points": ELEVATION_SMOOTHING_POINTS,
-            "elevation_smoothing_window_m_approx": round(
-                ELEVATION_SMOOTHING_POINTS * ELEVATION_SAMPLE_SPACING_M
-            ),
         }
 
 
@@ -2277,10 +2044,6 @@ def generate_route(request: RouteRequest):
             metrics["actual_gain_meters"] * FEET_PER_METER
         )
 
-        actual_descent_ft = (
-            metrics.get("actual_descent_meters", 0.0) * FEET_PER_METER
-        )
-
         distance_error_miles = abs(
             route_distance_miles - request.target_distance_miles
         )
@@ -2301,7 +2064,6 @@ def generate_route(request: RouteRequest):
             "distance_error_miles": round(distance_error_miles, 2),
             "requested_gain_ft": request.target_gain_ft,
             "actual_gain_ft": round(actual_gain_ft),
-            "actual_descent_ft": round(actual_descent_ft),
             "elevation_error_ft": round(elevation_error_ft),
             "route_type": route_type,
             "search_method": search_method,
@@ -2332,15 +2094,7 @@ def generate_route(request: RouteRequest):
             "filtered_edges_removed": filtered_edges_removed,
             "graph_from_cache": graph_from_cache,
             "unique_elevation_samples": unique_elevation_samples,
-            "route_elevation_samples": metrics.get(
-                "route_elevation_sample_count",
-                0,
-            ),
             "elevation_sample_spacing_m": ELEVATION_SAMPLE_SPACING_M,
-            "elevation_smoothing_window_points": ELEVATION_SMOOTHING_POINTS,
-            "elevation_smoothing_window_m_approx": round(
-                ELEVATION_SMOOTHING_POINTS * ELEVATION_SAMPLE_SPACING_M
-            ),
             "elevation_source": os.path.basename(DEM_PATH),
             "snapped_start_lat": snapped_start_lat,
             "snapped_start_lon": snapped_start_lon,
@@ -2506,7 +2260,6 @@ button:disabled {
 <div id="controls">
 
 <h2>Trail Running Creator</h2>
-<div class="small"><b>Version:</b> 2026-08-09-search-budget-v2</div>
 
 <div class="input-row">
     <div class="input-group">
@@ -2871,7 +2624,6 @@ async function generateRoute() {
             "<b>Distance error:</b> " + result.distance_error_miles + " mi<br><br>" +
             "<b>Elevation target:</b> " + result.requested_gain_ft + " ft<br>" +
             "<b>Actual elevation gain:</b> " + result.actual_gain_ft + " ft<br>" +
-            "<b>Actual descent:</b> " + result.actual_descent_ft + " ft<br>" +
             "<b>Elevation error:</b> " + result.elevation_error_ft + " ft<br><br>" +
             "<b>Search method:</b> " + result.search_method + "<br>" +
             "<b>Route profile:</b> " + result.route_profile + "<br>" +
@@ -2884,11 +2636,8 @@ async function generateRoute() {
             "<b>Immediate reversals:</b> " + result.immediate_reversals + "<br>" +
             "<b>Route score:</b> " + result.route_score + "<br><br>" +
             "<b>Graph cached:</b> " + result.graph_from_cache + "<br>" +
-            "<b>Graph elevation samples:</b> " + result.unique_elevation_samples + "<br>" +
-            "<b>Route elevation samples:</b> " + result.route_elevation_samples + "<br>" +
+            "<b>Elevation samples:</b> " + result.unique_elevation_samples + "<br>" +
             "<b>Elevation sample spacing:</b> ~" + result.elevation_sample_spacing_m + " m<br>" +
-            "<b>Elevation smoothing:</b> " + result.elevation_smoothing_window_points +
-            " points (~" + result.elevation_smoothing_window_m_approx + " m)<br>" +
             '<span class="small">Elevation source: ' + result.elevation_source + "</span>";
 
     } catch (error) {
@@ -2986,8 +2735,7 @@ async function analyzeGpx() {
             "<b>Raw GPX points:</b> " + result.raw_gpx_points + "<br>" +
             "<b>DEM sample points:</b> " + result.dem_sample_points + "<br>" +
             "<b>Elevation sample spacing:</b> ~" + result.elevation_sample_spacing_m + " m<br>" +
-            "<b>Elevation smoothing window:</b> " + result.elevation_smoothing_window_points +
-            " points (~" + result.elevation_smoothing_window_m_approx + " m)<br>" +
+            "<b>Elevation smoothing window:</b> " + result.elevation_smoothing_window_points + " points<br>" +
             '<span class="small">Blue = manual GPX, red = generated route, gray = allowed trail network.</span>';
 
     } catch (error) {
