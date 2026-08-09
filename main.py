@@ -44,13 +44,14 @@ GPX_TRAIL_MATCH_TOLERANCE_M = 25.0
 MAX_CACHED_GRAPHS = 5
 GRAPH_CACHE = {}
 
-# One filtered OSM trail graph covering the entire DEM/TIFF footprint.
+# One filtered OSM hybrid graph covering the entire DEM/TIFF footprint:
+# natural trails plus real walkable connector ways.
 # It is loaded/built lazily on the first trail request, then every route request
 # extracts only a local subgraph around its start coordinate.
 MASTER_GRAPH = None
 MASTER_GRAPH_INFO = {}
 MASTER_GRAPH_LOCK = threading.Lock()
-MASTER_GRAPH_PATH = os.path.join(BASE_DIR, "master_trails_output_USGS10m.graphml")
+MASTER_GRAPH_PATH = os.path.join(BASE_DIR, "master_walkable_trails_output_USGS10m_v8.graphml")
 DEM_BOUNDS_WGS84_CACHE = None
 
 # Cache DEM values by rounded lat/lon. Graph construction already samples
@@ -59,9 +60,15 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-09-v7-full-tiff-master-network"
+APP_VERSION = "2026-08-09-v8-full-tiff-hybrid-connectors"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
+TRAIL_HIGHWAYS = {"path", "track", "steps"}
+HARD_TRAIL_SURFACES = {"asphalt", "concrete", "concrete:lanes", "concrete:plates", "paving_stones", "sett", "cobblestone"}
+CONNECTOR_HIGHWAYS = {"footway", "pedestrian", "cycleway", "bridleway", "residential", "living_street", "service", "unclassified", "tertiary", "secondary", "primary", "road"}
+CONNECTOR_PATH_COST_MULTIPLIER = 2.5
+CONNECTOR_FINAL_SCORE_WEIGHT = 120.0
+CONNECTOR_CHEAP_SCORE_WEIGHT = 90.0
 
 
 # ============================================================
@@ -107,11 +114,7 @@ def home():
 # ============================================================
 
 def get_route_profile(target_distance_miles: float):
-
-    # Search radius = 50% of requested route distance.
-    search_radius_m = int(
-    target_distance_miles * METERS_PER_MILE
-    )
+    search_radius_m = max(250, int(float(target_distance_miles) * METERS_PER_MILE))
 
     if target_distance_miles < 4.0:
         return {
@@ -125,7 +128,6 @@ def get_route_profile(target_distance_miles: float):
             "partial_tuning_base_candidates": 32,
             "continue_through_start_below_target": True,
         }
-
     if target_distance_miles < 8.0:
         return {
             "name": "medium-waypoint",
@@ -137,7 +139,6 @@ def get_route_profile(target_distance_miles: float):
             "accurate_finalists": 40,
             "candidate_pool_multiplier": 3,
         }
-
     if target_distance_miles < 15.0:
         return {
             "name": "long-waypoint",
@@ -149,7 +150,6 @@ def get_route_profile(target_distance_miles: float):
             "accurate_finalists": 50,
             "candidate_pool_multiplier": 3,
         }
-
     return {
         "name": "ultra-waypoint",
         "search_radius_m": search_radius_m,
@@ -258,16 +258,18 @@ def node_angle_from_start(G, start_node, node):
 # EDGE HELPERS
 # ============================================================
 
+def edge_routing_cost(data):
+    length = float(data.get("length", 0) or 0)
+    if str(data.get("route_class", "trail")) == "connector":
+        return max(0.0, length) * CONNECTOR_PATH_COST_MULTIPLIER
+    return max(0.0, length)
+
+
 def get_shortest_edge(G, u, v):
     edge_data = G.get_edge_data(u, v)
-
     if not edge_data:
         return None
-
-    return min(
-        edge_data.values(),
-        key=lambda edge: float(edge.get("length", float("inf"))),
-    )
+    return min(edge_data.values(), key=lambda edge: (edge_routing_cost(edge), float(edge.get("length", float("inf")))))
 
 
 def path_distance_meters(G, route_nodes):
@@ -486,6 +488,7 @@ def edge_attributes_for_split_part(original_data, coords):
     attrs["ascent_m"] = float(ascent_m)
     attrs["descent_m"] = float(descent_m)
     attrs["elevation_sample_count"] = len(samples)
+    attrs["routing_cost"] = float(edge_routing_cost(attrs))
     attrs["virtual_split_edge"] = True
     return attrs
 
@@ -504,7 +507,11 @@ def insert_exact_routing_point(G, lat, lon):
     lat = float(lat)
     lon = float(lon)
 
-    projected = ox.projection.project_graph(G)
+    snap_graph = trail_only_graph(G)
+    if snap_graph.number_of_edges() == 0:
+        snap_graph = G
+
+    projected = ox.projection.project_graph(snap_graph)
     projected_crs = projected.graph.get("crs")
     if projected_crs is None:
         raise HTTPException(
@@ -545,7 +552,7 @@ def insert_exact_routing_point(G, lat, lon):
     # If the requested point is not actually on/very near a trail, keep the
     # former nearest-node behavior rather than inventing an off-trail connector.
     if edge_distance_m > EXACT_POINT_MAX_TRAIL_OFFSET_M:
-        fallback = int(ox.distance.nearest_nodes(G, X=lon, Y=lat))
+        fallback = int(ox.distance.nearest_nodes(snap_graph, X=lon, Y=lat))
         fallback_lat = float(G.nodes[fallback]["y"])
         fallback_lon = float(G.nodes[fallback]["x"])
         return G, fallback, {
@@ -654,7 +661,7 @@ def insert_exact_routing_point(G, lat, lon):
 
     if H.degree(virtual_node) == 0:
         H.remove_node(virtual_node)
-        fallback = int(ox.distance.nearest_nodes(G, X=lon, Y=lat))
+        fallback = int(ox.distance.nearest_nodes(snap_graph, X=lon, Y=lat))
         fallback_lat = float(G.nodes[fallback]["y"])
         fallback_lon = float(G.nodes[fallback]["x"])
         return G, fallback, {
@@ -682,29 +689,19 @@ def insert_exact_routing_point(G, lat, lon):
 # ============================================================
 
 def graph_debug_segments(G):
+    """Return natural trail geometry for the gray map overlay; hide connectors."""
     segments = []
     seen = set()
-
     for u, v, key, data in G.edges(keys=True, data=True):
-        physical_key = (
-            min(int(u), int(v)),
-            max(int(u), int(v)),
-            round(float(data.get("length", 0) or 0), 1),
-        )
-
+        if str(data.get("route_class", "trail")) != "trail":
+            continue
+        physical_key = (min(int(u), int(v)), max(int(u), int(v)), round(float(data.get("length", 0) or 0), 1))
         if physical_key in seen:
             continue
-
         seen.add(physical_key)
-
         coords = oriented_edge_coords(G, u, v, data)
-        if len(coords) < 2:
-            continue
-
-        segments.append(
-            [[float(lat), float(lon)] for lon, lat in coords]
-        )
-
+        if len(coords) >= 2:
+            segments.append([[float(lat), float(lon)] for lon, lat in coords])
     return segments
 
 
@@ -712,41 +709,53 @@ def graph_debug_segments(G):
 # TRAIL FILTER
 # ============================================================
 
-def edge_is_allowed_trail(data):
-    highways = normalize_tag_values(data.get("highway"))
-    surfaces = normalize_tag_values(data.get("surface"))
+def edge_access_allowed(data):
     access = normalize_tag_values(data.get("access"))
     foot = normalize_tag_values(data.get("foot"))
     area = normalize_tag_values(data.get("area"))
     indoor = normalize_tag_values(data.get("indoor"))
-
-    if not highways.intersection({"path", "track", "steps"}):
+    if "yes" in area or "yes" in indoor:
         return False
-
-    hard_surfaces = {
-        "asphalt",
-        "concrete",
-        "concrete:lanes",
-        "concrete:plates",
-        "paving_stones",
-        "sett",
-        "cobblestone",
-    }
-
-    if surfaces.intersection(hard_surfaces):
+    if "no" in foot:
         return False
-
-    if "yes" in area:
+    if access.intersection({"no", "private"}) and not foot.intersection({"yes", "designated", "permissive"}):
         return False
-
-    if "yes" in indoor:
-        return False
-
-    if access.intersection({"no", "private"}):
-        if not foot.intersection({"yes", "designated", "permissive"}):
-            return False
-
     return True
+
+
+def classify_walkable_edge(data):
+    if not edge_access_allowed(data):
+        return None
+    highways = normalize_tag_values(data.get("highway"))
+    surfaces = normalize_tag_values(data.get("surface"))
+    if highways.intersection(TRAIL_HIGHWAYS):
+        return "connector" if surfaces.intersection(HARD_TRAIL_SURFACES) else "trail"
+    if highways.intersection(CONNECTOR_HIGHWAYS):
+        return "connector"
+    return None
+
+
+def edge_is_allowed_trail(data):
+    return classify_walkable_edge(data) == "trail"
+
+
+def trail_edge_ids(G):
+    return [(u, v, key) for u, v, key, data in G.edges(keys=True, data=True) if str(data.get("route_class", "trail")) == "trail"]
+
+
+def trail_only_graph(G):
+    edges = trail_edge_ids(G)
+    return G.edge_subgraph(edges).copy() if edges else G.__class__()
+
+
+def graph_route_class_counts(G):
+    trail_edges = connector_edges = 0
+    for _, _, _, data in G.edges(keys=True, data=True):
+        if str(data.get("route_class", "trail")) == "connector":
+            connector_edges += 1
+        else:
+            trail_edges += 1
+    return trail_edges, connector_edges
 
 
 # ============================================================
@@ -984,67 +993,27 @@ def elevations_for_coords(coords):
 def add_local_dem_edge_elevations(G):
     edge_samples = {}
     all_points = []
-
     for u, v, key, data in G.edges(keys=True, data=True):
+        if str(data.get("route_class", "trail")) != "trail":
+            G[u][v][key]["ascent_m"] = 0.0
+            G[u][v][key]["descent_m"] = 0.0
+            G[u][v][key]["elevation_sample_count"] = 0
+            continue
         coords = oriented_edge_coords(G, u, v, data)
         samples = densify_polyline(coords, ELEVATION_SAMPLE_SPACING_M)
-
         if len(samples) < 2:
-            samples = [
-                (
-                    float(G.nodes[u]["x"]),
-                    float(G.nodes[u]["y"]),
-                ),
-                (
-                    float(G.nodes[v]["x"]),
-                    float(G.nodes[v]["y"]),
-                ),
-            ]
-
+            samples = [(float(G.nodes[u]["x"]), float(G.nodes[u]["y"])), (float(G.nodes[v]["x"]), float(G.nodes[v]["y"]))]
         edge_samples[(u, v, key)] = samples
         all_points.extend(samples)
-
-    elevation_lookup = sample_dem_points(all_points)
-
-    node_points = [
-        (
-            float(G.nodes[node]["x"]),
-            float(G.nodes[node]["y"]),
-        )
-        for node in G.nodes
-    ]
-
-    node_lookup = sample_dem_points(node_points)
-
-    for node in G.nodes:
-        lat = float(G.nodes[node]["y"])
-        lon = float(G.nodes[node]["x"])
-
-        node_key = (
-            round(lat, 7),
-            round(lon, 7),
-        )
-
-        G.nodes[node]["elevation"] = float(node_lookup[node_key])
-
+    lookup = sample_dem_points(all_points) if all_points else {}
     for (u, v, key), samples in edge_samples.items():
-        elevations = []
-
-        for lon, lat in samples:
-            sample_key = (
-                round(float(lat), 7),
-                round(float(lon), 7),
-            )
-            elevations.append(float(elevation_lookup[sample_key]))
-
+        elevations = [float(lookup[(round(float(lat), 7), round(float(lon), 7))]) for lon, lat in samples]
         elevations = smooth_elevations(elevations, radius=ELEVATION_SMOOTHING_RADIUS)
         ascent, descent = calculate_ascent_descent(elevations)
-
         G[u][v][key]["ascent_m"] = float(ascent)
         G[u][v][key]["descent_m"] = float(descent)
         G[u][v][key]["elevation_sample_count"] = len(samples)
-
-    return G, len(elevation_lookup)
+    return G, len(lookup)
 
 
 # ============================================================
@@ -1143,6 +1112,8 @@ def configure_osmnx_trail_tags():
         "tracktype",
         "sac_scale",
         "trail_visibility",
+        "sidewalk",
+        "service",
     ]
 
     useful_tags = list(ox.settings.useful_tags_way)
@@ -1155,232 +1126,105 @@ def configure_osmnx_trail_tags():
 
 
 def master_graph_metadata(G, loaded_from_disk=False):
-    physical = set()
-
+    physical = set(); trail_physical = set(); connector_physical = set()
     for u, v, key, data in G.edges(keys=True, data=True):
-        physical.add(
-            (
-                min(int(u), int(v)),
-                max(int(u), int(v)),
-                round(float(data.get("length", 0) or 0), 1),
-            )
-        )
-
+        pk = (min(int(u), int(v)), max(int(u), int(v)), round(float(data.get("length", 0) or 0), 1))
+        physical.add(pk)
+        if str(data.get("route_class", "trail")) == "connector": connector_physical.add(pk)
+        else: trail_physical.add(pk)
     return {
-        "nodes": int(G.number_of_nodes()),
-        "edges": int(G.number_of_edges()),
-        "physical_segments": int(len(physical)),
-        "filtered_edges_removed": int(
-            float(G.graph.get("master_filtered_edges_removed", 0) or 0)
-        ),
-        "loaded_from_disk": bool(loaded_from_disk),
-        "bbox": get_dem_bounds_wgs84(),
+        "nodes": int(G.number_of_nodes()), "edges": int(G.number_of_edges()),
+        "physical_segments": len(physical),
+        "trail_physical_segments": len(trail_physical),
+        "connector_physical_segments": len(connector_physical),
+        "filtered_edges_removed": int(float(G.graph.get("master_filtered_edges_removed", 0) or 0)),
+        "loaded_from_disk": bool(loaded_from_disk), "bbox": get_dem_bounds_wgs84(),
         "saved_graph": os.path.basename(MASTER_GRAPH_PATH),
     }
 
 
 def try_load_saved_master_graph():
-    if not os.path.exists(MASTER_GRAPH_PATH):
-        return None
-
+    if not os.path.exists(MASTER_GRAPH_PATH): return None
     try:
         G = ox.io.load_graphml(filepath=MASTER_GRAPH_PATH)
-        saved_signature = str(G.graph.get("dem_signature", ""))
-
-        if saved_signature != get_dem_signature():
-            return None
-
-        if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
-            return None
-
-        return G
+        if str(G.graph.get("dem_signature", "")) != get_dem_signature(): return None
+        if str(G.graph.get("master_network_schema", "")) != "hybrid-v8": return None
+        return G if G.number_of_nodes() and G.number_of_edges() else None
     except Exception:
-        # A bad/stale cache must never prevent the app from rebuilding.
         return None
 
 
 def save_master_graph(G):
     try:
-        ox.io.save_graphml(G, filepath=MASTER_GRAPH_PATH)
-        return True
+        ox.io.save_graphml(G, filepath=MASTER_GRAPH_PATH); return True
     except Exception:
-        # Runtime cache still works even if the deployment filesystem cannot
-        # persist the graph file.
         return False
 
 
 def build_master_trail_graph():
-    """
-    Download and filter every allowed trail inside the complete TIFF footprint.
-
-    This is done once per service lifetime (or loaded from the saved GraphML).
-    Elevation is intentionally NOT precomputed for the whole master network:
-    only the small local subgraph used by a route request receives DEM edge
-    data, preserving v6 routing behavior without a huge startup cost.
-    """
     configure_osmnx_trail_tags()
-
     bbox = get_dem_bounds_wgs84()
-    trail_filter = '["highway"~"path|track|steps"]'
-
+    hybrid_filter = '["highway"~"path|track|steps|footway|pedestrian|cycleway|bridleway|residential|living_street|service|unclassified|tertiary|secondary|primary|road"]'
     try:
-        G = ox.graph.graph_from_bbox(
-            bbox,
-            network_type="walk",
-            custom_filter=trail_filter,
-            simplify=True,
-            retain_all=True,
-            truncate_by_edge=False,
-        )
+        G = ox.graph.graph_from_bbox(bbox, network_type="walk", custom_filter=hybrid_filter, simplify=True, retain_all=True, truncate_by_edge=False)
     except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not download the master TIFF trail network: {exc}",
-        )
-
-    original_edges = G.number_of_edges()
-    remove_edges = []
-
+        raise HTTPException(status_code=502, detail=f"Could not download the master TIFF walkable network: {exc}")
+    original_edges = G.number_of_edges(); remove = []
     for u, v, key, data in G.edges(keys=True, data=True):
-        if not edge_is_allowed_trail(data):
-            remove_edges.append((u, v, key))
-            continue
-
-        if not edge_fully_inside_dem(G, u, v, data):
-            remove_edges.append((u, v, key))
-
-    G.remove_edges_from(remove_edges)
-    G.remove_nodes_from(list(nx.isolates(G)))
-
-    if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="No usable trail network was found inside the TIFF footprint.",
-        )
-
-    G.graph["dem_signature"] = get_dem_signature()
-    G.graph["master_filtered_edges_removed"] = int(
-        original_edges - G.number_of_edges()
-    )
-    G.graph["master_tiff_name"] = os.path.basename(DEM_PATH)
-    G.graph["master_network_version"] = APP_VERSION
-
-    save_master_graph(G)
-    return G
+        rc = classify_walkable_edge(data)
+        if rc is None or not edge_fully_inside_dem(G, u, v, data):
+            remove.append((u, v, key)); continue
+        data["route_class"] = rc
+        length = float(data.get("length", 0) or 0)
+        data["routing_cost"] = length * (CONNECTOR_PATH_COST_MULTIPLIER if rc == "connector" else 1.0)
+    G.remove_edges_from(remove); G.remove_nodes_from(list(nx.isolates(G)))
+    if not G.number_of_edges() or not trail_edge_ids(G):
+        raise HTTPException(status_code=400, detail="No usable natural trail network was found inside the TIFF footprint.")
+    G.graph["dem_signature"] = get_dem_signature(); G.graph["master_filtered_edges_removed"] = int(original_edges - G.number_of_edges())
+    G.graph["master_tiff_name"] = os.path.basename(DEM_PATH); G.graph["master_network_version"] = APP_VERSION; G.graph["master_network_schema"] = "hybrid-v8"
+    save_master_graph(G); return G
 
 
 def get_master_trail_graph():
-    """Return the one in-memory trail graph covering the entire TIFF."""
     global MASTER_GRAPH, MASTER_GRAPH_INFO
-
-    if MASTER_GRAPH is not None:
-        return MASTER_GRAPH, MASTER_GRAPH_INFO
-
+    if MASTER_GRAPH is not None: return MASTER_GRAPH, MASTER_GRAPH_INFO
     with MASTER_GRAPH_LOCK:
-        if MASTER_GRAPH is not None:
-            return MASTER_GRAPH, MASTER_GRAPH_INFO
-
-        G = try_load_saved_master_graph()
-        loaded_from_disk = G is not None
-
-        if G is None:
-            G = build_master_trail_graph()
-
-        MASTER_GRAPH = G
-        MASTER_GRAPH_INFO = master_graph_metadata(
-            G,
-            loaded_from_disk=loaded_from_disk,
-        )
-
+        if MASTER_GRAPH is not None: return MASTER_GRAPH, MASTER_GRAPH_INFO
+        G = try_load_saved_master_graph(); loaded = G is not None
+        if G is None: G = build_master_trail_graph()
+        MASTER_GRAPH = G; MASTER_GRAPH_INFO = master_graph_metadata(G, loaded_from_disk=loaded)
     return MASTER_GRAPH, MASTER_GRAPH_INFO
 
 
 def extract_local_master_subgraph(master_G, lat, lon, radius_meters):
-    """
-    Extract only the nearby portion of the already-loaded TIFF-wide graph.
-    The route algorithms therefore see a graph comparable in size to v6.
-    """
     if not point_inside_dem(lat, lon):
         left, bottom, right, top = get_dem_bounds_wgs84()
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Start coordinate is outside the elevation TIFF coverage. "
-                f"TIFF bounds are west={left:.6f}, east={right:.6f}, "
-                f"south={bottom:.6f}, north={top:.6f}."
-            ),
-        )
-
-    local_bbox = ox.utils_geo.bbox_from_point(
-        (float(lat), float(lon)),
-        float(radius_meters),
-    )
-
-    dem_left, dem_bottom, dem_right, dem_top = get_dem_bounds_wgs84()
-    left = max(float(local_bbox[0]), dem_left)
-    bottom = max(float(local_bbox[1]), dem_bottom)
-    right = min(float(local_bbox[2]), dem_right)
-    top = min(float(local_bbox[3]), dem_top)
-
-    if left >= right or bottom >= top:
-        raise HTTPException(
-            status_code=400,
-            detail="No TIFF-covered search area exists around this start coordinate.",
-        )
-
+        raise HTTPException(status_code=400, detail=f"Start coordinate is outside TIFF coverage: west={left:.6f}, east={right:.6f}, south={bottom:.6f}, north={top:.6f}.")
+    local_bbox = ox.utils_geo.bbox_from_point((float(lat), float(lon)), float(radius_meters))
+    dl, db, dr, dt = get_dem_bounds_wgs84()
+    left, bottom, right, top = max(float(local_bbox[0]), dl), max(float(local_bbox[1]), db), min(float(local_bbox[2]), dr), min(float(local_bbox[3]), dt)
+    if left >= right or bottom >= top: raise HTTPException(status_code=400, detail="No TIFF-covered search area exists around this start coordinate.")
     try:
-        local = ox.truncate.truncate_graph_bbox(
-            master_G,
-            (left, bottom, right, top),
-            truncate_by_edge=True,
-        )
+        local = ox.truncate.truncate_graph_bbox(master_G, (left, bottom, right, top), truncate_by_edge=True)
     except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not extract trails around this start coordinate: {exc}",
-        )
-
-    if local.number_of_nodes() == 0 or local.number_of_edges() == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="No allowed trails were found near this start coordinate.",
-        )
-
-    try:
-        nearest = ox.distance.nearest_nodes(
-            local,
-            X=float(lon),
-            Y=float(lat),
-        )
-    except Exception as exc:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Could not locate a nearby trail node: {exc}",
-        )
-
-    component = nx.node_connected_component(
-        local.to_undirected(as_view=True),
-        nearest,
-    )
-
+        raise HTTPException(status_code=400, detail=f"Could not extract trails around this start coordinate: {exc}")
+    trail_local = trail_only_graph(local)
+    if not local.number_of_edges() or not trail_local.number_of_edges(): raise HTTPException(status_code=400, detail="No natural trails were found near this start coordinate.")
+    nearest = ox.distance.nearest_nodes(trail_local, X=float(lon), Y=float(lat))
+    component = nx.node_connected_component(local.to_undirected(as_view=True), nearest)
     G = local.subgraph(component).copy()
-
-    if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
-        raise HTTPException(
-            status_code=400,
-            detail="The nearby trail network is not connected enough to route from this start.",
-        )
-
+    if not G.number_of_edges(): raise HTTPException(status_code=400, detail="The nearby hybrid trail network is not connected enough to route from this start.")
     return G
 
 
 def download_trail_graph(lat, lon, radius_meters):
     """
-    v7 compatibility wrapper.
+    v8 compatibility wrapper.
 
     Unlike v6, this never downloads OSM around each individual start. It loads
-    one TIFF-wide master network once, then extracts/caches a local graph and
-    adds the same DEM edge elevation data used by the existing route engines.
+    one TIFF-wide hybrid network once, then extracts/caches a local graph.
+    Natural trails get cheap per-edge DEM ascent; winning routes still receive
+    the full continuous-route DEM calculation.
     """
     cache_key = (
         round(float(lat), 5),
@@ -1388,6 +1232,7 @@ def download_trail_graph(lat, lon, radius_meters):
         int(radius_meters),
         ELEVATION_SAMPLE_SPACING_M,
         os.path.basename(DEM_PATH),
+        "hybrid-v8",
     )
 
     if cache_key in GRAPH_CACHE:
@@ -1435,25 +1280,15 @@ def download_trail_graph(lat, lon, radius_meters):
 def make_simple_routing_graph(G):
     S = nx.DiGraph()
     S.add_nodes_from(G.nodes(data=True))
-
     for u, v, data in G.edges(data=True):
         length = float(data.get("length", 0) or 0)
-        ascent = float(data.get("ascent_m", 0) or 0)
-
         if length <= 0:
             continue
-
-        if (
-            not S.has_edge(u, v)
-            or length < float(S[u][v].get("length", float("inf")))
-        ):
-            S.add_edge(
-                u,
-                v,
-                length=length,
-                ascent_m=ascent,
-            )
-
+        ascent = float(data.get("ascent_m", 0) or 0)
+        route_class = str(data.get("route_class", "trail"))
+        routing_cost = float(data.get("routing_cost", edge_routing_cost(data)))
+        if not S.has_edge(u, v) or routing_cost < float(S[u][v].get("routing_cost", float("inf"))):
+            S.add_edge(u, v, length=length, ascent_m=ascent, route_class=route_class, routing_cost=routing_cost)
     return S
 
 
@@ -1489,6 +1324,15 @@ def repeated_edge_stats(G, route_nodes):
             repeated_distance += lengths.get(edge_key, 0) * (count - 1)
 
     return repeated_edges, repeated_distance
+
+
+def connector_distance_meters(G, route_nodes):
+    total = 0.0
+    for i in range(len(route_nodes) - 1):
+        edge = get_shortest_edge(G, route_nodes[i], route_nodes[i + 1])
+        if edge is not None and str(edge.get("route_class", "trail")) == "connector":
+            total += float(edge.get("length", 0) or 0)
+    return total
 
 
 def repeated_node_occurrences(route_nodes):
@@ -1585,6 +1429,8 @@ def score_route_coordinates(
     repeat_ratio = repeated_distance / total_distance
     repeated_nodes = repeated_node_occurrences(route_nodes)
     immediate_reversals = count_immediate_reversals(route_nodes)
+    connector_distance = connector_distance_meters(G, route_nodes)
+    connector_ratio = connector_distance / max(total_distance, 1.0)
 
     if target_distance_meters < 4 * METERS_PER_MILE:
         repeat_weight = 50.0
@@ -1599,6 +1445,7 @@ def score_route_coordinates(
         + repeat_ratio * repeat_weight
         + repeated_nodes * node_weight
         + immediate_reversals * 12.0
+        + connector_ratio * CONNECTOR_FINAL_SCORE_WEIGHT
     )
 
     return (
@@ -1614,6 +1461,9 @@ def score_route_coordinates(
             "repeat_ratio": repeat_ratio,
             "repeated_nodes": repeated_nodes,
             "immediate_reversals": immediate_reversals,
+            "connector_distance_meters": connector_distance,
+            "connector_ratio": connector_ratio,
+            "trail_fraction": max(0.0, 1.0 - connector_ratio),
             "score": score,
             "route_coordinates": coords,
             "route_elevation_sample_count": geometry["dem_sample_points"],
@@ -1753,6 +1603,8 @@ def partial_edge_tuning_candidates(
 
         for neighbor in S.successors(u):
             data = S[u][neighbor]
+            if str(data.get("route_class", "trail")) != "trail":
+                continue
             length = float(data.get("length", 0) or 0)
             ascent = float(data.get("ascent_m", 0) or 0)
 
@@ -1866,6 +1718,7 @@ def beam_search_short_loop(
         "gain": 0.0,
         "used_edges": frozenset(),
         "repeat_distance": 0.0,
+        "connector_distance": 0.0,
         "reversals": 0,
     }]
 
@@ -1887,13 +1740,15 @@ def beam_search_short_loop(
             target_gain_density, 0.003
         )
         repeat_ratio = state["repeat_distance"] / max(state["distance"], 1.0)
+        connector_ratio = state.get("connector_distance", 0.0) / max(state["distance"], 1.0)
         reversal_penalty = state["reversals"] * 0.02
+        connector_penalty = connector_ratio * 1.5
 
         return {
-            "balanced": distance_error * 3.0 + density_error * 0.85 + repeat_ratio * 0.25 + reversal_penalty,
-            "gain": density_error * 2.5 + distance_error * 1.0 + repeat_ratio * 0.20 + reversal_penalty,
-            "distance": distance_error * 5.0 + density_error * 0.15 + repeat_ratio * 0.15 + reversal_penalty,
-            "flat": gain_density * 8.0 + distance_error * 2.0 + repeat_ratio * 0.15 + reversal_penalty,
+            "balanced": distance_error * 3.0 + density_error * 0.85 + repeat_ratio * 0.25 + reversal_penalty + connector_penalty,
+            "gain": density_error * 2.5 + distance_error * 1.0 + repeat_ratio * 0.20 + reversal_penalty + connector_penalty,
+            "distance": distance_error * 5.0 + density_error * 0.15 + repeat_ratio * 0.15 + reversal_penalty + connector_penalty,
+            "flat": gain_density * 8.0 + distance_error * 2.0 + repeat_ratio * 0.15 + reversal_penalty + connector_penalty,
         }
 
     for depth in range(max_steps):
@@ -1939,6 +1794,9 @@ def beam_search_short_loop(
                 reversals = state["reversals"] + immediate_reversal
                 new_route = route + (neighbor,)
                 new_gain = state["gain"] + edge_gain
+                new_connector_distance = state.get("connector_distance", 0.0) + (
+                    edge_length if str(edge.get("route_class", "trail")) == "connector" else 0.0
+                )
 
                 if neighbor == start_node:
                     # A partial out-and-back can add at most 0.75 mi. Therefore a
@@ -1963,6 +1821,7 @@ def beam_search_short_loop(
                             )
                             repeat_ratio = repeat_distance / max(new_distance, 1.0)
                             gain_density = new_gain / max(new_distance, 1.0)
+                            connector_ratio = new_connector_distance / max(new_distance, 1.0)
 
                             closed_candidates.append({
                                 "route": list(new_route),
@@ -1972,7 +1831,8 @@ def beam_search_short_loop(
                                 "gain_ratio": gain_ratio,
                                 "repeat_ratio": repeat_ratio,
                                 "gain_density": gain_density,
-                                "cheap_balanced": distance_ratio * 3.0 + gain_ratio * 1.2 + repeat_ratio * 0.25,
+                                "connector_ratio": connector_ratio,
+                                "cheap_balanced": distance_ratio * 3.0 + gain_ratio * 1.2 + repeat_ratio * 0.25 + connector_ratio * 1.5,
                             })
 
                             # Keep candidate storage bounded but diverse.
@@ -2005,6 +1865,7 @@ def beam_search_short_loop(
                         "gain": new_gain,
                         "used_edges": frozenset(used_edges),
                         "repeat_distance": repeat_distance,
+                        "connector_distance": new_connector_distance,
                         "reversals": reversals,
                     }
                     priorities = state_priorities(new_state, new_distance)
@@ -2051,6 +1912,7 @@ def beam_search_short_loop(
                 int(state["distance"] / 30.0),
                 int(state["gain"] / 6.0),
                 int(state["repeat_distance"] / 30.0),
+                int(state.get("connector_distance", 0.0) / 50.0),
             )
             if bucket in seen_buckets:
                 continue
@@ -2224,17 +2086,27 @@ def diversify_closed_candidates(
 
 def waypoint_path(S, source, target, used_edges):
     def weight(u, v, data):
-        cost = float(data.get("length", 1.0))
-
+        cost = float(data.get("routing_cost", data.get("length", 1.0)))
         if undirected_edge_key(u, v) in used_edges:
             cost *= 40.0
-
         return cost
 
-    return nx.shortest_path(
+    def heuristic(a, b):
+        try:
+            return haversine_meters(
+                float(S.nodes[a]["y"]),
+                float(S.nodes[a]["x"]),
+                float(S.nodes[b]["y"]),
+                float(S.nodes[b]["x"]),
+            )
+        except Exception:
+            return 0.0
+
+    return nx.astar_path(
         S,
         source,
         target,
+        heuristic=heuristic,
         weight=weight,
     )
 
@@ -2272,6 +2144,8 @@ def cheap_waypoint_score(
     repeat_ratio = repeated_distance / max(total_distance, 1.0)
     repeated_nodes = repeated_node_occurrences(route_nodes)
     immediate_reversals = count_immediate_reversals(route_nodes)
+    connector_distance = connector_distance_meters(G, route_nodes)
+    connector_ratio = connector_distance / max(total_distance, 1.0)
 
     # Distance and approximate elevation are the primary exploratory goals.
     # Repetition remains a meaningful but secondary penalty.
@@ -2281,6 +2155,7 @@ def cheap_waypoint_score(
         + repeat_ratio * 170.0
         + repeated_nodes * 12.0
         + immediate_reversals * 10.0
+        + connector_ratio * CONNECTOR_CHEAP_SCORE_WEIGHT
     )
 
     return score, {
@@ -2290,6 +2165,8 @@ def cheap_waypoint_score(
         "repeated_distance_meters": repeated_distance,
         "repeated_nodes": repeated_nodes,
         "immediate_reversals": immediate_reversals,
+        "connector_distance_meters": connector_distance,
+        "connector_ratio": connector_ratio,
     }
 
 
@@ -2319,13 +2196,22 @@ def generate_waypoint_loop(
 
     candidates = []
 
+    # For a closed route, ~50% of total distance is the practical maximum
+    # straight-line reach because the route still has to return to the start.
     max_radial_distance = min(
-        profile["search_radius_m"] * 0.90,
-        target_distance_meters * 0.32,
+        profile["search_radius_m"] * 0.95,
+        target_distance_meters * 0.48,
     )
 
-    for node in S.nodes:
-        if node == start_node:
+    # Waypoint anchors are chosen on natural trails, never on connector streets.
+    trail_nodes = set()
+    for u, v, data in G.edges(data=True):
+        if str(data.get("route_class", "trail")) == "trail":
+            trail_nodes.add(u)
+            trail_nodes.add(v)
+
+    for node in trail_nodes:
+        if node == start_node or node not in S:
             continue
 
         radial = haversine_meters(
@@ -3416,6 +3302,7 @@ def trail_network(request: TrailNetworkRequest):
         snap_distance = float(start_info["routing_offset_m"])
 
         segments = graph_debug_segments(G)
+        local_trail_edges, local_connector_edges = graph_route_class_counts(G)
         _, master_info = get_master_trail_graph()
 
         return {
@@ -3426,6 +3313,10 @@ def trail_network(request: TrailNetworkRequest):
             "master_network_nodes": master_info["nodes"],
             "master_network_edges": master_info["edges"],
             "master_physical_segments": master_info["physical_segments"],
+            "master_trail_segments": master_info.get("trail_physical_segments", 0),
+            "master_connector_segments": master_info.get("connector_physical_segments", 0),
+            "local_trail_directed_edges": local_trail_edges,
+            "local_connector_directed_edges": local_connector_edges,
             "master_loaded_from_disk": master_info["loaded_from_disk"],
             "master_tiff": os.path.basename(DEM_PATH),
             "search_radius_m": profile["search_radius_m"],
@@ -3711,6 +3602,8 @@ def generate_route(request: RouteRequest):
             ),
             "repeated_nodes": metrics["repeated_nodes"],
             "immediate_reversals": metrics["immediate_reversals"],
+            "connector_distance_miles": round(metrics.get("connector_distance_meters", 0.0) / METERS_PER_MILE, 2),
+            "trail_percent": round(metrics.get("trail_fraction", 1.0) * 100.0, 1),
             "route_score": round(metrics["score"], 2),
             "max_allowed_distance_error_miles": round(
                 limits["distance_error_limit_miles"],
@@ -3905,7 +3798,7 @@ button:disabled {
 <div id="controls">
 
 <h2>Trail Running Creator</h2>
-<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-v7-full-tiff-master-network</div>
+<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-v8-full-tiff-hybrid-connectors</div>
 
 <div class="input-row">
     <div class="input-group">
