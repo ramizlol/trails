@@ -110,9 +110,7 @@ def get_route_profile(target_distance_miles: float):
 
     # Search radius = 50% of requested route distance.
     search_radius_m = int(
-        target_distance_miles
-        * 0.5
-        * METERS_PER_MILE
+    target_distance_miles * METERS_PER_MILE
     )
 
     if target_distance_miles < 4.0:
