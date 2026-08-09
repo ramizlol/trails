@@ -3,5 +3,6 @@ uvicorn[standard]
 osmnx
 networkx
 scikit-learn
-rasterio>=1.5.0
+rasterio
 numpy
+python-multipart
