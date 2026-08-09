@@ -6,6 +6,7 @@ import math
 import os
 import random
 import time
+import threading
 import xml.etree.ElementTree as ET
 
 import networkx as nx
@@ -14,7 +15,7 @@ import osmnx as ox
 import rasterio
 from pyproj import Transformer
 from shapely.geometry import LineString
-from rasterio.warp import transform as rio_transform
+from rasterio.warp import transform as rio_transform, transform_bounds as rio_transform_bounds
 
 
 app = FastAPI()
@@ -25,7 +26,7 @@ app = FastAPI()
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DEM_PATH = os.path.join(BASE_DIR, "output_USGS30m.tif")
+DEM_PATH = os.path.join(BASE_DIR, "output_USGS10m.tif")
 
 METERS_PER_MILE = 1609.344
 FEET_PER_METER = 3.28084
@@ -34,7 +35,7 @@ DEFAULT_LAT = 33.586055
 DEFAULT_LON = -112.083341
 
 # Sample along trail/GPX geometry every 5 m.
-# The source DEM is still ~30 m resolution.
+# The source DEM is ~10 m resolution.
 ELEVATION_SAMPLE_SPACING_M = 5.0
 
 # GPX points within this distance of an allowed trail count as covered.
@@ -43,13 +44,22 @@ GPX_TRAIL_MATCH_TOLERANCE_M = 25.0
 MAX_CACHED_GRAPHS = 5
 GRAPH_CACHE = {}
 
+# One filtered OSM trail graph covering the entire DEM/TIFF footprint.
+# It is loaded/built lazily on the first trail request, then every route request
+# extracts only a local subgraph around its start coordinate.
+MASTER_GRAPH = None
+MASTER_GRAPH_INFO = {}
+MASTER_GRAPH_LOCK = threading.Lock()
+MASTER_GRAPH_PATH = os.path.join(BASE_DIR, "master_trails_output_USGS10m.graphml")
+DEM_BOUNDS_WGS84_CACHE = None
+
 # Cache DEM values by rounded lat/lon. Graph construction already samples
 # most trail points, so later route scoring can reuse those values instead
 # of reopening/resampling the GeoTIFF for every finalist.
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-09-v6-fast-waypoint-coros-gpx"
+APP_VERSION = "2026-08-09-v7-full-tiff-master-network"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
 
@@ -1034,26 +1044,91 @@ def add_local_dem_edge_elevations(G):
 
 
 # ============================================================
-# DOWNLOAD / CACHE TRAIL GRAPH
+# MASTER TIFF TRAIL GRAPH + LOCAL GRAPH CACHE
 # ============================================================
 
-def download_trail_graph(lat, lon, radius_meters):
-    cache_key = (
-        round(float(lat), 5),
-        round(float(lon), 5),
-        int(radius_meters),
-        ELEVATION_SAMPLE_SPACING_M,
-    )
+def get_dem_bounds_wgs84():
+    """Return the TIFF footprint as (left, bottom, right, top) in EPSG:4326."""
+    global DEM_BOUNDS_WGS84_CACHE
 
-    if cache_key in GRAPH_CACHE:
-        cached = GRAPH_CACHE[cache_key]
-        return (
-            cached["graph"],
-            cached["filtered_edges_removed"],
-            True,
-            cached["unique_elevation_samples"],
+    if DEM_BOUNDS_WGS84_CACHE is not None:
+        return DEM_BOUNDS_WGS84_CACHE
+
+    if not os.path.exists(DEM_PATH):
+        raise HTTPException(
+            status_code=500,
+            detail=f"DEM file not found: {DEM_PATH}",
         )
 
+    with rasterio.open(DEM_PATH) as src:
+        if src.crs is None:
+            raise HTTPException(
+                status_code=500,
+                detail="DEM has no CRS information.",
+            )
+
+        left, bottom, right, top = rio_transform_bounds(
+            src.crs,
+            "EPSG:4326",
+            src.bounds.left,
+            src.bounds.bottom,
+            src.bounds.right,
+            src.bounds.top,
+            densify_pts=21,
+        )
+
+    DEM_BOUNDS_WGS84_CACHE = (
+        float(left),
+        float(bottom),
+        float(right),
+        float(top),
+    )
+    return DEM_BOUNDS_WGS84_CACHE
+
+
+def get_dem_signature():
+    """Stable signature used to reject a stale saved master graph."""
+    bounds = get_dem_bounds_wgs84()
+
+    with rasterio.open(DEM_PATH) as src:
+        width = int(src.width)
+        height = int(src.height)
+
+    return (
+        f"{os.path.basename(DEM_PATH)}|"
+        f"{bounds[0]:.8f},{bounds[1]:.8f},"
+        f"{bounds[2]:.8f},{bounds[3]:.8f}|"
+        f"{width}x{height}"
+    )
+
+
+def point_inside_dem(lat, lon):
+    left, bottom, right, top = get_dem_bounds_wgs84()
+    lat = float(lat)
+    lon = float(lon)
+    return left <= lon <= right and bottom <= lat <= top
+
+
+def edge_fully_inside_dem(G, u, v, data):
+    """
+    Keep only trails whose complete stored geometry lies inside the TIFF.
+    This deliberately drops boundary-crossing pieces so route elevation can
+    never wander into NoData/outside-raster territory.
+    """
+    left, bottom, right, top = get_dem_bounds_wgs84()
+    coords = oriented_edge_coords(G, u, v, data)
+
+    if not coords:
+        return False
+
+    for lon, lat in coords:
+        if not (left <= float(lon) <= right and bottom <= float(lat) <= top):
+            return False
+
+    return True
+
+
+def configure_osmnx_trail_tags():
     extra_tags = [
         "surface",
         "footway",
@@ -1074,23 +1149,100 @@ def download_trail_graph(lat, lon, radius_meters):
 
     ox.settings.useful_tags_way = useful_tags
 
+
+def master_graph_metadata(G, loaded_from_disk=False):
+    physical = set()
+
+    for u, v, key, data in G.edges(keys=True, data=True):
+        physical.add(
+            (
+                min(int(u), int(v)),
+                max(int(u), int(v)),
+                round(float(data.get("length", 0) or 0), 1),
+            )
+        )
+
+    return {
+        "nodes": int(G.number_of_nodes()),
+        "edges": int(G.number_of_edges()),
+        "physical_segments": int(len(physical)),
+        "filtered_edges_removed": int(
+            float(G.graph.get("master_filtered_edges_removed", 0) or 0)
+        ),
+        "loaded_from_disk": bool(loaded_from_disk),
+        "bbox": get_dem_bounds_wgs84(),
+        "saved_graph": os.path.basename(MASTER_GRAPH_PATH),
+    }
+
+
+def try_load_saved_master_graph():
+    if not os.path.exists(MASTER_GRAPH_PATH):
+        return None
+
+    try:
+        G = ox.io.load_graphml(filepath=MASTER_GRAPH_PATH)
+        saved_signature = str(G.graph.get("dem_signature", ""))
+
+        if saved_signature != get_dem_signature():
+            return None
+
+        if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
+            return None
+
+        return G
+    except Exception:
+        # A bad/stale cache must never prevent the app from rebuilding.
+        return None
+
+
+def save_master_graph(G):
+    try:
+        ox.io.save_graphml(G, filepath=MASTER_GRAPH_PATH)
+        return True
+    except Exception:
+        # Runtime cache still works even if the deployment filesystem cannot
+        # persist the graph file.
+        return False
+
+
+def build_master_trail_graph():
+    """
+    Download and filter every allowed trail inside the complete TIFF footprint.
+
+    This is done once per service lifetime (or loaded from the saved GraphML).
+    Elevation is intentionally NOT precomputed for the whole master network:
+    only the small local subgraph used by a route request receives DEM edge
+    data, preserving v6 routing behavior without a huge startup cost.
+    """
+    configure_osmnx_trail_tags()
+
+    bbox = get_dem_bounds_wgs84()
     trail_filter = '["highway"~"path|track|steps"]'
 
-    G = ox.graph.graph_from_point(
-        (lat, lon),
-        dist=radius_meters,
-        network_type="walk",
-        custom_filter=trail_filter,
-        simplify=True,
-        retain_all=True,
-    )
+    try:
+        G = ox.graph.graph_from_bbox(
+            bbox,
+            network_type="walk",
+            custom_filter=trail_filter,
+            simplify=True,
+            retain_all=True,
+            truncate_by_edge=False,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not download the master TIFF trail network: {exc}",
+        )
 
     original_edges = G.number_of_edges()
-
     remove_edges = []
 
     for u, v, key, data in G.edges(keys=True, data=True):
         if not edge_is_allowed_trail(data):
+            remove_edges.append((u, v, key))
+            continue
+
+        if not edge_fully_inside_dem(G, u, v, data):
             remove_edges.append((u, v, key))
 
     G.remove_edges_from(remove_edges)
@@ -1099,23 +1251,158 @@ def download_trail_graph(lat, lon, radius_meters):
     if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
         raise HTTPException(
             status_code=400,
-            detail="No usable trail network found.",
+            detail="No usable trail network was found inside the TIFF footprint.",
         )
 
-    nearest = ox.distance.nearest_nodes(
-        G,
-        X=lon,
-        Y=lat,
+    G.graph["dem_signature"] = get_dem_signature()
+    G.graph["master_filtered_edges_removed"] = int(
+        original_edges - G.number_of_edges()
+    )
+    G.graph["master_tiff_name"] = os.path.basename(DEM_PATH)
+    G.graph["master_network_version"] = APP_VERSION
+
+    save_master_graph(G)
+    return G
+
+
+def get_master_trail_graph():
+    """Return the one in-memory trail graph covering the entire TIFF."""
+    global MASTER_GRAPH, MASTER_GRAPH_INFO
+
+    if MASTER_GRAPH is not None:
+        return MASTER_GRAPH, MASTER_GRAPH_INFO
+
+    with MASTER_GRAPH_LOCK:
+        if MASTER_GRAPH is not None:
+            return MASTER_GRAPH, MASTER_GRAPH_INFO
+
+        G = try_load_saved_master_graph()
+        loaded_from_disk = G is not None
+
+        if G is None:
+            G = build_master_trail_graph()
+
+        MASTER_GRAPH = G
+        MASTER_GRAPH_INFO = master_graph_metadata(
+            G,
+            loaded_from_disk=loaded_from_disk,
+        )
+
+    return MASTER_GRAPH, MASTER_GRAPH_INFO
+
+
+def extract_local_master_subgraph(master_G, lat, lon, radius_meters):
+    """
+    Extract only the nearby portion of the already-loaded TIFF-wide graph.
+    The route algorithms therefore see a graph comparable in size to v6.
+    """
+    if not point_inside_dem(lat, lon):
+        left, bottom, right, top = get_dem_bounds_wgs84()
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Start coordinate is outside the elevation TIFF coverage. "
+                f"TIFF bounds are west={left:.6f}, east={right:.6f}, "
+                f"south={bottom:.6f}, north={top:.6f}."
+            ),
+        )
+
+    local_bbox = ox.utils_geo.bbox_from_point(
+        (float(lat), float(lon)),
+        float(radius_meters),
     )
 
+    dem_left, dem_bottom, dem_right, dem_top = get_dem_bounds_wgs84()
+    left = max(float(local_bbox[0]), dem_left)
+    bottom = max(float(local_bbox[1]), dem_bottom)
+    right = min(float(local_bbox[2]), dem_right)
+    top = min(float(local_bbox[3]), dem_top)
+
+    if left >= right or bottom >= top:
+        raise HTTPException(
+            status_code=400,
+            detail="No TIFF-covered search area exists around this start coordinate.",
+        )
+
+    try:
+        local = ox.truncate.truncate_graph_bbox(
+            master_G,
+            (left, bottom, right, top),
+            truncate_by_edge=True,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not extract trails around this start coordinate: {exc}",
+        )
+
+    if local.number_of_nodes() == 0 or local.number_of_edges() == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No allowed trails were found near this start coordinate.",
+        )
+
+    try:
+        nearest = ox.distance.nearest_nodes(
+            local,
+            X=float(lon),
+            Y=float(lat),
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not locate a nearby trail node: {exc}",
+        )
+
     component = nx.node_connected_component(
-        G.to_undirected(as_view=True),
+        local.to_undirected(as_view=True),
         nearest,
     )
 
-    G = G.subgraph(component).copy()
+    G = local.subgraph(component).copy()
 
-    filtered_edges_removed = original_edges - G.number_of_edges()
+    if G.number_of_nodes() == 0 or G.number_of_edges() == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="The nearby trail network is not connected enough to route from this start.",
+        )
+
+    return G
+
+
+def download_trail_graph(lat, lon, radius_meters):
+    """
+    v7 compatibility wrapper.
+
+    Unlike v6, this never downloads OSM around each individual start. It loads
+    one TIFF-wide master network once, then extracts/caches a local graph and
+    adds the same DEM edge elevation data used by the existing route engines.
+    """
+    cache_key = (
+        round(float(lat), 5),
+        round(float(lon), 5),
+        int(radius_meters),
+        ELEVATION_SAMPLE_SPACING_M,
+        os.path.basename(DEM_PATH),
+    )
+
+    if cache_key in GRAPH_CACHE:
+        cached = GRAPH_CACHE[cache_key]
+        return (
+            cached["graph"],
+            cached["filtered_edges_removed"],
+            True,
+            cached["unique_elevation_samples"],
+        )
+
+    master_G, master_info = get_master_trail_graph()
+
+    G = extract_local_master_subgraph(
+        master_G,
+        lat,
+        lon,
+        radius_meters,
+    )
 
     G, unique_elevation_samples = add_local_dem_edge_elevations(G)
 
@@ -1125,13 +1412,13 @@ def download_trail_graph(lat, lon, radius_meters):
 
     GRAPH_CACHE[cache_key] = {
         "graph": G,
-        "filtered_edges_removed": filtered_edges_removed,
+        "filtered_edges_removed": master_info["filtered_edges_removed"],
         "unique_elevation_samples": unique_elevation_samples,
     }
 
     return (
         G,
-        filtered_edges_removed,
+        master_info["filtered_edges_removed"],
         False,
         unique_elevation_samples,
     )
@@ -3125,12 +3412,18 @@ def trail_network(request: TrailNetworkRequest):
         snap_distance = float(start_info["routing_offset_m"])
 
         segments = graph_debug_segments(G)
+        _, master_info = get_master_trail_graph()
 
         return {
             "allowed_trails": segments,
             "allowed_trail_segments": len(segments),
             "network_nodes": G.number_of_nodes(),
             "network_edges": G.number_of_edges(),
+            "master_network_nodes": master_info["nodes"],
+            "master_network_edges": master_info["edges"],
+            "master_physical_segments": master_info["physical_segments"],
+            "master_loaded_from_disk": master_info["loaded_from_disk"],
+            "master_tiff": os.path.basename(DEM_PATH),
             "search_radius_m": profile["search_radius_m"],
             "route_profile": profile["name"],
             "version": APP_VERSION,
@@ -3608,7 +3901,7 @@ button:disabled {
 <div id="controls">
 
 <h2>Trail Running Creator</h2>
-<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-exact-gpx-start-v4</div>
+<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-v7-full-tiff-master-network</div>
 
 <div class="input-row">
     <div class="input-group">
@@ -3946,6 +4239,12 @@ async function loadTrailNetwork(data) {
         "<b>Allowed trail network:</b> " +
         result.allowed_trail_segments +
         " physical segments<br>" +
+        "<b>Master TIFF trail network:</b> " +
+        result.master_physical_segments +
+        " physical segments<br>" +
+        "<b>Master TIFF:</b> " +
+        result.master_tiff +
+        "<br>" +
         "<b>Graph nodes:</b> " +
         result.network_nodes +
         "<br>" +
