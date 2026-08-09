@@ -5,6 +5,7 @@ from pydantic import BaseModel
 import osmnx as ox
 import networkx as nx
 import random
+import math
 
 
 app = FastAPI()
@@ -28,61 +29,342 @@ def home():
     }
 
 
-# ---------------------------------------------------------
-# GRAPH HELPERS
-# ---------------------------------------------------------
+# =========================================================
+# BASIC HELPERS
+# =========================================================
 
-def get_shortest_edge(G, u, v):
-    edge_data = G.get_edge_data(u, v)
+def normalize_tag_values(value):
+    """
+    Convert an OSM tag value/list into
+    a lowercase set of strings.
+    """
+
+    if value is None:
+        return set()
+
+    if not isinstance(
+        value,
+        (list, tuple, set)
+    ):
+        value = [value]
+
+    result = set()
+
+    for item in value:
+
+        if item is None:
+            continue
+
+        # Some OSM tags can contain
+        # semicolon-separated values.
+        for part in str(item).split(";"):
+
+            part = part.strip().lower()
+
+            if part:
+                result.add(part)
+
+    return result
+
+
+def undirected_edge_key(u, v):
+
+    return tuple(
+        sorted(
+            (
+                int(u),
+                int(v)
+            )
+        )
+    )
+
+
+def haversine_meters(
+    lat1,
+    lon1,
+    lat2,
+    lon2
+):
+
+    radius = 6371000.0
+
+    p1 = math.radians(lat1)
+    p2 = math.radians(lat2)
+
+    dphi = math.radians(
+        lat2 - lat1
+    )
+
+    dlambda = math.radians(
+        lon2 - lon1
+    )
+
+    a = (
+        math.sin(
+            dphi / 2.0
+        ) ** 2
+        +
+        math.cos(p1)
+        *
+        math.cos(p2)
+        *
+        math.sin(
+            dlambda / 2.0
+        ) ** 2
+    )
+
+    return (
+        2.0
+        *
+        radius
+        *
+        math.atan2(
+            math.sqrt(a),
+            math.sqrt(
+                1.0 - a
+            )
+        )
+    )
+
+
+def node_angle_from_start(
+    G,
+    start_node,
+    node
+):
+
+    start_lat = float(
+        G.nodes[start_node]["y"]
+    )
+
+    start_lon = float(
+        G.nodes[start_node]["x"]
+    )
+
+    lat = float(
+        G.nodes[node]["y"]
+    )
+
+    lon = float(
+        G.nodes[node]["x"]
+    )
+
+    # Used only to geographically order
+    # waypoints around the trailhead.
+    x = (
+        (lon - start_lon)
+        *
+        math.cos(
+            math.radians(
+                start_lat
+            )
+        )
+    )
+
+    y = (
+        lat - start_lat
+    )
+
+    return math.atan2(
+        y,
+        x
+    )
+
+
+# =========================================================
+# GRAPH HELPERS
+# =========================================================
+
+def get_shortest_edge(
+    G,
+    u,
+    v
+):
+
+    edge_data = (
+        G.get_edge_data(
+            u,
+            v
+        )
+    )
 
     if not edge_data:
         return None
 
     return min(
         edge_data.values(),
-        key=lambda edge: edge.get(
-            "length",
-            float("inf")
-        )
+        key=lambda edge:
+            float(
+                edge.get(
+                    "length",
+                    float("inf")
+                )
+            )
     )
 
 
-def path_distance_meters(G, route_nodes):
+def path_distance_meters(
+    G,
+    route_nodes
+):
+
     total = 0.0
 
-    for i in range(len(route_nodes) - 1):
-        u = route_nodes[i]
-        v = route_nodes[i + 1]
+    for i in range(
+        len(route_nodes) - 1
+    ):
 
         edge = get_shortest_edge(
             G,
-            u,
-            v
+            route_nodes[i],
+            route_nodes[i + 1]
         )
 
-        if edge:
+        if edge is not None:
+
             total += float(
                 edge.get(
                     "length",
                     0
                 )
+                or 0
             )
 
     return total
 
 
-def route_coordinates(G, route_nodes):
+def make_simple_routing_graph(G):
     """
-    Return the FULL OSM geometry for every edge in the route.
+    Turn the OSMnx MultiDiGraph into
+    a simpler DiGraph for routing.
 
-    This is important because simplified OSMnx graphs may have
-    long edges between junction nodes, while the real curved trail
-    geometry is stored in the edge's 'geometry' attribute.
+    If multiple OSM edges connect the
+    same nodes, keep the shortest one.
+    """
+
+    S = nx.DiGraph()
+
+    S.add_nodes_from(
+        G.nodes(
+            data=True
+        )
+    )
+
+    for (
+        u,
+        v,
+        data
+    ) in G.edges(
+        data=True
+    ):
+
+        length = float(
+            data.get(
+                "length",
+                0
+            )
+            or 0
+        )
+
+        if length <= 0:
+            continue
+
+        if (
+            not S.has_edge(
+                u,
+                v
+            )
+            or
+            length
+            <
+            float(
+                S[u][v].get(
+                    "length",
+                    float("inf")
+                )
+            )
+        ):
+
+            S.add_edge(
+                u,
+                v,
+                length=length
+            )
+
+    return S
+
+
+def penalized_shortest_path(
+    S,
+    source,
+    target,
+    used_edges
+):
+    """
+    Shortest path but make already-used
+    trail segments very expensive.
+
+    This encourages a loop instead of
+    simply going out and back.
+    """
+
+    def weight(
+        u,
+        v,
+        data
+    ):
+
+        base = float(
+            data.get(
+                "length",
+                1.0
+            )
+        )
+
+        key = (
+            undirected_edge_key(
+                u,
+                v
+            )
+        )
+
+        if key in used_edges:
+
+            return (
+                base
+                *
+                35.0
+            )
+
+        return base
+
+
+    return nx.shortest_path(
+        S,
+        source,
+        target,
+        weight=weight
+    )
+
+
+# =========================================================
+# FULL TRAIL GEOMETRY
+# =========================================================
+
+def route_coordinates(
+    G,
+    route_nodes
+):
+    """
+    Return actual OSM trail geometry,
+    including curves/switchbacks.
     """
 
     coordinates = []
 
-    for i in range(len(route_nodes) - 1):
+    for i in range(
+        len(route_nodes) - 1
+    ):
 
         u = route_nodes[i]
         v = route_nodes[i + 1]
@@ -106,8 +388,6 @@ def route_coordinates(G, route_nodes):
                 geometry.coords
             )
 
-            # Shapely LineString coordinates use:
-            # (longitude, latitude)
             u_lon = float(
                 G.nodes[u]["x"]
             )
@@ -124,43 +404,63 @@ def route_coordinates(G, route_nodes):
                 edge_coords[-1]
             )
 
-            distance_from_first_to_u = (
-                abs(first_lon - u_lon)
+            first_distance = (
+                abs(
+                    first_lon
+                    -
+                    u_lon
+                )
                 +
-                abs(first_lat - u_lat)
+                abs(
+                    first_lat
+                    -
+                    u_lat
+                )
             )
 
-            distance_from_last_to_u = (
-                abs(last_lon - u_lon)
+            last_distance = (
+                abs(
+                    last_lon
+                    -
+                    u_lon
+                )
                 +
-                abs(last_lat - u_lat)
+                abs(
+                    last_lat
+                    -
+                    u_lat
+                )
             )
 
-            # The stored LineString may be oriented
-            # opposite our route traversal.
+            # Geometry might be stored
+            # backwards compared with our
+            # route direction.
             if (
-                distance_from_last_to_u
+                last_distance
                 <
-                distance_from_first_to_u
+                first_distance
             ):
+
                 edge_coords.reverse()
 
-            for lon, lat in edge_coords:
+
+            for (
+                lon,
+                lat
+            ) in edge_coords:
 
                 point = {
                     "lat": float(lat),
                     "lon": float(lon)
                 }
 
-                # Avoid duplicate point where two
-                # consecutive edges join.
                 if coordinates:
 
                     previous = (
                         coordinates[-1]
                     )
 
-                    same_lat = (
+                    if (
                         abs(
                             previous["lat"]
                             -
@@ -168,9 +468,7 @@ def route_coordinates(G, route_nodes):
                         )
                         <
                         0.0000001
-                    )
-
-                    same_lon = (
+                        and
                         abs(
                             previous["lon"]
                             -
@@ -178,13 +476,8 @@ def route_coordinates(G, route_nodes):
                         )
                         <
                         0.0000001
-                    )
-
-                    if (
-                        same_lat
-                        and
-                        same_lon
                     ):
+
                         continue
 
                 coordinates.append(
@@ -193,8 +486,6 @@ def route_coordinates(G, route_nodes):
 
         else:
 
-            # Unsimplified/very short edges may not
-            # have a LineString geometry.
             u_point = {
                 "lat": float(
                     G.nodes[u]["y"]
@@ -242,6 +533,7 @@ def route_coordinates(G, route_nodes):
                     <
                     0.0000001
                 ):
+
                     coordinates.append(
                         u_point
                     )
@@ -250,14 +542,16 @@ def route_coordinates(G, route_nodes):
                 v_point
             )
 
-    # Single-node fallback
+
     if (
         not coordinates
         and
         route_nodes
     ):
 
-        node = route_nodes[0]
+        node = (
+            route_nodes[0]
+        )
 
         coordinates.append(
             {
@@ -273,9 +567,161 @@ def route_coordinates(G, route_nodes):
     return coordinates
 
 
-# ---------------------------------------------------------
-# TRAIL GRAPH
-# ---------------------------------------------------------
+# =========================================================
+# STRICT TRAIL FILTERING
+# =========================================================
+
+def edge_is_allowed_trail(data):
+    """
+    Keep trail-like paths/tracks/steps.
+
+    Reject clearly paved, private,
+    indoor or urban pedestrian ways.
+    """
+
+    highways = (
+        normalize_tag_values(
+            data.get(
+                "highway"
+            )
+        )
+    )
+
+    surfaces = (
+        normalize_tag_values(
+            data.get(
+                "surface"
+            )
+        )
+    )
+
+    access = (
+        normalize_tag_values(
+            data.get(
+                "access"
+            )
+        )
+    )
+
+    foot = (
+        normalize_tag_values(
+            data.get(
+                "foot"
+            )
+        )
+    )
+
+    area = (
+        normalize_tag_values(
+            data.get(
+                "area"
+            )
+        )
+    )
+
+    indoor = (
+        normalize_tag_values(
+            data.get(
+                "indoor"
+            )
+        )
+    )
+
+    footway = (
+        normalize_tag_values(
+            data.get(
+                "footway"
+            )
+        )
+    )
+
+
+    allowed_highways = {
+        "path",
+        "track",
+        "steps"
+    }
+
+
+    if not highways.intersection(
+        allowed_highways
+    ):
+
+        return False
+
+
+    # Explicit sidewalk/crosswalk
+    if footway.intersection(
+        {
+            "sidewalk",
+            "crossing"
+        }
+    ):
+
+        return False
+
+
+    # Clearly hard urban surfaces
+    hard_surfaces = {
+
+        "asphalt",
+
+        "concrete",
+
+        "concrete:lanes",
+
+        "concrete:plates",
+
+        "paving_stones",
+
+        "sett",
+
+        "cobblestone"
+    }
+
+
+    if surfaces.intersection(
+        hard_surfaces
+    ):
+
+        return False
+
+
+    # Do not route through mapped
+    # pedestrian areas.
+    if "yes" in area:
+
+        return False
+
+
+    # No indoor paths
+    if "yes" in indoor:
+
+        return False
+
+
+    # Respect private/closed ways unless
+    # pedestrian access is specifically allowed.
+    if access.intersection(
+        {
+            "no",
+            "private"
+        }
+    ):
+
+        if not foot.intersection(
+            {
+                "yes",
+                "designated",
+                "permissive"
+            }
+        ):
+
+            return False
+
+
+    return True
+
 
 def download_trail_graph(
     lat,
@@ -283,377 +729,906 @@ def download_trail_graph(
     radius_meters=3000
 ):
 
-    # Do not use network_type="walk".
+    # Ask OSMnx to preserve tags
+    # that we need for trail filtering.
+
+    extra_tags = [
+
+        "surface",
+
+        "footway",
+
+        "foot",
+
+        "access",
+
+        "area",
+
+        "indoor",
+
+        "tracktype",
+
+        "sac_scale",
+
+        "trail_visibility"
+    ]
+
+
+    useful_tags = list(
+        ox.settings.useful_tags_way
+    )
+
+
+    for tag in extra_tags:
+
+        if tag not in useful_tags:
+
+            useful_tags.append(
+                tag
+            )
+
+
+    ox.settings.useful_tags_way = (
+        useful_tags
+    )
+
+
+    # For now:
     #
-    # This restricts routing to trail-like
-    # OpenStreetMap highway types.
+    # path
+    # track
+    # steps
+    #
+    # We intentionally leave out
+    # highway=footway.
 
     trail_filter = (
-        '["highway"~"path|track|footway|steps"]'
+        '["highway"~"path|track|steps"]'
     )
 
-    G = ox.graph.graph_from_point(
-        (
-            lat,
-            lon
-        ),
-        dist=radius_meters,
-        custom_filter=trail_filter,
-        simplify=True
+
+    G = (
+        ox.graph.graph_from_point(
+            (
+                lat,
+                lon
+            ),
+            dist=radius_meters,
+
+            # This makes pedestrian networks
+            # bidirectional where appropriate.
+            network_type="walk",
+
+            custom_filter=
+                trail_filter,
+
+            simplify=True,
+
+            retain_all=True
+        )
     )
 
-    if G.number_of_nodes() == 0:
+
+    original_edges = (
+        G.number_of_edges()
+    )
+
+
+    edges_to_remove = []
+
+
+    for (
+        u,
+        v,
+        key,
+        data
+    ) in G.edges(
+        keys=True,
+        data=True
+    ):
+
+        if not edge_is_allowed_trail(
+            data
+        ):
+
+            edges_to_remove.append(
+                (
+                    u,
+                    v,
+                    key
+                )
+            )
+
+
+    G.remove_edges_from(
+        edges_to_remove
+    )
+
+
+    # Remove nodes that now have
+    # no usable trail attached.
+
+    isolated_nodes = list(
+        nx.isolates(
+            G
+        )
+    )
+
+    G.remove_nodes_from(
+        isolated_nodes
+    )
+
+
+    if (
+        G.number_of_nodes()
+        ==
+        0
+        or
+        G.number_of_edges()
+        ==
+        0
+    ):
 
         raise HTTPException(
             status_code=400,
             detail=(
-                "No trail network was found "
-                "near this starting point."
+                "No usable trail network remained "
+                "after filtering paved/private "
+                "pedestrian ways."
             )
         )
 
-    return G
+
+    # Find trail component nearest
+    # the requested trailhead.
+
+    nearest = (
+        ox.distance.nearest_nodes(
+            G,
+            X=lon,
+            Y=lat
+        )
+    )
 
 
-# ---------------------------------------------------------
-# ROUTE SCORING HELPERS
-# ---------------------------------------------------------
+    weak_component = (
+        nx.node_connected_component(
+            G.to_undirected(
+                as_view=True
+            ),
+            nearest
+        )
+    )
 
-def count_repeated_edges(route_nodes):
 
-    edge_list = []
+    G = G.subgraph(
+        weak_component
+    ).copy()
+
+
+    removed_edges = (
+        original_edges
+        -
+        G.number_of_edges()
+    )
+
+
+    return (
+        G,
+        removed_edges
+    )
+
+
+# =========================================================
+# ROUTE QUALITY METRICS
+# =========================================================
+
+def repeated_edge_stats(
+    G,
+    route_nodes
+):
+
+    counts = {}
+    lengths = {}
+
 
     for i in range(
         len(route_nodes) - 1
     ):
 
-        edge_list.append(
-            tuple(
-                sorted(
-                    (
-                        int(
-                            route_nodes[i]
-                        ),
-                        int(
-                            route_nodes[
-                                i + 1
-                            ]
-                        )
-                    )
-                )
+        u = route_nodes[i]
+        v = route_nodes[i + 1]
+
+        key = (
+            undirected_edge_key(
+                u,
+                v
             )
         )
 
-    repeated_edges = (
-        len(edge_list)
-        -
-        len(
-            set(
-                edge_list
+
+        edge = get_shortest_edge(
+            G,
+            u,
+            v
+        )
+
+
+        if edge:
+
+            length = float(
+                edge.get(
+                    "length",
+                    0
+                )
+                or
+                0
             )
+
+        else:
+
+            length = 0.0
+
+
+        counts[key] = (
+            counts.get(
+                key,
+                0
+            )
+            +
+            1
+        )
+
+
+        lengths[key] = (
+            length
+        )
+
+
+    repeated_edges = 0
+    repeated_distance = 0.0
+
+
+    for (
+        key,
+        count
+    ) in counts.items():
+
+        if count > 1:
+
+            repeated_edges += (
+                count - 1
+            )
+
+            repeated_distance += (
+                lengths.get(
+                    key,
+                    0.0
+                )
+                *
+                (count - 1)
+            )
+
+
+    return (
+        repeated_edges,
+        repeated_distance
+    )
+
+
+def repeated_node_occurrences(
+    route_nodes
+):
+
+    if len(route_nodes) <= 2:
+
+        return 0
+
+
+    # Don't penalize the expected
+    # return to the starting node.
+    interior = (
+        route_nodes[1:-1]
+    )
+
+
+    counts = {}
+
+
+    for node in interior:
+
+        counts[node] = (
+            counts.get(
+                node,
+                0
+            )
+            +
+            1
+        )
+
+
+    return sum(
+
+        count - 1
+
+        for count
+        in counts.values()
+
+        if count > 1
+    )
+
+
+def count_immediate_reversals(
+    route_nodes
+):
+
+    reversals = 0
+
+
+    for i in range(
+        len(route_nodes) - 2
+    ):
+
+        # A -> B -> A
+        if (
+            route_nodes[i]
+            ==
+            route_nodes[i + 2]
+        ):
+
+            reversals += 1
+
+
+    return reversals
+
+
+def route_score(
+    G,
+    route_nodes,
+    target_distance_meters
+):
+
+    total_distance = (
+        path_distance_meters(
+            G,
+            route_nodes
         )
     )
 
-    return repeated_edges
+
+    if total_distance <= 0:
+
+        return (
+            float("inf"),
+            {}
+        )
 
 
-# ---------------------------------------------------------
-# LOOP GENERATOR
-# ---------------------------------------------------------
+    distance_error = abs(
+        total_distance
+        -
+        target_distance_meters
+    )
 
-def generate_distance_loop(
+
+    distance_error_ratio = (
+        distance_error
+        /
+        target_distance_meters
+    )
+
+
+    (
+        repeated_edges,
+        repeated_distance
+    ) = repeated_edge_stats(
+        G,
+        route_nodes
+    )
+
+
+    repeat_ratio = (
+        repeated_distance
+        /
+        total_distance
+    )
+
+
+    repeated_nodes = (
+        repeated_node_occurrences(
+            route_nodes
+        )
+    )
+
+
+    repeated_node_ratio = (
+        repeated_nodes
+        /
+        max(
+            1,
+            len(route_nodes) - 2
+        )
+    )
+
+
+    immediate_reversals = (
+        count_immediate_reversals(
+            route_nodes
+        )
+    )
+
+
+    # Lower is better.
+    #
+    # Repetition is intentionally
+    # expensive.
+
+    score = (
+
+        distance_error_ratio
+        *
+        100.0
+
+        +
+
+        repeat_ratio
+        *
+        350.0
+
+        +
+
+        repeated_node_ratio
+        *
+        100.0
+
+        +
+
+        immediate_reversals
+        *
+        30.0
+    )
+
+
+    metrics = {
+
+        "total_distance_meters":
+            total_distance,
+
+        "distance_error_meters":
+            distance_error,
+
+        "repeated_edges":
+            repeated_edges,
+
+        "repeated_distance_meters":
+            repeated_distance,
+
+        "repeat_ratio":
+            repeat_ratio,
+
+        "repeated_nodes":
+            repeated_nodes,
+
+        "immediate_reversals":
+            immediate_reversals,
+
+        "score":
+            score
+    }
+
+
+    return (
+        score,
+        metrics
+    )
+
+
+# =========================================================
+# CLEAN LOOP GENERATOR
+# =========================================================
+
+def generate_clean_loop(
     G,
     start_node,
     target_distance_meters,
-    attempts=75
+    attempts=180
 ):
 
-    best_route = None
-    best_distance = 0.0
-    best_score = float("inf")
-
-    outward_target = (
-        target_distance_meters
-        *
-        0.50
+    S = (
+        make_simple_routing_graph(
+            G
+        )
     )
 
-    for _ in range(attempts):
 
-        current = start_node
+    start_lat = float(
+        G.nodes[start_node]["y"]
+    )
 
-        outward_route = [
+    start_lon = float(
+        G.nodes[start_node]["x"]
+    )
+
+
+    # Do not choose loop waypoints
+    # directly beside the trailhead.
+
+    min_anchor_distance = min(
+
+        1200.0,
+
+        max(
+            450.0,
+            target_distance_meters
+            *
+            0.07
+        )
+    )
+
+
+    anchor_candidates = []
+
+
+    for node in S.nodes:
+
+        if node == start_node:
+            continue
+
+
+        distance = (
+            haversine_meters(
+
+                start_lat,
+
+                start_lon,
+
+                float(
+                    G.nodes[node]["y"]
+                ),
+
+                float(
+                    G.nodes[node]["x"]
+                )
+            )
+        )
+
+
+        if (
+            distance
+            >=
+            min_anchor_distance
+        ):
+
+            anchor_candidates.append(
+                node
+            )
+
+
+    if (
+        len(anchor_candidates)
+        <
+        3
+    ):
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Not enough connected trail "
+                "junctions were found to build "
+                "a clean loop."
+            )
+        )
+
+
+    best_route = None
+
+    best_metrics = None
+
+    best_score = float(
+        "inf"
+    )
+
+
+    for _ in range(
+        attempts
+    ):
+
+
+        # Pick three geographic waypoints.
+
+        anchors = random.sample(
+            anchor_candidates,
+            3
+        )
+
+
+        # Don't use three waypoints
+        # sitting right beside one another.
+
+        pair_distances = []
+
+
+        for i in range(3):
+
+            for j in range(
+                i + 1,
+                3
+            ):
+
+                a = anchors[i]
+                b = anchors[j]
+
+
+                pair_distances.append(
+
+                    haversine_meters(
+
+                        float(
+                            G.nodes[a]["y"]
+                        ),
+
+                        float(
+                            G.nodes[a]["x"]
+                        ),
+
+                        float(
+                            G.nodes[b]["y"]
+                        ),
+
+                        float(
+                            G.nodes[b]["x"]
+                        )
+                    )
+                )
+
+
+        if min(
+            pair_distances
+        ) < 350.0:
+
+            continue
+
+
+        # Sort geographically around the
+        # starting point.
+        #
+        # This greatly reduces crisscrossing
+        # and weird star-shaped routes.
+
+        anchors.sort(
+
+            key=lambda node:
+
+                node_angle_from_start(
+
+                    G,
+
+                    start_node,
+
+                    node
+                )
+        )
+
+
+        # Randomly choose clockwise
+        # or counterclockwise.
+
+        if random.random() < 0.5:
+
+            anchors.reverse()
+
+
+        route_nodes = [
             start_node
         ]
 
-        outward_distance = 0.0
 
-        visited_edges = set()
-        visited_nodes = {
+        used_edges = set()
+
+
+        current = (
             start_node
-        }
+        )
 
-        for _step in range(220):
 
-            neighbors = list(
-                G.successors(
-                    current
-                )
-            )
+        failed = False
 
-            if not neighbors:
-                break
 
-            candidates = []
+        # Start -> A -> B -> C -> Start
 
-            for neighbor in neighbors:
+        for destination in (
+            anchors
+            +
+            [start_node]
+        ):
 
-                edge = (
-                    get_shortest_edge(
-                        G,
+            try:
+
+                leg = (
+                    penalized_shortest_path(
+
+                        S,
+
                         current,
-                        neighbor
+
+                        destination,
+
+                        used_edges
                     )
                 )
 
-                if edge is None:
-                    continue
+            except nx.NetworkXNoPath:
 
-                length = float(
-                    edge.get(
-                        "length",
-                        0
-                    )
-                )
+                failed = True
 
-                if length <= 0:
-                    continue
-
-                edge_key = tuple(
-                    sorted(
-                        (
-                            int(current),
-                            int(neighbor)
-                        )
-                    )
-                )
-
-                weight = 1.0
-
-                # Strongly discourage
-                # traveling the same segment again.
-                if (
-                    edge_key
-                    in
-                    visited_edges
-                ):
-                    weight *= 0.03
-
-                # Also discourage revisiting
-                # the same graph junction.
-                if (
-                    neighbor
-                    in
-                    visited_nodes
-                ):
-                    weight *= 0.12
-
-                candidates.append(
-                    {
-                        "neighbor":
-                            neighbor,
-
-                        "length":
-                            length,
-
-                        "edge_key":
-                            edge_key,
-
-                        "weight":
-                            weight
-                    }
-                )
-
-            if not candidates:
                 break
 
-            weights = [
-                candidate[
-                    "weight"
-                ]
-                for candidate
-                in candidates
+
+            if len(leg) < 2:
+
+                current = destination
+
+                continue
+
+
+            # Mark these segments used
+            # before creating the next leg.
+
+            for i in range(
+                len(leg) - 1
+            ):
+
+                used_edges.add(
+
+                    undirected_edge_key(
+
+                        leg[i],
+
+                        leg[i + 1]
+                    )
+                )
+
+
+            route_nodes.extend(
+                leg[1:]
+            )
+
+
+            current = (
+                destination
+            )
+
+
+        if (
+            failed
+            or
+            len(route_nodes) < 4
+        ):
+
+            continue
+
+
+        (
+            score,
+            metrics
+        ) = route_score(
+
+            G,
+
+            route_nodes,
+
+            target_distance_meters
+        )
+
+
+        total_distance = (
+            metrics[
+                "total_distance_meters"
             ]
+        )
 
-            chosen = random.choices(
-                candidates,
-                weights=weights,
-                k=1
-            )[0]
 
-            neighbor = (
-                chosen["neighbor"]
+        # Candidate is simply
+        # too short.
+
+        if (
+            total_distance
+            <
+            target_distance_meters
+            *
+            0.65
+        ):
+
+            continue
+
+
+        # Candidate is simply
+        # too long.
+
+        if (
+            total_distance
+            >
+            target_distance_meters
+            *
+            1.35
+        ):
+
+            continue
+
+
+        if score < best_score:
+
+            best_score = score
+
+            best_route = (
+                route_nodes
             )
 
-            length = (
-                chosen["length"]
+            best_metrics = (
+                metrics
             )
 
-            edge_key = (
-                chosen["edge_key"]
+
+        # Excellent candidate:
+        #
+        # within ~0.15 mile
+        # less than 2% repeated mileage
+        # no immediate U-turns
+
+        if (
+
+            metrics[
+                "distance_error_meters"
+            ]
+            <=
+            241.4
+
+            and
+
+            metrics[
+                "repeat_ratio"
+            ]
+            <=
+            0.02
+
+            and
+
+            metrics[
+                "immediate_reversals"
+            ]
+            ==
+            0
+        ):
+
+            break
+
+
+    if best_route is None:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Could not build a clean trail "
+                "loop near the requested distance. "
+                "Try a slightly shorter distance "
+                "or a larger search area."
             )
+        )
 
-            outward_route.append(
-                neighbor
-            )
-
-            outward_distance += (
-                length
-            )
-
-            visited_edges.add(
-                edge_key
-            )
-
-            visited_nodes.add(
-                neighbor
-            )
-
-            current = neighbor
-
-            # Start attempting to close the loop
-            # after enough outward mileage.
-            if (
-                outward_distance
-                >=
-                outward_target
-                *
-                0.60
-            ):
-
-                try:
-
-                    return_route = (
-                        nx.shortest_path(
-                            G,
-                            current,
-                            start_node,
-                            weight="length"
-                        )
-                    )
-
-                except nx.NetworkXNoPath:
-                    continue
-
-                return_distance = (
-                    path_distance_meters(
-                        G,
-                        return_route
-                    )
-                )
-
-                total_distance = (
-                    outward_distance
-                    +
-                    return_distance
-                )
-
-                full_route = (
-                    outward_route
-                    +
-                    return_route[1:]
-                )
-
-                distance_error = abs(
-                    total_distance
-                    -
-                    target_distance_meters
-                )
-
-                repeated_edges = (
-                    count_repeated_edges(
-                        full_route
-                    )
-                )
-
-                # Currently scoring on:
-                #
-                # 1. distance accuracy
-                # 2. repeated trail segments
-                #
-                # Elevation gets added next.
-
-                repeat_penalty = (
-                    repeated_edges
-                    *
-                    250
-                )
-
-                score = (
-                    distance_error
-                    +
-                    repeat_penalty
-                )
-
-                if (
-                    score
-                    <
-                    best_score
-                ):
-
-                    best_route = (
-                        full_route
-                    )
-
-                    best_distance = (
-                        total_distance
-                    )
-
-                    best_score = (
-                        score
-                    )
-
-                # Within ~0.1 mile
-                # and little repetition:
-                # good enough for this prototype.
-                if (
-                    distance_error
-                    <=
-                    160.9344
-                    and
-                    repeated_edges
-                    <=
-                    2
-                ):
-
-                    return (
-                        best_route,
-                        best_distance
-                    )
-
-            # Prevent an outward walk from
-            # consuming essentially the entire
-            # distance before trying to return.
-            if (
-                outward_distance
-                >
-                target_distance_meters
-                *
-                0.90
-            ):
-                break
 
     return (
         best_route,
-        best_distance
+        best_metrics
     )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # ROUTE API
-# ---------------------------------------------------------
+# =========================================================
 
-@app.post("/generate-route")
+@app.post(
+    "/generate-route"
+)
 def generate_route(
     request: RouteRequest
 ):
@@ -674,37 +1649,58 @@ def generate_route(
                 )
             )
 
+
         target_distance_meters = (
+
             request.target_distance_miles
             *
             1609.344
         )
 
-        # Keep this fixed while developing.
-        # We can dynamically resize/cached graphs later.
-        search_radius_meters = 3000
 
-        G = download_trail_graph(
+        # Keep fixed while we're developing.
+
+        search_radius_meters = (
+            3000
+        )
+
+
+        (
+            G,
+            filtered_edges_removed
+        ) = download_trail_graph(
+
             request.start_lat,
+
             request.start_lon,
+
             search_radius_meters
         )
 
+
         start_node = (
             ox.distance.nearest_nodes(
+
                 G,
+
                 X=request.start_lon,
+
                 Y=request.start_lat
             )
         )
 
+
         end_node = (
             ox.distance.nearest_nodes(
+
                 G,
+
                 X=request.end_lon,
+
                 Y=request.end_lat
             )
         )
+
 
         same_point = (
 
@@ -727,92 +1723,152 @@ def generate_route(
             0.0001
         )
 
+
+        # -------------------------------------------------
+        # LOOP
+        # -------------------------------------------------
+
         if same_point:
+
 
             (
                 route_nodes,
-                route_distance_meters
-            ) = generate_distance_loop(
+                metrics
+            ) = generate_clean_loop(
+
                 G,
+
                 start_node,
+
                 target_distance_meters,
-                attempts=75
+
+                attempts=180
             )
 
-            if not route_nodes:
 
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        "Could not generate "
-                        "a trail loop near "
-                        "the requested distance."
-                    )
-                )
+            route_distance_meters = (
+                metrics[
+                    "total_distance_meters"
+                ]
+            )
+
 
             route_type = (
-                "trail loop"
+                "clean trail loop"
             )
 
+
+        # -------------------------------------------------
+        # POINT TO POINT
+        # -------------------------------------------------
+
         else:
+
+
+            S = (
+                make_simple_routing_graph(
+                    G
+                )
+            )
+
 
             try:
 
                 route_nodes = (
                     nx.shortest_path(
-                        G,
+
+                        S,
+
                         start_node,
+
                         end_node,
+
                         weight="length"
                     )
                 )
+
 
             except nx.NetworkXNoPath:
 
                 raise HTTPException(
                     status_code=400,
                     detail=(
-                        "No connected trail route "
-                        "was found between those "
-                        "locations."
+                        "No connected trail-only "
+                        "route was found between "
+                        "those locations."
                     )
                 )
 
+
             route_distance_meters = (
                 path_distance_meters(
+
                     G,
+
                     route_nodes
                 )
             )
+
+
+            (
+                _,
+                metrics
+            ) = route_score(
+
+                G,
+
+                route_nodes,
+
+                max(
+                    route_distance_meters,
+                    1.0
+                )
+            )
+
 
             route_type = (
                 "trail point-to-point"
             )
 
+
         route_distance_miles = (
+
             route_distance_meters
             /
             1609.344
         )
 
+
         distance_error_miles = abs(
+
             route_distance_miles
             -
             request.target_distance_miles
         )
 
-        repeated_edges = (
-            count_repeated_edges(
+
+        coords = (
+            route_coordinates(
+
+                G,
+
                 route_nodes
             )
         )
 
-        coords = (
-            route_coordinates(
-                G,
-                route_nodes
+
+        repeated_distance_miles = (
+
+            metrics.get(
+                "repeated_distance_meters",
+                0.0
             )
+
+            /
+
+            1609.344
         )
+
 
         return {
 
@@ -834,13 +1890,14 @@ def generate_route(
                     2
                 ),
 
+            # ELEVATION COMES NEXT
             "actual_gain_ft":
                 None,
 
             "elevation_status":
                 (
                     "Elevation matching "
-                    "will be added next."
+                    "is the next step."
                 ),
 
             "route_type":
@@ -860,7 +1917,37 @@ def generate_route(
                 ),
 
             "repeated_edges":
-                repeated_edges,
+                metrics.get(
+                    "repeated_edges",
+                    0
+                ),
+
+            "repeated_distance_miles":
+                round(
+                    repeated_distance_miles,
+                    2
+                ),
+
+            "repeated_nodes":
+                metrics.get(
+                    "repeated_nodes",
+                    0
+                ),
+
+            "immediate_reversals":
+                metrics.get(
+                    "immediate_reversals",
+                    0
+                ),
+
+            "route_score":
+                round(
+                    metrics.get(
+                        "score",
+                        0.0
+                    ),
+                    2
+                ),
 
             "network_nodes":
                 G.number_of_nodes(),
@@ -868,24 +1955,31 @@ def generate_route(
             "network_edges":
                 G.number_of_edges(),
 
+            "filtered_edges_removed":
+                filtered_edges_removed,
+
             "search_radius_meters":
                 search_radius_meters,
 
-            "trail_filter":
+            "trail_policy":
                 (
-                    "path, track, "
-                    "footway, steps"
+                    "OSM highway=path|track|steps; "
+                    "excludes clearly paved, "
+                    "private/closed, indoor, area, "
+                    "sidewalk/crossing segments"
                 ),
 
             "status":
                 (
-                    "Trail route generated "
-                    "with full OSM geometry"
+                    "Clean trail route generated"
                 )
         }
 
+
     except HTTPException:
+
         raise
+
 
     except Exception as e:
 
@@ -895,9 +1989,9 @@ def generate_route(
         )
 
 
-# ---------------------------------------------------------
+# =========================================================
 # MAP PAGE
-# ---------------------------------------------------------
+# =========================================================
 
 @app.get(
     "/map",
@@ -919,7 +2013,9 @@ def route_map():
     content="width=device-width, initial-scale=1.0"
 >
 
-<title>Trail Running Creator</title>
+<title>
+Trail Running Creator
+</title>
 
 <link
     rel="stylesheet"
@@ -933,82 +2029,177 @@ def route_map():
 }
 
 body {
+
     margin: 0;
-    font-family: Arial, sans-serif;
-    background: #f5f5f5;
+
+    font-family:
+        Arial,
+        sans-serif;
+
+    background:
+        #f5f5f5;
 }
 
 #controls {
+
     padding: 16px;
-    background: white;
-    border-bottom: 1px solid #ccc;
+
+    background:
+        white;
+
+    border-bottom:
+        1px solid #ccc;
 }
 
 h2 {
-    margin: 0 0 14px 0;
+
+    margin:
+        0
+        0
+        14px
+        0;
 }
 
 .input-row {
-    display: flex;
-    flex-wrap: wrap;
-    gap: 12px;
-    margin-bottom: 12px;
+
+    display:
+        flex;
+
+    flex-wrap:
+        wrap;
+
+    gap:
+        12px;
+
+    margin-bottom:
+        12px;
 }
 
 .input-group {
-    display: flex;
-    flex-direction: column;
+
+    display:
+        flex;
+
+    flex-direction:
+        column;
 }
 
 label {
-    font-size: 13px;
-    margin-bottom: 4px;
-    font-weight: bold;
+
+    font-size:
+        13px;
+
+    margin-bottom:
+        4px;
+
+    font-weight:
+        bold;
 }
 
 input {
-    width: 165px;
-    padding: 8px;
-    border: 1px solid #aaa;
-    border-radius: 4px;
+
+    width:
+        165px;
+
+    padding:
+        8px;
+
+    border:
+        1px solid #aaa;
+
+    border-radius:
+        4px;
 }
 
 button {
-    padding: 10px 18px;
-    border: none;
-    border-radius: 5px;
-    cursor: pointer;
-    background: #222;
-    color: white;
-    font-size: 15px;
+
+    padding:
+        10px 18px;
+
+    border:
+        none;
+
+    border-radius:
+        5px;
+
+    cursor:
+        pointer;
+
+    background:
+        #222;
+
+    color:
+        white;
+
+    font-size:
+        15px;
 }
 
 button:disabled {
-    opacity: 0.5;
-    cursor: wait;
+
+    opacity:
+        0.5;
+
+    cursor:
+        wait;
 }
 
 #results {
-    margin-top: 12px;
-    line-height: 1.55;
+
+    margin-top:
+        12px;
+
+    line-height:
+        1.55;
 }
 
 #map {
-    height: calc(100vh - 325px);
-    min-height: 500px;
-    width: 100%;
+
+    height:
+        calc(
+            100vh - 350px
+        );
+
+    min-height:
+        500px;
+
+    width:
+        100%;
 }
 
 .error {
-    color: #b00020;
+
+    color:
+        #b00020;
 }
 
 .success {
-    color: #166534;
+
+    color:
+        #166534;
 }
 
 .warning {
-    color: #9a6700;
+
+    color:
+        #9a6700;
+}
+
+@media (
+    max-width: 700px
+) {
+
+    input {
+
+        width:
+            145px;
+    }
+
+    #map {
+
+        height:
+            65vh;
+    }
 }
 
 </style>
@@ -1020,6 +2211,7 @@ button:disabled {
 
 
 <div id="controls">
+
 
 <h2>
 Trail Running Creator
@@ -1159,28 +2351,46 @@ Ready.
 
 <script>
 
+
 const map = L.map(
     "map"
 ).setView(
-    [33.586, -112.085],
+    [
+        33.586,
+        -112.085
+    ],
     14
 );
 
 
 L.tileLayer(
+
     "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
+
     {
-        maxZoom: 19,
+
+        maxZoom:
+            19,
 
         attribution:
             "&copy; OpenStreetMap contributors"
     }
-).addTo(map);
+
+).addTo(
+    map
+);
 
 
-let routeLine = null;
-let startMarker = null;
-let finishMarker = null;
+let routeLine =
+    null;
+
+
+let startMarker =
+    null;
+
+
+let finishMarker =
+    null;
 
 
 const button =
@@ -1197,6 +2407,7 @@ button.addEventListener(
 
 async function generateRoute() {
 
+
     const results =
         document.getElementById(
             "results"
@@ -1205,12 +2416,14 @@ async function generateRoute() {
 
     const data = {
 
+
         start_lat:
             parseFloat(
                 document.getElementById(
                     "start_lat"
                 ).value
             ),
+
 
         start_lon:
             parseFloat(
@@ -1219,12 +2432,14 @@ async function generateRoute() {
                 ).value
             ),
 
+
         end_lat:
             parseFloat(
                 document.getElementById(
                     "end_lat"
                 ).value
             ),
+
 
         end_lon:
             parseFloat(
@@ -1233,12 +2448,14 @@ async function generateRoute() {
                 ).value
             ),
 
+
         target_distance_miles:
             parseFloat(
                 document.getElementById(
                     "distance"
                 ).value
             ),
+
 
         target_gain_ft:
             parseFloat(
@@ -1250,33 +2467,44 @@ async function generateRoute() {
 
 
     results.innerHTML =
+
         '<span class="warning">' +
-        "Downloading trail network and " +
-        "searching candidate loops..." +
+
+        "Filtering to trails and searching " +
+        "for a clean loop..." +
+
         "</span>";
 
 
-    button.disabled = true;
+    button.disabled =
+        true;
 
 
     try {
 
-        const response = await fetch(
-            "/generate-route",
-            {
-                method: "POST",
 
-                headers: {
-                    "Content-Type":
-                        "application/json"
-                },
+        const response =
+            await fetch(
 
-                body:
-                    JSON.stringify(
-                        data
-                    )
-            }
-        );
+                "/generate-route",
+
+                {
+
+                    method:
+                        "POST",
+
+                    headers: {
+
+                        "Content-Type":
+                            "application/json"
+                    },
+
+                    body:
+                        JSON.stringify(
+                            data
+                        )
+                }
+            );
 
 
         const responseText =
@@ -1285,7 +2513,9 @@ async function generateRoute() {
 
         if (!responseText) {
 
+
             throw new Error(
+
                 "Server returned an empty response. " +
                 "Check Render logs."
             );
@@ -1297,17 +2527,20 @@ async function generateRoute() {
 
         try {
 
+
             result =
                 JSON.parse(
                     responseText
                 );
 
-        }
 
-        catch {
+        } catch {
+
 
             throw new Error(
-                "Server returned invalid JSON: " +
+
+                "Server returned invalid JSON: "
+                +
                 responseText.substring(
                     0,
                     500
@@ -1318,7 +2551,9 @@ async function generateRoute() {
 
         if (!response.ok) {
 
+
             throw new Error(
+
                 result.detail
                 ||
                 "Server error."
@@ -1332,7 +2567,9 @@ async function generateRoute() {
             result.route.length < 2
         ) {
 
+
             throw new Error(
+
                 "Server returned an empty route."
             );
         }
@@ -1340,14 +2577,18 @@ async function generateRoute() {
 
         const coordinates =
             result.route.map(
+
                 point => [
+
                     point.lat,
+
                     point.lon
                 ]
             );
 
 
         if (routeLine) {
+
 
             map.removeLayer(
                 routeLine
@@ -1357,6 +2598,7 @@ async function generateRoute() {
 
         if (startMarker) {
 
+
             map.removeLayer(
                 startMarker
             );
@@ -1365,44 +2607,70 @@ async function generateRoute() {
 
         if (finishMarker) {
 
+
             map.removeLayer(
                 finishMarker
             );
         }
 
 
-        routeLine = L.polyline(
-            coordinates,
-            {
-                weight: 5,
-                opacity: 0.9
-            }
-        ).addTo(map);
+        routeLine =
+            L.polyline(
+
+                coordinates,
+
+                {
+
+                    weight:
+                        5,
+
+                    opacity:
+                        0.9
+                }
+
+            ).addTo(
+                map
+            );
 
 
-        startMarker = L.marker(
-            coordinates[0]
-        )
-        .addTo(map)
-        .bindPopup(
-            "Start"
-        );
+        startMarker =
+            L.marker(
+
+                coordinates[0]
+
+            )
+            .addTo(
+                map
+            )
+            .bindPopup(
+                "Start"
+            );
 
 
-        finishMarker = L.marker(
-            coordinates[
-                coordinates.length - 1
-            ]
-        )
-        .addTo(map)
-        .bindPopup(
-            "Finish"
-        );
+        finishMarker =
+            L.marker(
+
+                coordinates[
+                    coordinates.length
+                    -
+                    1
+                ]
+
+            )
+            .addTo(
+                map
+            )
+            .bindPopup(
+                "Finish"
+            );
 
 
         map.fitBounds(
+
             routeLine.getBounds(),
+
             {
+
                 padding: [
                     30,
                     30
@@ -1417,8 +2685,10 @@ async function generateRoute() {
 
         if (
             result.actual_gain_ft
-            !== null
+            !==
+            null
         ) {
+
 
             elevationText =
                 result.actual_gain_ft
@@ -1429,71 +2699,99 @@ async function generateRoute() {
 
         results.innerHTML =
 
+
             '<span class="success">' +
 
             "<b>Trail route generated</b>" +
 
             "</span><br>" +
 
+
             "<b>Route type:</b> " +
             result.route_type +
             "<br>" +
+
 
             "<b>Requested distance:</b> " +
             result.requested_distance_miles +
             " mi<br>" +
 
+
             "<b>Actual distance:</b> " +
             result.actual_distance_miles +
             " mi<br>" +
+
 
             "<b>Distance error:</b> " +
             result.distance_error_miles +
             " mi<br>" +
 
+
             "<b>Requested gain:</b> " +
             result.requested_gain_ft +
             " ft<br>" +
+
 
             "<b>Actual gain:</b> " +
             elevationText +
             "<br>" +
 
-            "<b>Repeated segments:</b> " +
+
+            "<b>Repeated trail distance:</b> " +
+            result.repeated_distance_miles +
+            " mi<br>" +
+
+
+            "<b>Repeated edges:</b> " +
             result.repeated_edges +
             "<br>" +
 
-            "<b>Graph route nodes:</b> " +
-            result.route_nodes +
+
+            "<b>Repeated junctions:</b> " +
+            result.repeated_nodes +
             "<br>" +
 
-            "<b>Rendered geometry points:</b> " +
-            result.route_geometry_points +
+
+            "<b>Immediate reversals:</b> " +
+            result.immediate_reversals +
             "<br>" +
 
-            "<b>Allowed OSM ways:</b> " +
-            result.trail_filter;
+
+            "<b>Filtered edges removed:</b> " +
+            result.filtered_edges_removed +
+            "<br>" +
+
+
+            "<b>Route score:</b> " +
+            result.route_score;
 
 
     }
 
+
     catch (error) {
+
 
         results.innerHTML =
 
             '<span class="error">' +
 
             "<b>Error:</b> " +
+
             error.message +
 
             "</span>";
     }
 
+
     finally {
 
-        button.disabled = false;
+
+        button.disabled =
+            false;
     }
 }
+
 
 </script>
 
