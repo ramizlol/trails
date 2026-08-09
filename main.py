@@ -3,31 +3,41 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 import math
+import os
 import random
-import requests
+
 import networkx as nx
+import numpy as np
 import osmnx as ox
+import rasterio
+from rasterio.warp import transform as rio_transform
 
 
 app = FastAPI()
 
 
 # =========================================================
-# SETTINGS / CACHE
+# SETTINGS
 # =========================================================
 
-GRAPH_CACHE = {}
-MAX_CACHED_GRAPHS = 4
-
-# Cache individual elevation samples too.
-ELEVATION_POINT_CACHE = {}
+# Your TIFF is in the same folder as main.py.
+DEM_PATH = "output_USGS30m.tif"
 
 METERS_PER_MILE = 1609.344
 FEET_PER_METER = 3.28084
 
-# We sample the actual trail geometry at approximately
-# this spacing before calculating climb/descent.
-ELEVATION_SAMPLE_SPACING_M = 60.0
+SEARCH_RADIUS_METERS = 3000
+
+# Since your DEM is approximately 30 m resolution,
+# sample the trail roughly every 30 m.
+ELEVATION_SAMPLE_SPACING_M = 30.0
+
+# Number of route candidates to test.
+ROUTE_ATTEMPTS = 500
+
+MAX_CACHED_GRAPHS = 4
+
+GRAPH_CACHE = {}
 
 
 # =========================================================
@@ -35,6 +45,7 @@ ELEVATION_SAMPLE_SPACING_M = 60.0
 # =========================================================
 
 class RouteRequest(BaseModel):
+
     start_lat: float
     start_lon: float
 
@@ -55,7 +66,8 @@ def home():
     return {
         "status": "Trail Running Creator API is running",
         "map": "/map",
-        "docs": "/docs"
+        "docs": "/docs",
+        "dem_info": "/dem-info"
     }
 
 
@@ -125,7 +137,7 @@ def haversine_meters(
 
     a = (
         math.sin(
-            dphi / 2
+            dphi / 2.0
         ) ** 2
 
         +
@@ -135,7 +147,7 @@ def haversine_meters(
         math.cos(p2)
         *
         math.sin(
-            dlambda / 2
+            dlambda / 2.0
         ) ** 2
     )
 
@@ -259,12 +271,8 @@ def path_gain_meters(
     G,
     route_nodes
 ):
-    """
-    Sum the pre-calculated ascent of every
-    actual trail edge in the route.
-    """
 
-    total_gain = 0.0
+    total = 0.0
 
     for i in range(
         len(route_nodes) - 1
@@ -278,7 +286,7 @@ def path_gain_meters(
 
         if edge is not None:
 
-            total_gain += float(
+            total += float(
                 edge.get(
                     "ascent_m",
                     0
@@ -287,11 +295,11 @@ def path_gain_meters(
                 0
             )
 
-    return total_gain
+    return total
 
 
 # =========================================================
-# ROUTING GRAPH
+# SIMPLE ROUTING GRAPH
 # =========================================================
 
 def make_simple_routing_graph(G):
@@ -367,21 +375,20 @@ def penalized_shortest_path(
         base = float(
             data.get(
                 "length",
-                1
+                1.0
             )
         )
 
-        edge_key = (
+        if (
             undirected_edge_key(
                 u,
                 v
             )
-        )
+            in
+            used_edges
+        ):
 
-        # Make previously-used trail sections
-        # very expensive.
-        if edge_key in used_edges:
-
+            # Strong penalty for already-used trails.
             return (
                 base
                 *
@@ -389,6 +396,7 @@ def penalized_shortest_path(
             )
 
         return base
+
 
     return nx.shortest_path(
         S,
@@ -399,7 +407,7 @@ def penalized_shortest_path(
 
 
 # =========================================================
-# FULL OSM EDGE GEOMETRY
+# FULL OSM TRAIL GEOMETRY
 # =========================================================
 
 def oriented_edge_coords(
@@ -408,28 +416,25 @@ def oriented_edge_coords(
     v,
     edge
 ):
-    """
-    Get the actual OSM trail geometry and orient
-    it in the direction u -> v.
-
-    Returns:
-        [(longitude, latitude), ...]
-    """
 
     geometry = edge.get(
         "geometry"
     )
 
+
     if geometry is not None:
 
         coords = [
+
             (
                 float(lon),
                 float(lat)
             )
+
             for lon, lat
             in geometry.coords
         ]
+
 
     else:
 
@@ -439,6 +444,7 @@ def oriented_edge_coords(
                 float(
                     G.nodes[u]["x"]
                 ),
+
                 float(
                     G.nodes[u]["y"]
                 )
@@ -448,14 +454,17 @@ def oriented_edge_coords(
                 float(
                     G.nodes[v]["x"]
                 ),
+
                 float(
                     G.nodes[v]["y"]
                 )
             )
         ]
 
+
     if not coords:
         return []
+
 
     u_lon = float(
         G.nodes[u]["x"]
@@ -465,6 +474,7 @@ def oriented_edge_coords(
         G.nodes[u]["y"]
     )
 
+
     first_lon, first_lat = (
         coords[0]
     )
@@ -473,31 +483,45 @@ def oriented_edge_coords(
         coords[-1]
     )
 
+
     first_distance = (
+
         abs(
             first_lon - u_lon
         )
+
         +
+
         abs(
             first_lat - u_lat
         )
     )
 
+
     last_distance = (
+
         abs(
             last_lon - u_lon
         )
+
         +
+
         abs(
             last_lat - u_lat
         )
     )
 
-    # Reverse the LineString if OSM stored
-    # its coordinates in the other direction.
-    if last_distance < first_distance:
+
+    # Reverse the geometry if it is stored
+    # opposite the direction we're traveling.
+    if (
+        last_distance
+        <
+        first_distance
+    ):
 
         coords.reverse()
+
 
     return coords
 
@@ -506,11 +530,9 @@ def route_coordinates(
     G,
     route_nodes
 ):
-    """
-    Return full curved trail geometry for Leaflet.
-    """
 
     coordinates = []
+
 
     for i in range(
         len(route_nodes) - 1
@@ -519,14 +541,17 @@ def route_coordinates(
         u = route_nodes[i]
         v = route_nodes[i + 1]
 
+
         edge = get_shortest_edge(
             G,
             u,
             v
         )
 
+
         if edge is None:
             continue
+
 
         edge_coords = (
             oriented_edge_coords(
@@ -537,12 +562,18 @@ def route_coordinates(
             )
         )
 
+
         for lon, lat in edge_coords:
 
             point = {
-                "lat": float(lat),
-                "lon": float(lon)
+
+                "lat":
+                    float(lat),
+
+                "lon":
+                    float(lon)
             }
+
 
             if coordinates:
 
@@ -550,7 +581,9 @@ def route_coordinates(
                     coordinates[-1]
                 )
 
+
                 if (
+
                     abs(
                         previous["lat"]
                         -
@@ -572,9 +605,11 @@ def route_coordinates(
 
                     continue
 
+
             coordinates.append(
                 point
             )
+
 
     if (
         not coordinates
@@ -586,8 +621,11 @@ def route_coordinates(
             route_nodes[0]
         )
 
+
         coordinates.append(
+
             {
+
                 "lat":
                     float(
                         G.nodes[node]["y"]
@@ -600,11 +638,12 @@ def route_coordinates(
             }
         )
 
+
     return coordinates
 
 
 # =========================================================
-# TRAIL FILTER
+# TRAIL FILTERING
 # =========================================================
 
 def edge_is_allowed_trail(data):
@@ -617,6 +656,7 @@ def edge_is_allowed_trail(data):
         )
     )
 
+
     surfaces = (
         normalize_tag_values(
             data.get(
@@ -624,6 +664,7 @@ def edge_is_allowed_trail(data):
             )
         )
     )
+
 
     access = (
         normalize_tag_values(
@@ -633,6 +674,7 @@ def edge_is_allowed_trail(data):
         )
     )
 
+
     foot = (
         normalize_tag_values(
             data.get(
@@ -640,6 +682,7 @@ def edge_is_allowed_trail(data):
             )
         )
     )
+
 
     area = (
         normalize_tag_values(
@@ -649,6 +692,7 @@ def edge_is_allowed_trail(data):
         )
     )
 
+
     indoor = (
         normalize_tag_values(
             data.get(
@@ -656,6 +700,7 @@ def edge_is_allowed_trail(data):
             )
         )
     )
+
 
     footway = (
         normalize_tag_values(
@@ -666,7 +711,7 @@ def edge_is_allowed_trail(data):
     )
 
 
-    # Trail-ish OSM highway values only.
+    # Only trail-like ways.
     if not highways.intersection(
         {
             "path",
@@ -751,22 +796,19 @@ def densify_polyline(
     spacing_m=
         ELEVATION_SAMPLE_SPACING_M
 ):
-    """
-    Add intermediate points along the real trail.
-
-    This means a long OSM edge does not only get
-    elevation values at its beginning and end.
-    """
 
     if not coords:
         return []
 
+
     if len(coords) == 1:
         return coords[:]
+
 
     dense = [
         coords[0]
     ]
+
 
     for i in range(
         len(coords) - 1
@@ -780,6 +822,7 @@ def densify_polyline(
             coords[i + 1]
         )
 
+
         segment_distance = (
             haversine_meters(
                 lat1,
@@ -789,10 +832,13 @@ def densify_polyline(
             )
         )
 
+
         if segment_distance <= 0:
             continue
 
+
         steps = max(
+
             1,
 
             int(
@@ -803,6 +849,7 @@ def densify_polyline(
                 )
             )
         )
+
 
         for step in range(
             1,
@@ -815,25 +862,32 @@ def densify_polyline(
                 steps
             )
 
+
             lon = (
                 lon1
                 +
                 (
-                    lon2 - lon1
+                    lon2
+                    -
+                    lon1
                 )
                 *
                 fraction
             )
 
+
             lat = (
                 lat1
                 +
                 (
-                    lat2 - lat1
+                    lat2
+                    -
+                    lat1
                 )
                 *
                 fraction
             )
+
 
             dense.append(
                 (
@@ -842,271 +896,436 @@ def densify_polyline(
                 )
             )
 
+
     return dense
 
 
 # =========================================================
-# ELEVATION API
+# SMOOTH DEM ELEVATIONS
 # =========================================================
 
-def elevation_cache_key(
-    lat,
-    lon
-):
+def smooth_elevations(values):
 
-    return (
-        round(
-            float(lat),
-            6
-        ),
+    if len(values) < 3:
 
-        round(
-            float(lon),
-            6
+        return [
+            float(v)
+            for v in values
+        ]
+
+
+    smoothed = [
+        float(
+            values[0]
+        )
+    ]
+
+
+    for i in range(
+        1,
+        len(values) - 1
+    ):
+
+        smoothed.append(
+
+            (
+
+                float(
+                    values[
+                        i - 1
+                    ]
+                )
+
+                +
+
+                float(
+                    values[i]
+                )
+
+                +
+
+                float(
+                    values[
+                        i + 1
+                    ]
+                )
+
+            )
+
+            /
+
+            3.0
+        )
+
+
+    smoothed.append(
+        float(
+            values[-1]
         )
     )
 
 
-def fetch_elevations_for_points(
-    points
-):
-    """
-    points:
-        [(lon, lat), ...]
+    return smoothed
 
-    Returns:
+
+# =========================================================
+# LOCAL TIFF ELEVATION SAMPLING
+# =========================================================
+
+def sample_dem_points(points):
+
+    """
+    Input:
+        [(longitude, latitude), ...]
+
+    Output:
         {
-            (lat, lon): elevation_meters
+            (rounded_lat, rounded_lon): elevation_meters
         }
     """
 
-    missing = []
-    already_added = set()
+
+    if not os.path.exists(
+        DEM_PATH
+    ):
+
+        raise HTTPException(
+
+            status_code=500,
+
+            detail=(
+                "DEM file not found: "
+                +
+                DEM_PATH
+            )
+        )
+
+
+    unique = {}
+
 
     for lon, lat in points:
 
         key = (
-            elevation_cache_key(
-                lat,
-                lon
-            )
-        )
 
-        if (
-            key
-            not in
-            ELEVATION_POINT_CACHE
+            round(
+                float(lat),
+                7
+            ),
 
-            and
-
-            key
-            not in
-            already_added
-        ):
-
-            missing.append(
-                (
-                    lon,
-                    lat,
-                    key
-                )
-            )
-
-            already_added.add(
-                key
-            )
-
-
-    # Open-Meteo currently supports
-    # up to 100 coordinates per request.
-    batch_size = 100
-
-
-    for start in range(
-        0,
-        len(missing),
-        batch_size
-    ):
-
-        batch = missing[
-            start:
-            start + batch_size
-        ]
-
-        latitudes = ",".join(
-            str(lat)
-
-            for _,
-            lat,
-            _
-            in batch
-        )
-
-        longitudes = ",".join(
-            str(lon)
-
-            for lon,
-            _,
-            _
-            in batch
-        )
-
-        try:
-
-            response = requests.get(
-
-                "https://api.open-meteo.com/v1/elevation",
-
-                params={
-                    "latitude":
-                        latitudes,
-
-                    "longitude":
-                        longitudes
-                },
-
-                timeout=30
-            )
-
-        except requests.RequestException as exc:
-
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "Elevation service "
-                    "connection failed: "
-                    +
-                    str(exc)
-                )
-            )
-
-
-        if not response.ok:
-
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "Elevation service returned HTTP "
-                    +
-                    str(
-                        response.status_code
-                    )
-                )
-            )
-
-
-        try:
-
-            payload = (
-                response.json()
-            )
-
-        except ValueError:
-
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    "Elevation service "
-                    "returned invalid JSON."
-                )
-            )
-
-
-        elevations = (
-            payload.get(
-                "elevation"
+            round(
+                float(lon),
+                7
             )
         )
 
 
-        if (
-            not isinstance(
-                elevations,
-                list
-            )
+        unique[key] = (
 
-            or
+            float(lon),
 
-            len(elevations)
-            !=
-            len(batch)
-        ):
+            float(lat)
+        )
+
+
+    keys = list(
+        unique.keys()
+    )
+
+
+    lons = [
+
+        unique[key][0]
+
+        for key in keys
+    ]
+
+
+    lats = [
+
+        unique[key][1]
+
+        for key in keys
+    ]
+
+
+    with rasterio.open(
+        DEM_PATH
+    ) as src:
+
+
+        if src.crs is None:
 
             raise HTTPException(
-                status_code=502,
+
+                status_code=500,
+
                 detail=(
-                    "Elevation service returned "
-                    "unexpected data."
+                    "DEM has no CRS information."
                 )
             )
+
+
+        # Convert standard lon/lat into the
+        # coordinate system used by the TIFF.
+        xs, ys = rio_transform(
+
+            "EPSG:4326",
+
+            src.crs,
+
+            lons,
+
+            lats
+        )
+
+
+        outside = []
 
 
         for (
-            (
-                _,
-                _,
-                key
-            ),
-            elevation
+            key,
+            x,
+            y
         ) in zip(
-            batch,
-            elevations
+            keys,
+            xs,
+            ys
         ):
 
-            if elevation is None:
+
+            if not (
+
+                src.bounds.left
+                <=
+                x
+                <=
+                src.bounds.right
+
+                and
+
+                src.bounds.bottom
+                <=
+                y
+                <=
+                src.bounds.top
+            ):
+
+                outside.append(
+                    key
+                )
+
+
+        if outside:
+
+            first_lat, first_lon = (
+                outside[0]
+            )
+
+
+            raise HTTPException(
+
+                status_code=400,
+
+                detail=(
+
+                    "DEM does not cover the entire "
+                    "trail graph. "
+
+                    +
+
+                    str(
+                        len(outside)
+                    )
+
+                    +
+
+                    " elevation sample points are "
+                    "outside the TIFF. "
+
+                    +
+
+                    "First uncovered point: "
+
+                    +
+
+                    str(
+                        first_lat
+                    )
+
+                    +
+
+                    ", "
+
+                    +
+
+                    str(
+                        first_lon
+                    )
+                )
+            )
+
+
+        samples = list(
+
+            src.sample(
+
+                zip(
+                    xs,
+                    ys
+                ),
+
+                indexes=1,
+
+                masked=True
+            )
+        )
+
+
+        lookup = {}
+
+
+        for (
+            key,
+            sample
+        ) in zip(
+            keys,
+            samples
+        ):
+
+
+            value = (
+                sample[0]
+            )
+
+
+            if np.ma.is_masked(
+                value
+            ):
 
                 raise HTTPException(
-                    status_code=502,
+
+                    status_code=400,
+
                     detail=(
-                        "Elevation service returned "
-                        "a missing elevation value."
+
+                        "DEM contains NoData at "
+
+                        +
+
+                        str(
+                            key[0]
+                        )
+
+                        +
+
+                        ", "
+
+                        +
+
+                        str(
+                            key[1]
+                        )
                     )
                 )
 
-            ELEVATION_POINT_CACHE[
-                key
-            ] = float(
+
+            elevation = float(
+                value
+            )
+
+
+            if not math.isfinite(
+                elevation
+            ):
+
+                raise HTTPException(
+
+                    status_code=400,
+
+                    detail=(
+
+                        "DEM returned invalid elevation at "
+
+                        +
+
+                        str(
+                            key[0]
+                        )
+
+                        +
+
+                        ", "
+
+                        +
+
+                        str(
+                            key[1]
+                        )
+                    )
+                )
+
+
+            if (
+                src.nodata
+                is not None
+
+                and
+
+                math.isclose(
+
+                    elevation,
+
+                    float(
+                        src.nodata
+                    ),
+
+                    rel_tol=0.0,
+
+                    abs_tol=1e-6
+                )
+            ):
+
+                raise HTTPException(
+
+                    status_code=400,
+
+                    detail=(
+
+                        "DEM contains NoData at "
+
+                        +
+
+                        str(
+                            key[0]
+                        )
+
+                        +
+
+                        ", "
+
+                        +
+
+                        str(
+                            key[1]
+                        )
+                    )
+                )
+
+
+            lookup[key] = (
                 elevation
             )
 
 
-    result = {}
-
-    for lon, lat in points:
-
-        key = (
-            elevation_cache_key(
-                lat,
-                lon
-            )
-        )
-
-        result[key] = (
-            ELEVATION_POINT_CACHE[
-                key
-            ]
-        )
-
-    return result
+    return lookup
 
 
 # =========================================================
-# CALCULATE ELEVATION FOR EVERY TRAIL EDGE
+# PRE-CALCULATE ASCENT/DESCENT FOR EACH TRAIL
 # =========================================================
 
-def add_dense_edge_elevations(G):
-    """
-    For every trail edge:
-
-    1. get its real OSM geometry
-    2. sample points every ~60 m
-    3. fetch terrain elevation
-    4. calculate ascent
-    5. calculate descent
-
-    ascent_m/descent_m are then stored directly
-    on the graph edge.
-    """
+def add_local_dem_edge_elevations(G):
 
     edge_samples = {}
 
@@ -1123,6 +1342,7 @@ def add_dense_edge_elevations(G):
         data=True
     ):
 
+
         coords = (
             oriented_edge_coords(
                 G,
@@ -1132,9 +1352,12 @@ def add_dense_edge_elevations(G):
             )
         )
 
+
         samples = (
             densify_polyline(
+
                 coords,
+
                 ELEVATION_SAMPLE_SPACING_M
             )
         )
@@ -1148,6 +1371,7 @@ def add_dense_edge_elevations(G):
                     float(
                         G.nodes[u]["x"]
                     ),
+
                     float(
                         G.nodes[u]["y"]
                     )
@@ -1157,6 +1381,7 @@ def add_dense_edge_elevations(G):
                     float(
                         G.nodes[v]["x"]
                     ),
+
                     float(
                         G.nodes[v]["y"]
                     )
@@ -1170,7 +1395,9 @@ def add_dense_edge_elevations(G):
                 v,
                 key
             )
-        ] = samples
+        ] = (
+            samples
+        )
 
 
         all_points.extend(
@@ -1178,59 +1405,74 @@ def add_dense_edge_elevations(G):
         )
 
 
+    # Read all geometry sample points from
+    # the local GeoTIFF.
     elevation_lookup = (
-        fetch_elevations_for_points(
+        sample_dem_points(
             all_points
         )
     )
 
 
-    # Add elevation to graph nodes too.
-    for node in G.nodes:
+    # Also sample graph junction nodes.
+    node_points = [
 
-        lon = float(
-            G.nodes[node]["x"]
+        (
+            float(
+                G.nodes[node]["x"]
+            ),
+
+            float(
+                G.nodes[node]["y"]
+            )
         )
+
+        for node
+        in G.nodes
+    ]
+
+
+    node_lookup = (
+        sample_dem_points(
+            node_points
+        )
+    )
+
+
+    for node in G.nodes:
 
         lat = float(
             G.nodes[node]["y"]
         )
 
-        cache_key = (
-            elevation_cache_key(
-                lat,
-                lon
-            )
+        lon = float(
+            G.nodes[node]["x"]
         )
 
 
-        if (
-            cache_key
-            not in
-            ELEVATION_POINT_CACHE
-        ):
+        key = (
 
-            fetch_elevations_for_points(
-                [
-                    (
-                        lon,
-                        lat
-                    )
-                ]
+            round(
+                lat,
+                7
+            ),
+
+            round(
+                lon,
+                7
             )
+        )
 
 
         G.nodes[node][
             "elevation"
         ] = float(
-            ELEVATION_POINT_CACHE[
-                cache_key
-            ]
+            node_lookup[key]
         )
 
 
-    # Calculate ascent/descent
-    # along every individual trail edge.
+    # Calculate ascent/descent separately
+    # for each directed trail edge.
     for (
         (
             u,
@@ -1241,18 +1483,42 @@ def add_dense_edge_elevations(G):
     ) in edge_samples.items():
 
 
-        elevations = [
+        elevations = []
 
-            elevation_lookup[
-                elevation_cache_key(
-                    lat,
-                    lon
+
+        for lon, lat in samples:
+
+            sample_key = (
+
+                round(
+                    float(lat),
+                    7
+                ),
+
+                round(
+                    float(lon),
+                    7
                 )
-            ]
+            )
 
-            for lon, lat
-            in samples
-        ]
+
+            elevations.append(
+
+                float(
+                    elevation_lookup[
+                        sample_key
+                    ]
+                )
+            )
+
+
+        # Slight smoothing prevents one DEM pixel
+        # from artificially inflating accumulated gain.
+        elevations = (
+            smooth_elevations(
+                elevations
+            )
+        )
 
 
         ascent = 0.0
@@ -1264,15 +1530,22 @@ def add_dense_edge_elevations(G):
         ):
 
             difference = (
-                elevations[i + 1]
+
+                elevations[
+                    i + 1
+                ]
+
                 -
+
                 elevations[i]
             )
 
 
             if difference > 0:
 
-                ascent += difference
+                ascent += (
+                    difference
+                )
 
 
             elif difference < 0:
@@ -1282,26 +1555,21 @@ def add_dense_edge_elevations(G):
                 )
 
 
-        edge = (
-            G[u][v][key]
-        )
-
-
-        edge[
+        G[u][v][key][
             "ascent_m"
         ] = float(
             ascent
         )
 
 
-        edge[
+        G[u][v][key][
             "descent_m"
         ] = float(
             descent
         )
 
 
-        edge[
+        G[u][v][key][
             "elevation_sample_count"
         ] = len(
             samples
@@ -1317,28 +1585,32 @@ def add_dense_edge_elevations(G):
 
 
 # =========================================================
-# DOWNLOAD TRAIL GRAPH
+# DOWNLOAD / PREPARE TRAIL GRAPH
 # =========================================================
 
 def download_trail_graph(
     lat,
     lon,
-    radius_meters=3000
+    radius_meters=
+        SEARCH_RADIUS_METERS
 ):
+
 
     cache_key = (
 
         round(
-            lat,
+            float(lat),
             4
         ),
 
         round(
-            lon,
+            float(lon),
             4
         ),
 
-        radius_meters
+        int(
+            radius_meters
+        )
     )
 
 
@@ -1349,6 +1621,7 @@ def download_trail_graph(
                 cache_key
             ]
         )
+
 
         return (
 
@@ -1430,9 +1703,11 @@ def download_trail_graph(
         custom_filter=
             trail_filter,
 
-        simplify=True,
+        simplify=
+            True,
 
-        retain_all=True
+        retain_all=
+            True
     )
 
 
@@ -1454,6 +1729,7 @@ def download_trail_graph(
         data=True
     ):
 
+
         if not edge_is_allowed_trail(
             data
         ):
@@ -1473,6 +1749,7 @@ def download_trail_graph(
 
 
     G.remove_nodes_from(
+
         list(
             nx.isolates(
                 G
@@ -1482,6 +1759,7 @@ def download_trail_graph(
 
 
     if (
+
         G.number_of_nodes()
         ==
         0
@@ -1494,18 +1772,23 @@ def download_trail_graph(
     ):
 
         raise HTTPException(
+
             status_code=400,
+
             detail=(
-                "No usable trail network "
-                "remained after filtering."
+                "No usable trail network remained "
+                "after filtering."
             )
         )
 
 
     nearest = (
         ox.distance.nearest_nodes(
+
             G,
+
             X=lon,
+
             Y=lat
         )
     )
@@ -1529,21 +1812,25 @@ def download_trail_graph(
 
 
     filtered_edges_removed = (
+
         original_edges
+
         -
+
         G.number_of_edges()
     )
 
 
-    # THIS IS THE IMPORTANT NEW STEP.
-    G, unique_elevation_samples = (
-        add_dense_edge_elevations(
-            G
-        )
+    # No internet elevation API.
+    # Read everything from the local USGS TIFF.
+    (
+        G,
+        unique_elevation_samples
+    ) = add_local_dem_edge_elevations(
+        G
     )
 
 
-    # Limit graph memory usage.
     if (
         len(
             GRAPH_CACHE
@@ -1552,9 +1839,11 @@ def download_trail_graph(
         MAX_CACHED_GRAPHS
     ):
 
-        oldest_key = next(
-            iter(
-                GRAPH_CACHE
+        oldest_key = (
+            next(
+                iter(
+                    GRAPH_CACHE
+                )
             )
         )
 
@@ -1579,9 +1868,13 @@ def download_trail_graph(
 
 
     return (
+
         G,
+
         filtered_edges_removed,
+
         False,
+
         unique_elevation_samples
     )
 
@@ -1624,9 +1917,9 @@ def repeated_edge_stats(
         )
 
 
-        if edge:
+        length = (
 
-            length = float(
+            float(
                 edge.get(
                     "length",
                     0
@@ -1635,17 +1928,23 @@ def repeated_edge_stats(
                 0
             )
 
-        else:
+            if edge
 
-            length = 0.0
+            else
+
+            0.0
+        )
 
 
         counts[key] = (
+
             counts.get(
                 key,
                 0
             )
+
             +
+
             1
         )
 
@@ -1656,7 +1955,6 @@ def repeated_edge_stats(
 
 
     repeated_edges = 0
-
     repeated_distance = 0.0
 
 
@@ -1665,18 +1963,23 @@ def repeated_edge_stats(
         count
     ) in counts.items():
 
+
         if count > 1:
 
             repeated_edges += (
                 count - 1
             )
 
+
             repeated_distance += (
+
                 lengths.get(
                     key,
-                    0
+                    0.0
                 )
+
                 *
+
                 (
                     count - 1
                 )
@@ -1684,7 +1987,9 @@ def repeated_edge_stats(
 
 
     return (
+
         repeated_edges,
+
         repeated_distance
     )
 
@@ -1706,11 +2011,14 @@ def repeated_node_occurrences(
     ]:
 
         counts[node] = (
+
             counts.get(
                 node,
                 0
             )
+
             +
+
             1
         )
 
@@ -1737,11 +2045,14 @@ def count_immediate_reversals(
         len(route_nodes) - 2
     ):
 
+
         # A -> B -> A
         if (
             route_nodes[i]
             ==
-            route_nodes[i + 2]
+            route_nodes[
+                i + 2
+            ]
         ):
 
             reversals += 1
@@ -1760,6 +2071,7 @@ def route_score(
     target_distance_meters,
     target_gain_meters
 ):
+
 
     total_distance = (
         path_distance_meters(
@@ -1786,22 +2098,31 @@ def route_score(
 
 
     distance_error = abs(
+
         total_distance
+
         -
+
         target_distance_meters
     )
 
 
     distance_error_ratio = (
+
         distance_error
+
         /
+
         target_distance_meters
     )
 
 
     gain_error = abs(
+
         actual_gain
+
         -
+
         target_gain_meters
     )
 
@@ -1809,10 +2130,14 @@ def route_score(
     if target_gain_meters > 0:
 
         gain_error_ratio = (
+
             gain_error
+
             /
+
             target_gain_meters
         )
+
 
     else:
 
@@ -1825,14 +2150,18 @@ def route_score(
         repeated_edges,
         repeated_distance
     ) = repeated_edge_stats(
+
         G,
         route_nodes
     )
 
 
     repeat_ratio = (
+
         repeated_distance
+
         /
+
         total_distance
     )
 
@@ -1845,8 +2174,11 @@ def route_score(
 
 
     repeated_node_ratio = (
+
         repeated_nodes
+
         /
+
         max(
             1,
             len(route_nodes) - 2
@@ -1861,14 +2193,7 @@ def route_score(
     )
 
 
-    # Lower score is better.
-    #
-    # Distance:          120
-    # Elevation:         150
-    # Repeated mileage:  450
-    # Repeated nodes:    120
-    # U-turns:            40
-
+    # Lower score = better route.
     score = (
 
         distance_error_ratio
@@ -1949,8 +2274,10 @@ def generate_clean_loop(
     start_node,
     target_distance_meters,
     target_gain_meters,
-    attempts=400
+    attempts=
+        ROUTE_ATTEMPTS
 ):
+
 
     S = (
         make_simple_routing_graph(
@@ -1986,6 +2313,7 @@ def generate_clean_loop(
 
     for node in S.nodes:
 
+
         if node == start_node:
             continue
 
@@ -2008,31 +2336,45 @@ def generate_clean_loop(
         )
 
 
-        if distance >= min_anchor_distance:
+        if (
+            distance
+            >=
+            min_anchor_distance
+        ):
 
             anchor_candidates.append(
                 node
             )
 
 
-    # More waypoints for longer routes.
-    if target_distance_meters >= 12000:
+    # Four waypoints works better for longer
+    # trail-running loops.
+    anchor_count = (
 
-        anchor_count = 4
+        4
 
-    else:
+        if target_distance_meters
+        >=
+        12000
 
-        anchor_count = 3
+        else
+
+        3
+    )
 
 
     if (
-        len(anchor_candidates)
+        len(
+            anchor_candidates
+        )
         <
         anchor_count
     ):
 
         raise HTTPException(
+
             status_code=400,
+
             detail=(
                 "Not enough trail junctions "
                 "were found to build a loop."
@@ -2051,12 +2393,13 @@ def generate_clean_loop(
 
 
         anchors = random.sample(
+
             anchor_candidates,
+
             anchor_count
         )
 
 
-        # Reject heavily clustered waypoints.
         too_close = False
 
 
@@ -2068,6 +2411,7 @@ def generate_clean_loop(
                 i + 1,
                 len(anchors)
             ):
+
 
                 a = anchors[i]
                 b = anchors[j]
@@ -2110,8 +2454,7 @@ def generate_clean_loop(
             continue
 
 
-        # Put waypoints in geographic order
-        # around the trailhead.
+        # Geographic ordering reduces criss-crossing.
         anchors.sort(
 
             key=lambda node:
@@ -2127,7 +2470,7 @@ def generate_clean_loop(
         )
 
 
-        # Try clockwise and counterclockwise.
+        # Random clockwise/counter-clockwise.
         if random.random() < 0.5:
 
             anchors.reverse()
@@ -2145,7 +2488,7 @@ def generate_clean_loop(
         failed = False
 
 
-        # Start -> waypoints -> Start.
+        # Start -> waypoint -> waypoint -> ... -> Start
         for destination in (
 
             anchors
@@ -2196,7 +2539,9 @@ def generate_clean_loop(
 
                         leg[i],
 
-                        leg[i + 1]
+                        leg[
+                            i + 1
+                        ]
                     )
                 )
 
@@ -2211,7 +2556,9 @@ def generate_clean_loop(
 
         if (
             failed
+
             or
+
             len(route_nodes) < 4
         ):
 
@@ -2275,14 +2622,14 @@ def generate_clean_loop(
             )
 
 
-        # Excellent candidate:
-        # within 0.10 mi and 100 ft.
         distance_good = (
 
             metrics[
                 "distance_error_meters"
             ]
+
             <=
+
             160.9344
         )
 
@@ -2308,11 +2655,17 @@ def generate_clean_loop(
             metrics[
                 "repeat_ratio"
             ]
+
             <=
+
             0.02
         )
 
 
+        # Excellent result:
+        # <0.1 mi distance error
+        # <100 ft elevation error
+        # almost no repetition.
         if (
 
             distance_good
@@ -2340,23 +2693,105 @@ def generate_clean_loop(
     if best_route is None:
 
         raise HTTPException(
+
             status_code=400,
+
             detail=(
-                "Could not generate a clean "
-                "route near the requested "
-                "distance and elevation."
+                "Could not generate a clean route "
+                "near the requested distance "
+                "and elevation."
             )
         )
 
 
     return (
+
         best_route,
+
         best_metrics
     )
 
 
 # =========================================================
-# API
+# DEM INFO ENDPOINT
+# =========================================================
+
+@app.get("/dem-info")
+def dem_info():
+
+
+    if not os.path.exists(
+        DEM_PATH
+    ):
+
+        raise HTTPException(
+
+            status_code=404,
+
+            detail=(
+                "DEM file not found: "
+                +
+                DEM_PATH
+            )
+        )
+
+
+    with rasterio.open(
+        DEM_PATH
+    ) as src:
+
+
+        return {
+
+            "file":
+                DEM_PATH,
+
+            "crs":
+                str(
+                    src.crs
+                ),
+
+            "width":
+                src.width,
+
+            "height":
+                src.height,
+
+            "bounds": {
+
+                "left":
+                    src.bounds.left,
+
+                "bottom":
+                    src.bounds.bottom,
+
+                "right":
+                    src.bounds.right,
+
+                "top":
+                    src.bounds.top
+            },
+
+            "pixel_size": {
+
+                "x":
+                    abs(
+                        src.transform.a
+                    ),
+
+                "y":
+                    abs(
+                        src.transform.e
+                    )
+            },
+
+            "nodata":
+                src.nodata
+        }
+
+
+# =========================================================
+# GENERATE ROUTE API
 # =========================================================
 
 @app.post(
@@ -2365,6 +2800,7 @@ def generate_clean_loop(
 def generate_route(
     request: RouteRequest
 ):
+
 
     try:
 
@@ -2376,7 +2812,9 @@ def generate_route(
         ):
 
             raise HTTPException(
+
                 status_code=400,
+
                 detail=(
                     "Target distance must "
                     "be greater than 0."
@@ -2384,10 +2822,16 @@ def generate_route(
             )
 
 
-        if request.target_gain_ft < 0:
+        if (
+            request.target_gain_ft
+            <
+            0
+        ):
 
             raise HTTPException(
+
                 status_code=400,
+
                 detail=(
                     "Elevation gain cannot "
                     "be negative."
@@ -2398,7 +2842,9 @@ def generate_route(
         target_distance_meters = (
 
             request.target_distance_miles
+
             *
+
             METERS_PER_MILE
         )
 
@@ -2406,13 +2852,10 @@ def generate_route(
         target_gain_meters = (
 
             request.target_gain_ft
+
             /
+
             FEET_PER_METER
-        )
-
-
-        search_radius_meters = (
-            3000
         )
 
 
@@ -2427,7 +2870,7 @@ def generate_route(
 
             request.start_lon,
 
-            search_radius_meters
+            SEARCH_RADIUS_METERS
         )
 
 
@@ -2477,9 +2920,9 @@ def generate_route(
         )
 
 
-        # -------------------------------------------------
+        # =================================================
         # LOOP
-        # -------------------------------------------------
+        # =================================================
 
         if same_point:
 
@@ -2497,18 +2940,19 @@ def generate_route(
 
                 target_gain_meters,
 
-                attempts=400
+                attempts=
+                    ROUTE_ATTEMPTS
             )
 
 
             route_type = (
-                "distance + dense-elevation trail loop"
+                "distance + local-DEM trail loop"
             )
 
 
-        # -------------------------------------------------
+        # =================================================
         # POINT TO POINT
-        # -------------------------------------------------
+        # =================================================
 
         else:
 
@@ -2531,7 +2975,8 @@ def generate_route(
 
                         end_node,
 
-                        weight="length"
+                        weight=
+                            "length"
                     )
                 )
 
@@ -2539,10 +2984,12 @@ def generate_route(
             except nx.NetworkXNoPath:
 
                 raise HTTPException(
+
                     status_code=400,
+
                     detail=(
-                        "No connected trail "
-                        "route was found."
+                        "No connected trail route "
+                        "was found."
                     )
                 )
 
@@ -2557,10 +3004,12 @@ def generate_route(
                 route_nodes,
 
                 max(
+
                     path_distance_meters(
                         G,
                         route_nodes
                     ),
+
                     1.0
                 ),
 
@@ -2755,21 +3204,11 @@ def generate_route(
 
 
             "elevation_source":
-                (
-                    "Open-Meteo / "
-                    "Copernicus DEM GLO-90"
-                ),
-
-
-            "elevation_resolution":
-                "90 meters",
+                DEM_PATH,
 
 
             "status":
-                (
-                    "Dense-geometry "
-                    "elevation route generated"
-                )
+                "Local USGS DEM route generated"
         }
 
 
@@ -2781,8 +3220,12 @@ def generate_route(
     except Exception as exc:
 
         raise HTTPException(
+
             status_code=500,
-            detail=str(exc)
+
+            detail=str(
+                exc
+            )
         )
 
 
@@ -2796,7 +3239,8 @@ def generate_route(
 )
 def route_map():
 
-    return """
+
+    return r"""
 <!DOCTYPE html>
 
 <html>
@@ -2822,6 +3266,7 @@ Trail Running Creator
 
 
 <style>
+
 
 * {
     box-sizing: border-box;
@@ -3007,6 +3452,25 @@ button:disabled {
 }
 
 
+@media (
+    max-width: 700px
+) {
+
+    input {
+
+        width:
+            145px;
+    }
+
+
+    #map {
+
+        height:
+            65vh;
+    }
+}
+
+
 </style>
 
 </head>
@@ -3161,15 +3625,17 @@ Ready.
 <script>
 
 
-const map = L.map(
-    "map"
-).setView(
-    [
-        33.586,
-        -112.085
-    ],
-    14
-);
+const map =
+    L.map(
+        "map"
+    )
+    .setView(
+        [
+            33.586,
+            -112.085
+        ],
+        14
+    );
 
 
 L.tileLayer(
@@ -3279,8 +3745,8 @@ async function generateRoute() {
 
         '<span class="warning">' +
 
-        "Building trail graph, sampling elevation " +
-        "along trail geometry, and evaluating routes..." +
+        "Building trail graph, reading local USGS elevation, " +
+        "and evaluating routes..." +
 
         "</span>";
 
@@ -3343,13 +3809,17 @@ async function generateRoute() {
                 );
 
 
-        } catch {
+        }
+
+        catch {
 
 
             throw new Error(
 
                 "Invalid server response: "
+
                 +
+
                 responseText.substring(
                     0,
                     500
@@ -3364,7 +3834,9 @@ async function generateRoute() {
             throw new Error(
 
                 result.detail
+
                 ||
+
                 "Server error."
             );
         }
@@ -3372,7 +3844,9 @@ async function generateRoute() {
 
         if (
             !result.route
+
             ||
+
             result.route.length < 2
         ) {
 
@@ -3555,25 +4029,20 @@ async function generateRoute() {
             "<br>" +
 
 
-            "<b>Unique elevation samples:</b> " +
+            "<b>Elevation samples:</b> " +
             result.unique_elevation_samples +
             "<br>" +
 
 
-            "<b>Elevation sampling:</b> ~" +
+            "<b>Elevation sample spacing:</b> ~" +
             result.elevation_sample_spacing_m +
-            " m along trail geometry" +
-            "<br><br>" +
+            " m<br><br>" +
 
 
             '<span class="small">' +
 
             "Elevation source: " +
             result.elevation_source +
-            " (" +
-            result.elevation_resolution +
-            "). Terrain data © Copernicus; " +
-            "elevation API by Open-Meteo." +
 
             "</span>";
 
