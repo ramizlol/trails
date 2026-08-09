@@ -43,7 +43,7 @@ GPX_TRAIL_MATCH_TOLERANCE_M = 25.0
 MAX_CACHED_GRAPHS = 5
 GRAPH_CACHE = {}
 
-APP_VERSION = "2026-08-09-exact-gpx-start-v4"
+APP_VERSION = "2026-08-09-exact-gpx-start-v4-gpx-export"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
 
@@ -3017,6 +3017,47 @@ def dem_info():
 
 
 # ============================================================
+# GPX EXPORT PROFILE
+# ============================================================
+
+def build_gpx_export_points(coords):
+    """
+    Build one dense GPX-ready route profile.
+
+    Both downloadable GPX files use these exact same points.
+    The elevation version adds the smoothed DEM elevation as <ele>;
+    the no-elevation version simply omits <ele>.
+    """
+    if not coords or len(coords) < 2:
+        return []
+
+    lonlat = [
+        (float(point["lon"]), float(point["lat"]))
+        for point in coords
+    ]
+
+    dense = densify_polyline(
+        lonlat,
+        ELEVATION_SAMPLE_SPACING_M,
+    )
+
+    raw_elevations = elevations_for_coords(dense)
+    smoothed_elevations = smooth_elevations(
+        raw_elevations,
+        radius=ELEVATION_SMOOTHING_RADIUS,
+    )
+
+    return [
+        {
+            "lat": float(lat),
+            "lon": float(lon),
+            "ele_m": round(float(ele), 2),
+        }
+        for (lon, lat), ele in zip(dense, smoothed_elevations)
+    ]
+
+
+# ============================================================
 # GENERATE ROUTE
 # ============================================================
 
@@ -3176,6 +3217,12 @@ def generate_route(request: RouteRequest):
 
         coords = metrics.get("route_coordinates") or route_coordinates(G, route_nodes)
 
+        # Build a single dense export track only after the winning route has
+        # been selected. This does not change the route search. Both GPX
+        # download options use the same points; one includes DEM elevation
+        # and one omits it.
+        gpx_export_points = build_gpx_export_points(coords)
+
         return {
             "requested_distance_miles": request.target_distance_miles,
             "actual_distance_miles": round(route_distance_miles, 2),
@@ -3188,6 +3235,7 @@ def generate_route(request: RouteRequest):
             "search_method": search_method,
             "route_profile": profile["name"],
             "route": coords,
+            "gpx_export_points": gpx_export_points,
             "route_nodes": len(route_nodes),
             "route_geometry_points": len(coords),
             "repeated_edges": metrics["repeated_edges"],
@@ -3426,6 +3474,8 @@ button:disabled {
 </div>
 
 <button id="generateButton">Generate Trail Route</button>
+<button id="downloadGpxButton" disabled>Download GPX</button>
+<button id="downloadGpxElevationButton" disabled>Download GPX + DEM Elevation</button>
 <button id="networkButton">Reload Allowed Trails</button>
 
 <div class="network-control">
@@ -3480,11 +3530,14 @@ L.tileLayer(
 let routeLine = null;
 let gpxLine = null;
 let networkLayer = L.layerGroup();
+let lastGeneratedRoute = null;
 let requestedStartMarker = null;
 let snappedStartMarker = null;
 let snapLine = null;
 
 const generateButton = document.getElementById("generateButton");
+const downloadGpxButton = document.getElementById("downloadGpxButton");
+const downloadGpxElevationButton = document.getElementById("downloadGpxElevationButton");
 const networkButton = document.getElementById("networkButton");
 const analyzeGpxButton = document.getElementById("analyzeGpxButton");
 const testGpxButton = document.getElementById("testGpxButton");
@@ -3493,11 +3546,93 @@ const showNetworkCheckbox = document.getElementById("showNetwork");
 
 
 generateButton.addEventListener("click", generateRoute);
+downloadGpxButton.addEventListener("click", () => downloadGeneratedGpx(false));
+downloadGpxElevationButton.addEventListener("click", () => downloadGeneratedGpx(true));
 networkButton.addEventListener("click", reloadNetwork);
 analyzeGpxButton.addEventListener("click", analyzeGpx);
 testGpxButton.addEventListener("click", testGpxAgainstGenerator);
 clearGpxButton.addEventListener("click", clearGpx);
 showNetworkCheckbox.addEventListener("change", updateNetworkVisibility);
+
+
+function escapeXml(value) {
+    return String(value)
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&apos;");
+}
+
+
+function buildGpxXml(points, routeName, includeElevation) {
+    const trackPoints = points.map(point => {
+        const lat = Number(point.lat).toFixed(7);
+        const lon = Number(point.lon).toFixed(7);
+
+        if (includeElevation && Number.isFinite(Number(point.ele_m))) {
+            const ele = Number(point.ele_m).toFixed(2);
+            return `      <trkpt lat="${lat}" lon="${lon}"><ele>${ele}</ele></trkpt>`;
+        }
+
+        return `      <trkpt lat="${lat}" lon="${lon}"></trkpt>`;
+    }).join("\n");
+
+    return `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="Trail Running Creator" xmlns="http://www.topografix.com/GPX/1/1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.topografix.com/GPX/1/1 http://www.topografix.com/GPX/1/1/gpx.xsd">
+  <metadata>
+    <name>${escapeXml(routeName)}</name>
+  </metadata>
+  <trk>
+    <name>${escapeXml(routeName)}</name>
+    <trkseg>
+${trackPoints}
+    </trkseg>
+  </trk>
+</gpx>
+`;
+}
+
+
+function triggerTextDownload(filename, contents, mimeType) {
+    const blob = new Blob([contents], {type: mimeType});
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+
+function downloadGeneratedGpx(includeElevation) {
+    if (!lastGeneratedRoute) {
+        return;
+    }
+
+    const points = lastGeneratedRoute.gpx_export_points;
+
+    if (!points || points.length < 2) {
+        alert("The generated route does not contain enough points to export.");
+        return;
+    }
+
+    const distance = Number(lastGeneratedRoute.actual_distance_miles).toFixed(2);
+    const gain = Math.round(Number(lastGeneratedRoute.actual_gain_ft));
+    const routeName = includeElevation
+        ? `Trail Route ${distance} mi ${gain} ft - DEM elevation`
+        : `Trail Route ${distance} mi ${gain} ft - no elevation`;
+
+    const suffix = includeElevation ? "with-dem-elevation" : "no-elevation";
+    const filename = `trail-route-${distance}mi-${gain}ft-${suffix}.gpx`;
+    const xml = buildGpxXml(points, routeName, includeElevation);
+
+    triggerTextDownload(filename, xml, "application/gpx+xml;charset=utf-8");
+}
 
 
 function updateNetworkVisibility() {
@@ -3704,6 +3839,9 @@ async function generateRoute() {
 
     results.innerHTML = '<span class="warning">Loading allowed trails...</span>';
     generateButton.disabled = true;
+    lastGeneratedRoute = null;
+    downloadGpxButton.disabled = true;
+    downloadGpxElevationButton.disabled = true;
 
     try {
         await loadTrailNetwork(data);
@@ -3726,6 +3864,14 @@ async function generateRoute() {
         if (!result.route || result.route.length < 2) {
             throw new Error("Server returned an empty route.");
         }
+
+        if (!result.gpx_export_points || result.gpx_export_points.length < 2) {
+            throw new Error("Server returned a route but no GPX export profile.");
+        }
+
+        lastGeneratedRoute = result;
+        downloadGpxButton.disabled = false;
+        downloadGpxElevationButton.disabled = false;
 
         const coordinates = result.route.map(
             point => [point.lat, point.lon]
@@ -3790,6 +3936,8 @@ async function generateRoute() {
             "<b>Elevation sample spacing:</b> ~" + result.elevation_sample_spacing_m + " m<br>" +
             "<b>Elevation smoothing:</b> ~" + result.elevation_smoothing_distance_m + " m (" + result.elevation_smoothing_window_points + " points)<br>" +
             "<b>Version:</b> " + result.version + "<br>" +
+            "<b>GPX export points:</b> " + result.gpx_export_points.length + "<br>" +
+            '<span class="small">Use Download GPX for coordinates only, or Download GPX + DEM Elevation for the same track with &lt;ele&gt; values.</span><br>' +
             '<span class="small">Elevation source: ' + result.elevation_source + "</span>";
 
     } catch (error) {
