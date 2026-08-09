@@ -16,6 +16,7 @@ import rasterio
 from pyproj import Transformer
 from shapely.geometry import LineString
 from rasterio.warp import transform as rio_transform, transform_bounds as rio_transform_bounds
+from sklearn.neighbors import BallTree
 
 
 app = FastAPI()
@@ -44,14 +45,13 @@ GPX_TRAIL_MATCH_TOLERANCE_M = 25.0
 MAX_CACHED_GRAPHS = 5
 GRAPH_CACHE = {}
 
-# One filtered OSM hybrid graph covering the entire DEM/TIFF footprint:
-# natural trails plus real walkable connector ways.
-# It is loaded/built lazily on the first trail request, then every route request
-# extracts only a local subgraph around its start coordinate.
+# One filtered OSM natural-trail graph covering the entire DEM/TIFF footprint.
+# Walkable roads are NOT stored TIFF-wide. V9 fetches only a few narrow
+# connector corridors on demand for long routes, which keeps Render memory low.
 MASTER_GRAPH = None
 MASTER_GRAPH_INFO = {}
 MASTER_GRAPH_LOCK = threading.Lock()
-MASTER_GRAPH_PATH = os.path.join(BASE_DIR, "master_walkable_trails_output_USGS10m_v8.graphml")
+MASTER_GRAPH_PATH = os.path.join(BASE_DIR, "master_trails_output_USGS10m_v9.graphml")
 DEM_BOUNDS_WGS84_CACHE = None
 
 # Cache DEM values by rounded lat/lon. Graph construction already samples
@@ -60,7 +60,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-09-v8-full-tiff-hybrid-connectors"
+APP_VERSION = "2026-08-09-v9-selective-connectors"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
 TRAIL_HIGHWAYS = {"path", "track", "steps"}
@@ -69,6 +69,18 @@ CONNECTOR_HIGHWAYS = {"footway", "pedestrian", "cycleway", "bridleway", "residen
 CONNECTOR_PATH_COST_MULTIPLIER = 2.5
 CONNECTOR_FINAL_SCORE_WEIGHT = 120.0
 CONNECTOR_CHEAP_SCORE_WEIGHT = 90.0
+
+# V9 keeps the TIFF-wide master graph trail-only. For long routes it downloads
+# only a few narrow walkable-road corridors needed to bridge nearby disconnected
+# trail systems. This avoids holding the entire urban street network in memory.
+SELECTIVE_CONNECTORS_MIN_RADIUS_M = 8.0 * METERS_PER_MILE
+SELECTIVE_CONNECTOR_MAX_COUNT = 4
+SELECTIVE_CONNECTOR_MIN_COMPONENT_TRAIL_M = 250.0
+SELECTIVE_CONNECTOR_MAX_GAP_M = 7000.0
+SELECTIVE_CONNECTOR_ATTACH_MAX_M = 90.0
+SELECTIVE_CONNECTOR_CACHE = {}
+MAX_SELECTIVE_CONNECTOR_CACHE = 8
+CONNECTOR_FILTER = '["highway"~"footway|pedestrian|cycleway|bridleway|residential|living_street|service|unclassified|tertiary|secondary|primary|road"]'
 
 
 # ============================================================
@@ -1126,105 +1138,829 @@ def configure_osmnx_trail_tags():
 
 
 def master_graph_metadata(G, loaded_from_disk=False):
-    physical = set(); trail_physical = set(); connector_physical = set()
+    physical = set()
+    trail_physical = set()
+
     for u, v, key, data in G.edges(keys=True, data=True):
-        pk = (min(int(u), int(v)), max(int(u), int(v)), round(float(data.get("length", 0) or 0), 1))
+        pk = (
+            min(int(u), int(v)),
+            max(int(u), int(v)),
+            round(float(data.get("length", 0) or 0), 1),
+        )
         physical.add(pk)
-        if str(data.get("route_class", "trail")) == "connector": connector_physical.add(pk)
-        else: trail_physical.add(pk)
+        trail_physical.add(pk)
+
     return {
-        "nodes": int(G.number_of_nodes()), "edges": int(G.number_of_edges()),
+        "nodes": int(G.number_of_nodes()),
+        "edges": int(G.number_of_edges()),
         "physical_segments": len(physical),
         "trail_physical_segments": len(trail_physical),
-        "connector_physical_segments": len(connector_physical),
-        "filtered_edges_removed": int(float(G.graph.get("master_filtered_edges_removed", 0) or 0)),
-        "loaded_from_disk": bool(loaded_from_disk), "bbox": get_dem_bounds_wgs84(),
+        "connector_physical_segments": 0,
+        "filtered_edges_removed": int(
+            float(G.graph.get("master_filtered_edges_removed", 0) or 0)
+        ),
+        "loaded_from_disk": bool(loaded_from_disk),
+        "bbox": get_dem_bounds_wgs84(),
         "saved_graph": os.path.basename(MASTER_GRAPH_PATH),
     }
 
 
 def try_load_saved_master_graph():
-    if not os.path.exists(MASTER_GRAPH_PATH): return None
+    if not os.path.exists(MASTER_GRAPH_PATH):
+        return None
+
     try:
         G = ox.io.load_graphml(filepath=MASTER_GRAPH_PATH)
-        if str(G.graph.get("dem_signature", "")) != get_dem_signature(): return None
-        if str(G.graph.get("master_network_schema", "")) != "hybrid-v8": return None
-        return G if G.number_of_nodes() and G.number_of_edges() else None
+
+        if str(G.graph.get("dem_signature", "")) != get_dem_signature():
+            return None
+
+        if str(G.graph.get("master_network_schema", "")) != "trail-only-v9":
+            return None
+
+        if not G.number_of_nodes() or not G.number_of_edges():
+            return None
+
+        return G
     except Exception:
         return None
 
 
 def save_master_graph(G):
     try:
-        ox.io.save_graphml(G, filepath=MASTER_GRAPH_PATH); return True
+        ox.io.save_graphml(G, filepath=MASTER_GRAPH_PATH)
+        return True
     except Exception:
         return False
 
 
 def build_master_trail_graph():
+    """
+    Download every allowed natural trail inside the TIFF footprint once.
+
+    V9 deliberately does NOT place the complete Phoenix street network in this
+    master graph. Walkable streets are fetched later only for small connector
+    corridors between trail components that are useful to a long route.
+    """
     configure_osmnx_trail_tags()
     bbox = get_dem_bounds_wgs84()
-    hybrid_filter = '["highway"~"path|track|steps|footway|pedestrian|cycleway|bridleway|residential|living_street|service|unclassified|tertiary|secondary|primary|road"]'
+    trail_filter = '["highway"~"path|track|steps"]'
+
     try:
-        G = ox.graph.graph_from_bbox(bbox, network_type="walk", custom_filter=hybrid_filter, simplify=True, retain_all=True, truncate_by_edge=False)
+        G = ox.graph.graph_from_bbox(
+            bbox,
+            network_type="walk",
+            custom_filter=trail_filter,
+            simplify=True,
+            retain_all=True,
+            truncate_by_edge=False,
+        )
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Could not download the master TIFF walkable network: {exc}")
-    original_edges = G.number_of_edges(); remove = []
+        raise HTTPException(
+            status_code=502,
+            detail=f"Could not download the master TIFF trail network: {exc}",
+        )
+
+    original_edges = G.number_of_edges()
+    remove = []
+
     for u, v, key, data in G.edges(keys=True, data=True):
-        rc = classify_walkable_edge(data)
-        if rc is None or not edge_fully_inside_dem(G, u, v, data):
-            remove.append((u, v, key)); continue
-        data["route_class"] = rc
-        length = float(data.get("length", 0) or 0)
-        data["routing_cost"] = length * (CONNECTOR_PATH_COST_MULTIPLIER if rc == "connector" else 1.0)
-    G.remove_edges_from(remove); G.remove_nodes_from(list(nx.isolates(G)))
-    if not G.number_of_edges() or not trail_edge_ids(G):
-        raise HTTPException(status_code=400, detail="No usable natural trail network was found inside the TIFF footprint.")
-    G.graph["dem_signature"] = get_dem_signature(); G.graph["master_filtered_edges_removed"] = int(original_edges - G.number_of_edges())
-    G.graph["master_tiff_name"] = os.path.basename(DEM_PATH); G.graph["master_network_version"] = APP_VERSION; G.graph["master_network_schema"] = "hybrid-v8"
-    save_master_graph(G); return G
+        if not edge_is_allowed_trail(data):
+            remove.append((u, v, key))
+            continue
+
+        if not edge_fully_inside_dem(G, u, v, data):
+            remove.append((u, v, key))
+            continue
+
+        data["route_class"] = "trail"
+        data["routing_cost"] = float(data.get("length", 0) or 0)
+
+    G.remove_edges_from(remove)
+    G.remove_nodes_from(list(nx.isolates(G)))
+
+    if not G.number_of_edges():
+        raise HTTPException(
+            status_code=400,
+            detail="No usable natural trail network was found inside the TIFF footprint.",
+        )
+
+    G.graph["dem_signature"] = get_dem_signature()
+    G.graph["master_filtered_edges_removed"] = int(
+        original_edges - G.number_of_edges()
+    )
+    G.graph["master_tiff_name"] = os.path.basename(DEM_PATH)
+    G.graph["master_network_version"] = APP_VERSION
+    G.graph["master_network_schema"] = "trail-only-v9"
+
+    save_master_graph(G)
+    return G
 
 
 def get_master_trail_graph():
     global MASTER_GRAPH, MASTER_GRAPH_INFO
-    if MASTER_GRAPH is not None: return MASTER_GRAPH, MASTER_GRAPH_INFO
+
+    if MASTER_GRAPH is not None:
+        return MASTER_GRAPH, MASTER_GRAPH_INFO
+
     with MASTER_GRAPH_LOCK:
-        if MASTER_GRAPH is not None: return MASTER_GRAPH, MASTER_GRAPH_INFO
-        G = try_load_saved_master_graph(); loaded = G is not None
-        if G is None: G = build_master_trail_graph()
-        MASTER_GRAPH = G; MASTER_GRAPH_INFO = master_graph_metadata(G, loaded_from_disk=loaded)
+        if MASTER_GRAPH is not None:
+            return MASTER_GRAPH, MASTER_GRAPH_INFO
+
+        G = try_load_saved_master_graph()
+        loaded = G is not None
+
+        if G is None:
+            G = build_master_trail_graph()
+
+        MASTER_GRAPH = G
+        MASTER_GRAPH_INFO = master_graph_metadata(
+            G,
+            loaded_from_disk=loaded,
+        )
+
     return MASTER_GRAPH, MASTER_GRAPH_INFO
 
 
 def extract_local_master_subgraph(master_G, lat, lon, radius_meters):
+    """
+    Return every natural-trail component inside the requested radius/bbox.
+
+    Unlike v7/v8, disconnected trail systems are not discarded here. This is
+    why the gray overlay can show all available trails in the large search area.
+    The route search later limits anchors to nodes actually reachable from the
+    requested start, after selective connector corridors are added.
+    """
     if not point_inside_dem(lat, lon):
         left, bottom, right, top = get_dem_bounds_wgs84()
-        raise HTTPException(status_code=400, detail=f"Start coordinate is outside TIFF coverage: west={left:.6f}, east={right:.6f}, south={bottom:.6f}, north={top:.6f}.")
-    local_bbox = ox.utils_geo.bbox_from_point((float(lat), float(lon)), float(radius_meters))
-    dl, db, dr, dt = get_dem_bounds_wgs84()
-    left, bottom, right, top = max(float(local_bbox[0]), dl), max(float(local_bbox[1]), db), min(float(local_bbox[2]), dr), min(float(local_bbox[3]), dt)
-    if left >= right or bottom >= top: raise HTTPException(status_code=400, detail="No TIFF-covered search area exists around this start coordinate.")
-    try:
-        local = ox.truncate.truncate_graph_bbox(master_G, (left, bottom, right, top), truncate_by_edge=True)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Could not extract trails around this start coordinate: {exc}")
-    trail_local = trail_only_graph(local)
-    if not local.number_of_edges() or not trail_local.number_of_edges(): raise HTTPException(status_code=400, detail="No natural trails were found near this start coordinate.")
-    nearest = ox.distance.nearest_nodes(trail_local, X=float(lon), Y=float(lat))
-    component = nx.node_connected_component(local.to_undirected(as_view=True), nearest)
-    G = local.subgraph(component).copy()
-    if not G.number_of_edges(): raise HTTPException(status_code=400, detail="The nearby hybrid trail network is not connected enough to route from this start.")
-    return G
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Start coordinate is outside TIFF coverage: "
+                f"west={left:.6f}, east={right:.6f}, "
+                f"south={bottom:.6f}, north={top:.6f}."
+            ),
+        )
 
+    local_bbox = ox.utils_geo.bbox_from_point(
+        (float(lat), float(lon)),
+        float(radius_meters),
+    )
+
+    dl, db, dr, dt = get_dem_bounds_wgs84()
+    left = max(float(local_bbox[0]), dl)
+    bottom = max(float(local_bbox[1]), db)
+    right = min(float(local_bbox[2]), dr)
+    top = min(float(local_bbox[3]), dt)
+
+    if left >= right or bottom >= top:
+        raise HTTPException(
+            status_code=400,
+            detail="No TIFF-covered search area exists around this start coordinate.",
+        )
+
+    try:
+        local = ox.truncate.truncate_graph_bbox(
+            master_G,
+            (left, bottom, right, top),
+            truncate_by_edge=True,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Could not extract trails around this start coordinate: {exc}",
+        )
+
+    if not local.number_of_edges():
+        raise HTTPException(
+            status_code=400,
+            detail="No natural trails were found near this start coordinate.",
+        )
+
+    return local.copy()
+
+
+def _component_unique_trail_length(G, nodes):
+    nodes = set(nodes)
+    seen = set()
+    total = 0.0
+
+    for u in nodes:
+        if u not in G:
+            continue
+        for _, v, key, data in G.out_edges(u, keys=True, data=True):
+            if v not in nodes:
+                continue
+            if str(data.get("route_class", "trail")) != "trail":
+                continue
+            pk = (
+                min(int(u), int(v)),
+                max(int(u), int(v)),
+                round(float(data.get("length", 0) or 0), 1),
+            )
+            if pk in seen:
+                continue
+            seen.add(pk)
+            total += float(data.get("length", 0) or 0)
+
+    return total
+
+
+def _closest_node_pair_cross_graph(Ga, nodes_a, Gb, nodes_b):
+    a = [n for n in nodes_a if n in Ga]
+    b = [n for n in nodes_b if n in Gb]
+
+    if not a or not b:
+        return None
+
+    coords_a = np.radians(
+        np.array(
+            [[float(Ga.nodes[n]["y"]), float(Ga.nodes[n]["x"])] for n in a],
+            dtype=float,
+        )
+    )
+    coords_b = np.radians(
+        np.array(
+            [[float(Gb.nodes[n]["y"]), float(Gb.nodes[n]["x"])] for n in b],
+            dtype=float,
+        )
+    )
+
+    tree = BallTree(coords_a, metric="haversine")
+    distances, indices = tree.query(coords_b, k=1)
+    row = int(np.argmin(distances[:, 0]))
+    ai = int(indices[row, 0])
+    distance_m = float(distances[row, 0]) * 6371000.0
+
+    return a[ai], b[row], distance_m
+
+
+def _closest_node_pair_same_graph(G, nodes_a, nodes_b):
+    return _closest_node_pair_cross_graph(G, nodes_a, G, nodes_b)
+
+
+def _connector_bbox(lat1, lon1, lat2, lon2, padding_m):
+    mean_lat = (float(lat1) + float(lat2)) / 2.0
+    lat_pad = float(padding_m) / 111320.0
+    lon_scale = max(0.2, math.cos(math.radians(mean_lat)))
+    lon_pad = float(padding_m) / (111320.0 * lon_scale)
+
+    left = min(float(lon1), float(lon2)) - lon_pad
+    right = max(float(lon1), float(lon2)) + lon_pad
+    bottom = min(float(lat1), float(lat2)) - lat_pad
+    top = max(float(lat1), float(lat2)) + lat_pad
+
+    dl, db, dr, dt = get_dem_bounds_wgs84()
+    return (
+        max(left, dl),
+        max(bottom, db),
+        min(right, dr),
+        min(top, dt),
+    )
+
+
+def _nodes_in_bbox(G, nodes, bbox):
+    left, bottom, right, top = bbox
+    result = []
+
+    for n in nodes:
+        if n not in G:
+            continue
+        lat = float(G.nodes[n]["y"])
+        lon = float(G.nodes[n]["x"])
+        if left <= lon <= right and bottom <= lat <= top:
+            result.append(n)
+
+    return result
+
+
+def _nearest_attachment(local_G, trail_nodes, walk_G, preferred_node, bbox):
+    """
+    Return (trail_node, walk_node, offset_m).
+
+    Prefer an exact shared OSM node between a trail and the walkable connector
+    graph. Only if OSM topology does not share a node do we permit a very short
+    <=90 m attachment, which is marked separately as a synthetic attachment.
+    """
+    trail_nodes = _nodes_in_bbox(local_G, trail_nodes, bbox)
+    if not trail_nodes:
+        return None
+
+    shared = [n for n in trail_nodes if n in walk_G]
+
+    if shared:
+        preferred_lat = float(local_G.nodes[preferred_node]["y"])
+        preferred_lon = float(local_G.nodes[preferred_node]["x"])
+        best = min(
+            shared,
+            key=lambda n: haversine_meters(
+                preferred_lat,
+                preferred_lon,
+                float(local_G.nodes[n]["y"]),
+                float(local_G.nodes[n]["x"]),
+            ),
+        )
+        return best, best, 0.0
+
+    pair = _closest_node_pair_cross_graph(
+        local_G,
+        trail_nodes,
+        walk_G,
+        list(walk_G.nodes),
+    )
+
+    if pair is None:
+        return None
+
+    trail_node, walk_node, distance_m = pair
+
+    if distance_m > SELECTIVE_CONNECTOR_ATTACH_MAX_M:
+        return None
+
+    return trail_node, walk_node, float(distance_m)
+
+
+def _download_connector_corridor(local_G, source_nodes, target_nodes, source_hint, target_hint):
+    source_lat = float(local_G.nodes[source_hint]["y"])
+    source_lon = float(local_G.nodes[source_hint]["x"])
+    target_lat = float(local_G.nodes[target_hint]["y"])
+    target_lon = float(local_G.nodes[target_hint]["x"])
+
+    straight_gap = haversine_meters(
+        source_lat,
+        source_lon,
+        target_lat,
+        target_lon,
+    )
+
+    padding_m = min(1100.0, max(400.0, straight_gap * 0.16))
+    bbox = _connector_bbox(
+        source_lat,
+        source_lon,
+        target_lat,
+        target_lon,
+        padding_m,
+    )
+
+    if bbox[0] >= bbox[2] or bbox[1] >= bbox[3]:
+        return None, "connector corridor falls outside TIFF"
+
+    cache_key = (
+        round(source_lat, 4),
+        round(source_lon, 4),
+        round(target_lat, 4),
+        round(target_lon, 4),
+        round(padding_m, -1),
+    )
+
+    reverse_key = (
+        cache_key[2],
+        cache_key[3],
+        cache_key[0],
+        cache_key[1],
+        cache_key[4],
+    )
+
+    cached = SELECTIVE_CONNECTOR_CACHE.get(cache_key)
+    if cached is None:
+        cached = SELECTIVE_CONNECTOR_CACHE.get(reverse_key)
+
+    if cached is not None:
+        W = cached.copy()
+    else:
+        try:
+            W = ox.graph.graph_from_bbox(
+                bbox,
+                network_type="walk",
+                custom_filter=CONNECTOR_FILTER,
+                simplify=True,
+                retain_all=True,
+                truncate_by_edge=False,
+            )
+        except Exception as exc:
+            return None, f"connector OSM query failed: {exc}"
+
+        remove = []
+        for u, v, key, data in W.edges(keys=True, data=True):
+            if classify_walkable_edge(data) != "connector":
+                remove.append((u, v, key))
+                continue
+            if not edge_fully_inside_dem(W, u, v, data):
+                remove.append((u, v, key))
+                continue
+            data["route_class"] = "connector"
+            data["routing_cost"] = (
+                float(data.get("length", 0) or 0)
+                * CONNECTOR_PATH_COST_MULTIPLIER
+            )
+
+        W.remove_edges_from(remove)
+        W.remove_nodes_from(list(nx.isolates(W)))
+
+        if not W.number_of_edges():
+            return None, "no usable walkable connector ways in corridor"
+
+        if len(SELECTIVE_CONNECTOR_CACHE) >= MAX_SELECTIVE_CONNECTOR_CACHE:
+            oldest = next(iter(SELECTIVE_CONNECTOR_CACHE))
+            SELECTIVE_CONNECTOR_CACHE.pop(oldest)
+
+        SELECTIVE_CONNECTOR_CACHE[cache_key] = W.copy()
+
+    source_attach = _nearest_attachment(
+        local_G,
+        source_nodes,
+        W,
+        source_hint,
+        bbox,
+    )
+    target_attach = _nearest_attachment(
+        local_G,
+        target_nodes,
+        W,
+        target_hint,
+        bbox,
+    )
+
+    if source_attach is None or target_attach is None:
+        return None, "could not attach connector corridor to both trail systems"
+
+    source_trail, source_walk, source_offset = source_attach
+    target_trail, target_walk, target_offset = target_attach
+
+    try:
+        distances, paths = nx.multi_source_dijkstra(
+            W,
+            [source_walk],
+            weight="length",
+        )
+    except Exception as exc:
+        return None, f"connector shortest-path search failed: {exc}"
+
+    if target_walk not in distances:
+        return None, "walkable corridor does not connect the two trail systems"
+
+    path = paths[target_walk]
+    path_length = float(distances[target_walk])
+
+    # Reject wildly indirect connector paths. We only want practical bridges
+    # between trail systems, not an accidental city-scale detour.
+    max_reasonable = max(1800.0, straight_gap * 3.5 + 1200.0)
+    if path_length > max_reasonable:
+        return None, "walkable connector path is too indirect"
+
+    return {
+        "walk_graph": W,
+        "path": path,
+        "path_length_m": path_length,
+        "source_trail": source_trail,
+        "source_walk": source_walk,
+        "source_offset_m": source_offset,
+        "target_trail": target_trail,
+        "target_walk": target_walk,
+        "target_offset_m": target_offset,
+        "straight_gap_m": straight_gap,
+    }, None
+
+
+def _next_unique_edge_key(G, u, v, base):
+    key = str(base)
+    if not G.has_edge(u, v, key):
+        return key
+
+    i = 1
+    while G.has_edge(u, v, f"{key}_{i}"):
+        i += 1
+    return f"{key}_{i}"
+
+
+def _add_attachment_edge(G, trail_node, walk_node, offset_m, label):
+    if trail_node == walk_node or offset_m <= 0.01:
+        return 0.0
+
+    lon1 = float(G.nodes[trail_node]["x"])
+    lat1 = float(G.nodes[trail_node]["y"])
+    lon2 = float(G.nodes[walk_node]["x"])
+    lat2 = float(G.nodes[walk_node]["y"])
+    length = haversine_meters(lat1, lon1, lat2, lon2)
+
+    attrs_forward = {
+        "geometry": LineString([(lon1, lat1), (lon2, lat2)]),
+        "length": float(length),
+        "highway": "connector_attachment",
+        "route_class": "connector",
+        "routing_cost": float(length) * CONNECTOR_PATH_COST_MULTIPLIER,
+        "synthetic_attachment": True,
+        "connector_label": label,
+    }
+    attrs_reverse = dict(attrs_forward)
+    attrs_reverse["geometry"] = LineString([(lon2, lat2), (lon1, lat1)])
+
+    k1 = _next_unique_edge_key(G, trail_node, walk_node, f"v9attach_{label}")
+    k2 = _next_unique_edge_key(G, walk_node, trail_node, f"v9attach_{label}")
+    G.add_edge(trail_node, walk_node, key=k1, **attrs_forward)
+    G.add_edge(walk_node, trail_node, key=k2, **attrs_reverse)
+    return float(length)
+
+
+def _merge_connector_path(local_G, connector_result, connector_index):
+    W = connector_result["walk_graph"]
+    path = connector_result["path"]
+
+    for n in path:
+        if n not in local_G:
+            local_G.add_node(n, **dict(W.nodes[n]))
+
+    copied_path_length = 0.0
+
+    for i in range(len(path) - 1):
+        a = path[i]
+        b = path[i + 1]
+
+        forward = W.get_edge_data(a, b) or {}
+        reverse = W.get_edge_data(b, a) or {}
+
+        # Copy every directed edge for this selected physical connector segment.
+        for x, y, edge_dict in ((a, b, forward), (b, a, reverse)):
+            for key, data in edge_dict.items():
+                attrs = dict(data)
+                attrs["route_class"] = "connector"
+                attrs["routing_cost"] = (
+                    float(attrs.get("length", 0) or 0)
+                    * CONNECTOR_PATH_COST_MULTIPLIER
+                )
+                use_key = _next_unique_edge_key(
+                    local_G,
+                    x,
+                    y,
+                    f"v9c{connector_index}_{key}",
+                )
+                local_G.add_edge(x, y, key=use_key, **attrs)
+
+        best = get_shortest_edge(W, a, b)
+        if best is not None:
+            copied_path_length += float(best.get("length", 0) or 0)
+
+    # If OSM represents the trail/road join with separate nodes, bridge only a
+    # very small topology gap. These short edges are explicitly tagged so their
+    # mileage is penalized like every other connector.
+    copied_path_length += _add_attachment_edge(
+        local_G,
+        connector_result["source_trail"],
+        connector_result["source_walk"],
+        connector_result["source_offset_m"],
+        f"{connector_index}_a",
+    )
+    copied_path_length += _add_attachment_edge(
+        local_G,
+        connector_result["target_trail"],
+        connector_result["target_walk"],
+        connector_result["target_offset_m"],
+        f"{connector_index}_b",
+    )
+
+    return copied_path_length
+
+
+def add_selective_connectors(local_G, start_lat, start_lon, radius_meters):
+    """
+    Add a small number of real walkable OSM connector paths between useful
+    disconnected trail components.
+
+    This function is intentionally conservative:
+      * skipped entirely for routes shorter than 8 miles
+      * at most four connector corridors
+      * at most ~7 km straight-line component gap
+      * each corridor is downloaded and immediately reduced to one shortest path
+      * all unused streets are discarded before DEM annotation / route search
+    """
+    stats = {
+        "components_before": 0,
+        "components_after": 0,
+        "connectors_added": 0,
+        "connector_queries": 0,
+        "connector_path_meters": 0.0,
+        "attempted": False,
+        "errors": [],
+    }
+
+    G = local_G.copy()
+    undirected = G.to_undirected(as_view=True)
+    components = [set(c) for c in nx.connected_components(undirected)]
+    stats["components_before"] = len(components)
+
+    if len(components) <= 1:
+        stats["components_after"] = len(components)
+        G.graph["selective_connector_stats"] = stats
+        return G, stats
+
+    if float(radius_meters) < SELECTIVE_CONNECTORS_MIN_RADIUS_M:
+        stats["components_after"] = len(components)
+        G.graph["selective_connector_stats"] = stats
+        return G, stats
+
+    stats["attempted"] = True
+
+    try:
+        trail_graph = trail_only_graph(G)
+        start_node = int(
+            ox.distance.nearest_nodes(
+                trail_graph,
+                X=float(start_lon),
+                Y=float(start_lat),
+            )
+        )
+    except Exception as exc:
+        stats["errors"].append(f"could not locate start trail component: {exc}")
+        stats["components_after"] = len(components)
+        G.graph["selective_connector_stats"] = stats
+        return G, stats
+
+    original_components = components
+    component_lengths = {
+        i: _component_unique_trail_length(G, nodes)
+        for i, nodes in enumerate(original_components)
+    }
+
+    start_component_index = next(
+        (i for i, nodes in enumerate(original_components) if start_node in nodes),
+        None,
+    )
+
+    if start_component_index is None:
+        stats["components_after"] = len(components)
+        G.graph["selective_connector_stats"] = stats
+        return G, stats
+
+    failed_components = set()
+    max_gap = min(
+        SELECTIVE_CONNECTOR_MAX_GAP_M,
+        max(1500.0, float(radius_meters) * 0.32),
+    )
+    max_useful_radial = min(
+        float(radius_meters) * 0.55,
+        float(radius_meters),
+    )
+
+    for connector_index in range(1, SELECTIVE_CONNECTOR_MAX_COUNT + 1):
+        reachable = set(
+            nx.node_connected_component(
+                G.to_undirected(as_view=True),
+                start_node,
+            )
+        )
+
+        candidate_rows = []
+
+        for i, target_nodes in enumerate(original_components):
+            if i == start_component_index:
+                continue
+            if i in failed_components:
+                continue
+            if reachable.intersection(target_nodes):
+                continue
+            if component_lengths.get(i, 0.0) < SELECTIVE_CONNECTOR_MIN_COMPONENT_TRAIL_M:
+                continue
+
+            radial_pair = _closest_node_pair_same_graph(
+                G,
+                [start_node],
+                target_nodes,
+            )
+            if radial_pair is None or radial_pair[2] > max_useful_radial:
+                continue
+
+            gap_pair = _closest_node_pair_same_graph(
+                G,
+                reachable,
+                target_nodes,
+            )
+            if gap_pair is None:
+                continue
+
+            source_hint, target_hint, gap_m = gap_pair
+            if gap_m > max_gap:
+                continue
+
+            trail_length = component_lengths.get(i, 0.0)
+            # Prefer nearby components, with a modest bonus for substantial
+            # trail systems so a 100 m fragment does not beat a preserve.
+            score = gap_m / (1.0 + min(trail_length, 8000.0) / 8000.0 * 0.45)
+            candidate_rows.append(
+                (score, gap_m, -trail_length, i, source_hint, target_hint)
+            )
+
+        if not candidate_rows:
+            break
+
+        candidate_rows.sort()
+        connected_this_round = False
+
+        # Try several candidates; one failed Overpass corridor should not abort
+        # the request or kill the server response.
+        for _, gap_m, _, component_index, source_hint, target_hint in candidate_rows[:6]:
+            stats["connector_queries"] += 1
+            result, error = _download_connector_corridor(
+                G,
+                reachable,
+                original_components[component_index],
+                source_hint,
+                target_hint,
+            )
+
+            if result is None:
+                failed_components.add(component_index)
+                if error:
+                    stats["errors"].append(
+                        f"component {component_index}: {error}"
+                    )
+                continue
+
+            copied_length = _merge_connector_path(
+                G,
+                result,
+                connector_index,
+            )
+            stats["connectors_added"] += 1
+            stats["connector_path_meters"] += float(copied_length)
+            connected_this_round = True
+            break
+
+        if not connected_this_round:
+            break
+
+    stats["components_after"] = nx.number_connected_components(
+        G.to_undirected(as_view=True)
+    )
+    stats["connector_path_meters"] = round(
+        stats["connector_path_meters"],
+        1,
+    )
+    G.graph["selective_connector_stats"] = stats
+    return G, stats
+
+
+
+def add_reachable_dem_edge_elevations(G, start_lat, start_lon):
+    """
+    Annotate only the trail/connector component that can actually be reached
+    from the requested start. Disconnected gray-map trail systems remain in G
+    for display, but they do not consume DEM sampling time until a connector
+    makes them routeable.
+    """
+    trail_graph = trail_only_graph(G)
+    if not trail_graph.number_of_edges():
+        raise HTTPException(
+            status_code=400,
+            detail="No natural trails were found near this start coordinate.",
+        )
+
+    start_node = int(
+        ox.distance.nearest_nodes(
+            trail_graph,
+            X=float(start_lon),
+            Y=float(start_lat),
+        )
+    )
+    reachable = set(
+        nx.node_connected_component(
+            G.to_undirected(as_view=True),
+            start_node,
+        )
+    )
+
+    routeable = G.subgraph(reachable).copy()
+    routeable, unique_samples = add_local_dem_edge_elevations(routeable)
+
+    H = G.copy()
+
+    # Give non-routeable display-only edges harmless defaults. If a later graph
+    # version connects them, that new local graph is rebuilt and annotated.
+    for u, v, key, data in H.edges(keys=True, data=True):
+        data["ascent_m"] = float(data.get("ascent_m", 0) or 0)
+        data["descent_m"] = float(data.get("descent_m", 0) or 0)
+        data["elevation_sample_count"] = int(
+            float(data.get("elevation_sample_count", 0) or 0)
+        )
+
+    for u, v, key, data in routeable.edges(keys=True, data=True):
+        if H.has_edge(u, v, key):
+            H[u][v][key]["ascent_m"] = float(data.get("ascent_m", 0) or 0)
+            H[u][v][key]["descent_m"] = float(data.get("descent_m", 0) or 0)
+            H[u][v][key]["elevation_sample_count"] = int(
+                float(data.get("elevation_sample_count", 0) or 0)
+            )
+            H[u][v][key]["routing_cost"] = float(edge_routing_cost(H[u][v][key]))
+
+    H.graph["routeable_component_nodes"] = len(reachable)
+    H.graph["routeable_component_edges"] = routeable.number_of_edges()
+    return H, unique_samples
 
 def download_trail_graph(lat, lon, radius_meters):
     """
-    v8 compatibility wrapper.
+    V9 compatibility wrapper.
 
-    Unlike v6, this never downloads OSM around each individual start. It loads
-    one TIFF-wide hybrid network once, then extracts/caches a local graph.
-    Natural trails get cheap per-edge DEM ascent; winning routes still receive
-    the full continuous-route DEM calculation.
+    The master graph is trail-only. Long route requests may add only a handful
+    of reduced connector paths; the full urban street graph is never retained.
     """
     cache_key = (
         round(float(lat), 5),
@@ -1232,7 +1968,7 @@ def download_trail_graph(lat, lon, radius_meters):
         int(radius_meters),
         ELEVATION_SAMPLE_SPACING_M,
         os.path.basename(DEM_PATH),
-        "hybrid-v8",
+        "selective-v9",
     )
 
     if cache_key in GRAPH_CACHE:
@@ -1253,7 +1989,22 @@ def download_trail_graph(lat, lon, radius_meters):
         radius_meters,
     )
 
-    G, unique_elevation_samples = add_local_dem_edge_elevations(G)
+    G, connector_stats = add_selective_connectors(
+        G,
+        lat,
+        lon,
+        radius_meters,
+    )
+
+    # Only the component actually routeable from the requested start receives
+    # DEM edge annotations. Other disconnected trails stay visible in gray but
+    # do not create a giant 5 m elevation-sampling workload.
+    G, unique_elevation_samples = add_reachable_dem_edge_elevations(
+        G,
+        lat,
+        lon,
+    )
+    G.graph["selective_connector_stats"] = connector_stats
 
     if len(GRAPH_CACHE) >= MAX_CACHED_GRAPHS:
         oldest = next(iter(GRAPH_CACHE))
@@ -1271,7 +2022,6 @@ def download_trail_graph(lat, lon, radius_meters):
         False,
         unique_elevation_samples,
     )
-
 
 # ============================================================
 # SIMPLE ROUTING GRAPH
@@ -2204,11 +2954,23 @@ def generate_waypoint_loop(
     )
 
     # Waypoint anchors are chosen on natural trails, never on connector streets.
+    # The gray overlay may contain disconnected trail systems. Only components
+    # actually reachable from this start (including v9 selective connectors)
+    # are eligible as route anchors.
+    reachable_nodes = set(
+        nx.node_connected_component(
+            S.to_undirected(as_view=True),
+            start_node,
+        )
+    )
+
     trail_nodes = set()
     for u, v, data in G.edges(data=True):
         if str(data.get("route_class", "trail")) == "trail":
-            trail_nodes.add(u)
-            trail_nodes.add(v)
+            if u in reachable_nodes:
+                trail_nodes.add(u)
+            if v in reachable_nodes:
+                trail_nodes.add(v)
 
     for node in trail_nodes:
         if node == start_node or node not in S:
@@ -3303,6 +4065,7 @@ def trail_network(request: TrailNetworkRequest):
 
         segments = graph_debug_segments(G)
         local_trail_edges, local_connector_edges = graph_route_class_counts(G)
+        connector_stats = G.graph.get("selective_connector_stats", {}) or {}
         _, master_info = get_master_trail_graph()
 
         return {
@@ -3317,6 +4080,14 @@ def trail_network(request: TrailNetworkRequest):
             "master_connector_segments": master_info.get("connector_physical_segments", 0),
             "local_trail_directed_edges": local_trail_edges,
             "local_connector_directed_edges": local_connector_edges,
+            "selective_connectors_attempted": bool(connector_stats.get("attempted", False)),
+            "selective_connectors_added": int(connector_stats.get("connectors_added", 0) or 0),
+            "selective_connector_queries": int(connector_stats.get("connector_queries", 0) or 0),
+            "selective_connector_path_meters": float(connector_stats.get("connector_path_meters", 0.0) or 0.0),
+            "trail_components_before": int(connector_stats.get("components_before", 0) or 0),
+            "trail_components_after": int(connector_stats.get("components_after", 0) or 0),
+            "routeable_component_nodes": int(float(G.graph.get("routeable_component_nodes", 0) or 0)),
+            "routeable_component_edges": int(float(G.graph.get("routeable_component_edges", 0) or 0)),
             "master_loaded_from_disk": master_info["loaded_from_disk"],
             "master_tiff": os.path.basename(DEM_PATH),
             "search_radius_m": profile["search_radius_m"],
@@ -3798,7 +4569,7 @@ button:disabled {
 <div id="controls">
 
 <h2>Trail Running Creator</h2>
-<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-v8-full-tiff-hybrid-connectors</div>
+<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-v9-selective-connectors</div>
 
 <div class="input-row">
     <div class="input-group">
@@ -4033,6 +4804,10 @@ async function readJsonResponse(response) {
 async function loadTrailNetwork(data) {
     const diagnostics = document.getElementById("diagnostics");
 
+    // Clear the previous gray network immediately so a failed request can never
+    // leave stale trail lines on the map and make them look like fresh data.
+    networkLayer.clearLayers();
+
     const response = await fetch(
         "/trail-network",
         {
@@ -4049,8 +4824,6 @@ async function loadTrailNetwork(data) {
     );
 
     const result = await readJsonResponse(response);
-
-    networkLayer.clearLayers();
 
     for (const segment of result.allowed_trails) {
         L.polyline(
@@ -4148,6 +4921,17 @@ async function loadTrailNetwork(data) {
         "<b>Graph edges:</b> " +
         result.network_edges +
         "<br>" +
+        "<b>Trail components:</b> " +
+        result.trail_components_before +
+        " → " +
+        result.trail_components_after +
+        "<br>" +
+        "<b>Selective connectors:</b> " +
+        result.selective_connectors_added +
+        " added (" + result.selective_connector_queries + " corridor queries)<br>" +
+        "<b>Routeable component:</b> " +
+        result.routeable_component_nodes +
+        " nodes / " + result.routeable_component_edges + " edges<br>" +
         "<b>Start snap distance:</b> " +
         result.snap_distance_m +
         " m<br>" +
