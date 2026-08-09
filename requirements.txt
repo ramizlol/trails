@@ -3,3 +3,4 @@ uvicorn[standard]
 osmnx
 networkx
 scikit-learn
+requests
