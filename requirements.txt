@@ -3,4 +3,5 @@ uvicorn[standard]
 osmnx
 networkx
 scikit-learn
-requests
+rasterio>=1.5.0
+numpy
