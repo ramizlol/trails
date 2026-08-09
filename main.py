@@ -13,6 +13,7 @@ import numpy as np
 import osmnx as ox
 import rasterio
 from pyproj import Transformer
+from shapely.geometry import LineString
 from rasterio.warp import transform as rio_transform
 
 
@@ -29,8 +30,8 @@ DEM_PATH = os.path.join(BASE_DIR, "output_USGS30m.tif")
 METERS_PER_MILE = 1609.344
 FEET_PER_METER = 3.28084
 
-DEFAULT_LAT = 33.589281
-DEFAULT_LON = -112.091148
+DEFAULT_LAT = 33.586055
+DEFAULT_LON = -112.083341
 
 # Sample along trail/GPX geometry every 5 m.
 # The source DEM is still ~30 m resolution.
@@ -42,7 +43,7 @@ GPX_TRAIL_MATCH_TOLERANCE_M = 25.0
 MAX_CACHED_GRAPHS = 5
 GRAPH_CACHE = {}
 
-APP_VERSION = "2026-08-09-gpx-ground-truth-v3"
+APP_VERSION = "2026-08-09-exact-gpx-start-v4"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
 
@@ -343,6 +344,309 @@ def route_coordinates(G, route_nodes):
             coordinates.append(point)
 
     return coordinates
+
+
+# ============================================================
+# EXACT START-POINT INSERTION
+# ============================================================
+
+EXACT_POINT_MAX_TRAIL_OFFSET_M = 3.0
+
+
+def _local_xy_m(lon, lat, ref_lon, ref_lat):
+    """Approximate lon/lat as local meters around a reference point."""
+    radius = 6371000.0
+    x = math.radians(float(lon) - float(ref_lon)) * radius * math.cos(math.radians(float(ref_lat)))
+    y = math.radians(float(lat) - float(ref_lat)) * radius
+    return x, y
+
+
+def nearest_position_on_polyline(coords, target_lon, target_lat):
+    """Return nearest segment/t/fraction and distance from a point to a lon/lat polyline."""
+    if len(coords) < 2:
+        return None
+
+    best = None
+    cumulative_m = 0.0
+
+    for index in range(len(coords) - 1):
+        lon1, lat1 = coords[index]
+        lon2, lat2 = coords[index + 1]
+
+        ax, ay = _local_xy_m(lon1, lat1, target_lon, target_lat)
+        bx, by = _local_xy_m(lon2, lat2, target_lon, target_lat)
+
+        dx = bx - ax
+        dy = by - ay
+        denom = dx * dx + dy * dy
+
+        if denom <= 1e-12:
+            t = 0.0
+        else:
+            # Target point is local origin (0, 0).
+            t = -(ax * dx + ay * dy) / denom
+            t = max(0.0, min(1.0, t))
+
+        px = ax + t * dx
+        py = ay + t * dy
+        distance_m = math.hypot(px, py)
+
+        segment_m = haversine_meters(lat1, lon1, lat2, lon2)
+        along_m = cumulative_m + segment_m * t
+
+        if best is None or distance_m < best["distance_m"]:
+            projected_lon = float(lon1) + (float(lon2) - float(lon1)) * t
+            projected_lat = float(lat1) + (float(lat2) - float(lat1)) * t
+            best = {
+                "segment_index": index,
+                "t": float(t),
+                "distance_m": float(distance_m),
+                "along_m": float(along_m),
+                "projected_lon": float(projected_lon),
+                "projected_lat": float(projected_lat),
+            }
+
+        cumulative_m += segment_m
+
+    if best is not None:
+        best["total_m"] = float(cumulative_m)
+
+    return best
+
+
+def split_polyline_at_position(coords, segment_index, t, split_lon, split_lat):
+    """Split a directed lon/lat polyline at a location inside one segment."""
+    split_point = (float(split_lon), float(split_lat))
+    left = list(coords[: segment_index + 1])
+    right = list(coords[segment_index + 1 :])
+
+    if not left:
+        left = [split_point]
+    if not right:
+        right = [split_point]
+
+    if not left or haversine_meters(left[-1][1], left[-1][0], split_point[1], split_point[0]) > 0.05:
+        left.append(split_point)
+    else:
+        left[-1] = split_point
+
+    if not right or haversine_meters(split_point[1], split_point[0], right[0][1], right[0][0]) > 0.05:
+        right.insert(0, split_point)
+    else:
+        right[0] = split_point
+
+    return left, right
+
+
+def edge_attributes_for_split_part(original_data, coords):
+    """Copy edge tags and recompute geometry/length/elevation for one split piece."""
+    attrs = dict(original_data)
+    attrs["geometry"] = LineString(coords)
+    attrs["length"] = float(polyline_distance_meters(coords))
+
+    samples = densify_polyline(coords, ELEVATION_SAMPLE_SPACING_M)
+    if len(samples) < 2:
+        samples = list(coords)
+
+    elevations = elevations_for_coords(samples)
+    smoothed = smooth_elevations(
+        elevations,
+        radius=ELEVATION_SMOOTHING_RADIUS,
+    )
+    ascent_m, descent_m = calculate_ascent_descent(smoothed)
+
+    attrs["ascent_m"] = float(ascent_m)
+    attrs["descent_m"] = float(descent_m)
+    attrs["elevation_sample_count"] = len(samples)
+    attrs["virtual_split_edge"] = True
+    return attrs
+
+
+def insert_exact_routing_point(G, lat, lon):
+    """
+    Insert a temporary graph node at the requested coordinate when it lies on
+    an allowed trail edge (within EXACT_POINT_MAX_TRAIL_OFFSET_M).
+
+    The selected physical edge is split in both travel directions. This means
+    loop search starts and finishes at the requested coordinate instead of
+    snapping to an OSM junction tens of meters away.
+
+    The cached graph is never mutated: this function returns a copy.
+    """
+    lat = float(lat)
+    lon = float(lon)
+
+    projected = ox.projection.project_graph(G)
+    projected_crs = projected.graph.get("crs")
+    if projected_crs is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not determine projected graph CRS for exact start insertion.",
+        )
+
+    transformer = Transformer.from_crs(
+        "EPSG:4326",
+        projected_crs,
+        always_xy=True,
+    )
+    x, y = transformer.transform(lon, lat)
+
+    try:
+        edge_id, edge_distance_m = ox.distance.nearest_edges(
+            projected,
+            X=float(x),
+            Y=float(y),
+            return_dist=True,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not find nearest trail edge for exact start: {exc}",
+        )
+
+    values = list(edge_id) if not isinstance(edge_id, tuple) else list(edge_id)
+    if len(values) < 3:
+        raise HTTPException(
+            status_code=500,
+            detail="Nearest trail edge returned an invalid edge identifier.",
+        )
+
+    u, v, key = values[:3]
+    edge_distance_m = float(np.atleast_1d(edge_distance_m)[0])
+
+    # If the requested point is not actually on/very near a trail, keep the
+    # former nearest-node behavior rather than inventing an off-trail connector.
+    if edge_distance_m > EXACT_POINT_MAX_TRAIL_OFFSET_M:
+        fallback = int(ox.distance.nearest_nodes(G, X=lon, Y=lat))
+        fallback_lat = float(G.nodes[fallback]["y"])
+        fallback_lon = float(G.nodes[fallback]["x"])
+        return G, fallback, {
+            "exact_inserted": False,
+            "trail_offset_m": round(edge_distance_m, 2),
+            "routing_lat": fallback_lat,
+            "routing_lon": fallback_lon,
+            "routing_offset_m": round(
+                haversine_meters(lat, lon, fallback_lat, fallback_lon),
+                2,
+            ),
+            "source_edge": [int(u), int(v), str(key)],
+        }
+
+    selected_data = G.get_edge_data(u, v, key)
+    if selected_data is None:
+        selected_data = get_shortest_edge(G, u, v)
+    if selected_data is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not read the nearest trail edge for exact start insertion.",
+        )
+
+    selected_coords = oriented_edge_coords(G, u, v, selected_data)
+    nearest = nearest_position_on_polyline(selected_coords, lon, lat)
+    if nearest is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not locate the requested start along the nearest trail geometry.",
+        )
+
+    # Use the requested coordinate itself as the temporary routing node. The GPX
+    # start is essentially on the edge, so this preserves the exact GPX start.
+    split_lon = lon
+    split_lat = lat
+
+    H = G.copy()
+
+    virtual_node = -1
+    while virtual_node in H:
+        virtual_node -= 1
+
+    elevation = elevations_for_coords([(split_lon, split_lat)])[0]
+    H.add_node(
+        virtual_node,
+        x=float(split_lon),
+        y=float(split_lat),
+        elevation=float(elevation),
+        virtual_exact_point=True,
+    )
+
+    # Split every directed copy of this same physical u-v trail segment that
+    # passes through the requested point. Normally this is u->v and v->u.
+    split_count = 0
+    original_pair = {int(u), int(v)}
+    candidates = []
+
+    for a, b in [(u, v), (v, u)]:
+        edge_dict = G.get_edge_data(a, b) or {}
+        for candidate_key, data in edge_dict.items():
+            coords = oriented_edge_coords(G, a, b, data)
+            position = nearest_position_on_polyline(coords, lon, lat)
+            if position is None:
+                continue
+            if position["distance_m"] <= max(EXACT_POINT_MAX_TRAIL_OFFSET_M, edge_distance_m + 0.5):
+                candidates.append((a, b, candidate_key, data, coords, position))
+
+    # At minimum, make sure the exact edge returned by nearest_edges is split.
+    if not candidates:
+        candidates.append((u, v, key, selected_data, selected_coords, nearest))
+
+    for a, b, candidate_key, data, coords, position in candidates:
+        if H.has_edge(a, b, candidate_key):
+            H.remove_edge(a, b, candidate_key)
+
+        left, right = split_polyline_at_position(
+            coords,
+            position["segment_index"],
+            position["t"],
+            split_lon,
+            split_lat,
+        )
+
+        left_length = polyline_distance_meters(left)
+        right_length = polyline_distance_meters(right)
+
+        # Ignore pathological near-zero pieces. This should not happen for the
+        # GPX start used here, which is well inside the OSM edge.
+        if left_length > 0.25:
+            H.add_edge(
+                a,
+                virtual_node,
+                key=candidate_key,
+                **edge_attributes_for_split_part(data, left),
+            )
+            split_count += 1
+
+        if right_length > 0.25:
+            H.add_edge(
+                virtual_node,
+                b,
+                key=candidate_key,
+                **edge_attributes_for_split_part(data, right),
+            )
+            split_count += 1
+
+    if H.degree(virtual_node) == 0:
+        H.remove_node(virtual_node)
+        fallback = int(ox.distance.nearest_nodes(G, X=lon, Y=lat))
+        fallback_lat = float(G.nodes[fallback]["y"])
+        fallback_lon = float(G.nodes[fallback]["x"])
+        return G, fallback, {
+            "exact_inserted": False,
+            "trail_offset_m": round(edge_distance_m, 2),
+            "routing_lat": fallback_lat,
+            "routing_lon": fallback_lon,
+            "routing_offset_m": round(haversine_meters(lat, lon, fallback_lat, fallback_lon), 2),
+            "source_edge": [int(u), int(v), str(key)],
+        }
+
+    return H, virtual_node, {
+        "exact_inserted": True,
+        "trail_offset_m": round(edge_distance_m, 2),
+        "routing_lat": float(split_lat),
+        "routing_lon": float(split_lon),
+        "routing_offset_m": 0.0,
+        "source_edge": [int(u), int(v), str(key)],
+        "split_directed_pieces": split_count,
+    }
 
 
 # ============================================================
@@ -2129,8 +2433,8 @@ def approximate_node_trace_from_edge_runs(G, edge_runs, requested_start_lon, req
     )
     if start_snap_distance_m > 20.0:
         note += (
-            " The GPX starts noticeably between graph nodes, so exact beam replay "
-            "would require splitting that OSM edge at the GPX start."
+            " The GPX starts noticeably between original OSM graph nodes. "
+            "v4 inserts a temporary routing node exactly at the requested GPX start for generation."
         )
 
     return {
@@ -2320,19 +2624,25 @@ async def test_gpx_against_generator(file: UploadFile = File(...)):
             start_lat,
         )
 
-        start_node = ox.distance.nearest_nodes(
+        replay_start_node = ox.distance.nearest_nodes(
             G,
             X=start_lon,
             Y=start_lat,
         )
-        start_node = int(start_node)
+        replay_start_node = int(replay_start_node)
 
         replay = replay_trace_hard_rules(
             G,
             node_trace["nodes"],
-            start_node,
+            replay_start_node,
             distance_m,
             limits,
+        )
+
+        generator_G, generator_start_node, generator_start_info = insert_exact_routing_point(
+            G,
+            start_lat,
+            start_lon,
         )
 
         generator = {
@@ -2344,15 +2654,15 @@ async def test_gpx_against_generator(file: UploadFile = File(...)):
         if target_distance_miles < 4.0:
             try:
                 route_nodes, metrics, search_steps, states_expanded = beam_search_short_loop(
-                    G,
-                    start_node,
+                    generator_G,
+                    generator_start_node,
                     distance_m,
                     ascent_m,
                     limits,
                     profile,
                 )
 
-                route_coords = metrics.get("route_coordinates") or route_coordinates(G, route_nodes)
+                route_coords = metrics.get("route_coordinates") or route_coordinates(generator_G, route_nodes)
                 generator = {
                     "success": True,
                     "error": None,
@@ -2387,10 +2697,14 @@ async def test_gpx_against_generator(file: UploadFile = File(...)):
                 ],
             },
             "graph": {
-                "start_node": start_node,
-                "start_snap_distance_m": node_trace["start_snap_distance_m"],
-                "nodes": G.number_of_nodes(),
-                "edges": G.number_of_edges(),
+                "start_node": generator_start_node,
+                "start_snap_distance_m": float(generator_start_info["routing_offset_m"]),
+                "exact_start_inserted": bool(generator_start_info["exact_inserted"]),
+                "start_trail_offset_m": float(generator_start_info["trail_offset_m"]),
+                "original_nearest_node": replay_start_node,
+                "original_node_snap_distance_m": node_trace["start_snap_distance_m"],
+                "nodes": generator_G.number_of_nodes(),
+                "edges": generator_G.number_of_edges(),
                 "search_radius_m": profile["search_radius_m"],
                 "filtered_edges_removed": filtered_edges_removed,
                 "from_cache": graph_from_cache,
@@ -2622,21 +2936,15 @@ def trail_network(request: TrailNetworkRequest):
             profile["search_radius_m"],
         )
 
-        start_node = ox.distance.nearest_nodes(
+        G, start_node, start_info = insert_exact_routing_point(
             G,
-            X=request.start_lon,
-            Y=request.start_lat,
+            request.start_lat,
+            request.start_lon,
         )
 
         snapped_lat = float(G.nodes[start_node]["y"])
         snapped_lon = float(G.nodes[start_node]["x"])
-
-        snap_distance = haversine_meters(
-            request.start_lat,
-            request.start_lon,
-            snapped_lat,
-            snapped_lon,
-        )
+        snap_distance = float(start_info["routing_offset_m"])
 
         segments = graph_debug_segments(G)
 
@@ -2657,6 +2965,9 @@ def trail_network(request: TrailNetworkRequest):
                 "lon": snapped_lon,
             },
             "snap_distance_m": round(snap_distance, 1),
+            "exact_start_inserted": bool(start_info["exact_inserted"]),
+            "start_trail_offset_m": float(start_info["trail_offset_m"]),
+            "start_source_edge": start_info.get("source_edge"),
             "filtered_edges_removed": filtered_edges_removed,
             "graph_from_cache": graph_from_cache,
             "elevation_samples": unique_elevation_samples,
@@ -2752,32 +3063,29 @@ def generate_route(request: RouteRequest):
             profile["search_radius_m"],
         )
 
-        start_node = ox.distance.nearest_nodes(
-            G,
-            X=request.start_lon,
-            Y=request.start_lat,
-        )
-
-        end_node = ox.distance.nearest_nodes(
-            G,
-            X=request.end_lon,
-            Y=request.end_lat,
-        )
-
-        snapped_start_lat = float(G.nodes[start_node]["y"])
-        snapped_start_lon = float(G.nodes[start_node]["x"])
-
-        snap_distance_m = haversine_meters(
-            request.start_lat,
-            request.start_lon,
-            snapped_start_lat,
-            snapped_start_lon,
-        )
-
         same_point = (
             abs(request.start_lat - request.end_lat) < 0.0001
             and abs(request.start_lon - request.end_lon) < 0.0001
         )
+
+        G, start_node, start_info = insert_exact_routing_point(
+            G,
+            request.start_lat,
+            request.start_lon,
+        )
+
+        if same_point:
+            end_node = start_node
+        else:
+            end_node = ox.distance.nearest_nodes(
+                G,
+                X=request.end_lon,
+                Y=request.end_lat,
+            )
+
+        snapped_start_lat = float(G.nodes[start_node]["y"])
+        snapped_start_lon = float(G.nodes[start_node]["x"])
+        snap_distance_m = float(start_info["routing_offset_m"])
 
         if same_point:
             if request.target_distance_miles < 4.0:
@@ -2917,6 +3225,9 @@ def generate_route(request: RouteRequest):
             "snapped_start_lat": snapped_start_lat,
             "snapped_start_lon": snapped_start_lon,
             "snap_distance_m": round(snap_distance_m, 1),
+            "exact_start_inserted": bool(start_info["exact_inserted"]),
+            "start_trail_offset_m": float(start_info["trail_offset_m"]),
+            "start_source_edge": start_info.get("source_edge"),
             "status": "Route generated",
         }
 
@@ -3078,27 +3389,27 @@ button:disabled {
 <div id="controls">
 
 <h2>Trail Running Creator</h2>
-<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-gpx-ground-truth-v3</div>
+<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-exact-gpx-start-v4</div>
 
 <div class="input-row">
     <div class="input-group">
         <label for="start_lat">Start latitude</label>
-        <input id="start_lat" type="number" step="any" value="33.589281">
+        <input id="start_lat" type="number" step="any" value="33.586055">
     </div>
 
     <div class="input-group">
         <label for="start_lon">Start longitude</label>
-        <input id="start_lon" type="number" step="any" value="-112.091148">
+        <input id="start_lon" type="number" step="any" value="-112.083341">
     </div>
 
     <div class="input-group">
         <label for="end_lat">End latitude</label>
-        <input id="end_lat" type="number" step="any" value="33.589281">
+        <input id="end_lat" type="number" step="any" value="33.586055">
     </div>
 
     <div class="input-group">
         <label for="end_lon">End longitude</label>
-        <input id="end_lon" type="number" step="any" value="-112.091148">
+        <input id="end_lon" type="number" step="any" value="-112.083341">
     </div>
 </div>
 
@@ -3154,7 +3465,7 @@ button:disabled {
 
 <script>
 const map = L.map("map").setView(
-    [33.589281, -112.091148],
+    [33.586055, -112.083341],
     15
 );
 
@@ -3352,6 +3663,12 @@ async function loadTrailNetwork(data) {
         "<b>Start snap distance:</b> " +
         result.snap_distance_m +
         " m<br>" +
+        "<b>Exact start inserted:</b> " +
+        (result.exact_start_inserted ? "YES" : "NO") +
+        "<br>" +
+        "<b>Requested point → trail:</b> " +
+        result.start_trail_offset_m +
+        " m<br>" +
         "<b>Search radius:</b> " +
         result.search_radius_m +
         " m<br>" +
@@ -3460,7 +3777,9 @@ async function generateRoute() {
             "<b>Route profile:</b> " + result.route_profile + "<br>" +
             "<b>Search depth:</b> " + result.search_steps + "<br>" +
             "<b>States expanded:</b> " + expandedText + "<br>" +
-            "<b>Start snap distance:</b> " + result.snap_distance_m + " m<br><br>" +
+            "<b>Start snap distance:</b> " + result.snap_distance_m + " m<br>" +
+            "<b>Exact start inserted:</b> " + (result.exact_start_inserted ? "YES" : "NO") + "<br>" +
+            "<b>Requested point → trail:</b> " + result.start_trail_offset_m + " m<br><br>" +
             "<b>Repeated trail distance:</b> " + result.repeated_distance_miles + " mi<br>" +
             "<b>Repeated edges:</b> " + result.repeated_edges + "<br>" +
             "<b>Repeated junctions:</b> " + result.repeated_nodes + "<br>" +
@@ -3669,7 +3988,9 @@ async function testGpxAgainstGenerator() {
             '<b>Benchmark distance:</b> ' + benchmark.distance_miles + ' mi<br>' +
             '<b>Benchmark DEM gain:</b> ' + benchmark.gain_ft + ' ft<br>' +
             '<b>Benchmark descent:</b> ' + benchmark.descent_ft + ' ft<br>' +
-            '<b>Graph-start snap:</b> ' + result.graph.start_snap_distance_m + ' m<br><br>' +
+            '<b>Graph-start snap:</b> ' + result.graph.start_snap_distance_m + ' m<br>' +
+            '<b>Exact GPX start inserted:</b> ' + (result.graph.exact_start_inserted ? 'YES' : 'NO') + '<br>' +
+            '<b>GPX start → trail:</b> ' + result.graph.start_trail_offset_m + ' m<br><br>' +
             '<b>Allowed-trail coverage:</b> ' + result.coverage.percent + '%<br>' +
             '<b>Mean trail match distance:</b> ' + result.coverage.mean_distance_m + ' m<br>' +
             '<b>Max trail match distance:</b> ' + result.coverage.max_distance_m + ' m<br><br>' +
