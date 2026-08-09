@@ -42,7 +42,7 @@ GPX_TRAIL_MATCH_TOLERANCE_M = 25.0
 MAX_CACHED_GRAPHS = 5
 GRAPH_CACHE = {}
 
-APP_VERSION = "2026-08-09-partial-edge-v7-v2"
+APP_VERSION = "2026-08-09-gpx-ground-truth-v3"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
 
@@ -1936,6 +1936,497 @@ def analyze_gpx_trail_coverage(G, coords):
     }
 
 
+
+# ============================================================
+# GPX GROUND-TRUTH / GRAPH TRACE DIAGNOSTICS
+# ============================================================
+
+def match_gpx_to_graph_edge_runs(G, coords):
+    """
+    Map dense GPX samples to the nearest allowed graph edges.
+
+    Consecutive samples on the same physical trail segment are collapsed into
+    one run. Reverse directed copies of the same OSM segment are treated as the
+    same physical edge so bidirectional OSM edges do not create false changes.
+    """
+    if not coords:
+        return {
+            "runs": [],
+            "sample_count": 0,
+            "mean_distance_m": None,
+            "max_distance_m": None,
+            "continuous_transitions": 0,
+            "transition_count": 0,
+            "transition_continuity_percent": 0.0,
+        }
+
+    projected = ox.projection.project_graph(G)
+    projected_crs = projected.graph.get("crs")
+    if projected_crs is None:
+        raise HTTPException(
+            status_code=500,
+            detail="Could not determine projected graph CRS for GPX trace matching.",
+        )
+
+    transformer = Transformer.from_crs(
+        "EPSG:4326",
+        projected_crs,
+        always_xy=True,
+    )
+
+    lons = [float(point[0]) for point in coords]
+    lats = [float(point[1]) for point in coords]
+    xs, ys = transformer.transform(lons, lats)
+
+    try:
+        edge_ids, distances = ox.distance.nearest_edges(
+            projected,
+            X=list(xs),
+            Y=list(ys),
+            return_dist=True,
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not map GPX samples to graph edges: {exc}",
+        )
+
+    edge_ids = list(np.atleast_1d(edge_ids))
+    distances = [float(value) for value in np.atleast_1d(distances)]
+
+    runs = []
+    for sample_index, edge_id in enumerate(edge_ids):
+        try:
+            u, v, key = edge_id
+        except Exception:
+            # Some versions can return a list-like object rather than tuple.
+            values = list(edge_id)
+            if len(values) < 3:
+                continue
+            u, v, key = values[:3]
+
+        physical = undirected_edge_key(u, v)
+        distance_m = distances[sample_index] if sample_index < len(distances) else None
+
+        if runs and runs[-1]["physical_edge"] == physical:
+            runs[-1]["sample_end"] = sample_index
+            runs[-1]["samples"] += 1
+            if distance_m is not None:
+                runs[-1]["max_match_distance_m"] = max(
+                    runs[-1]["max_match_distance_m"],
+                    distance_m,
+                )
+            continue
+
+        runs.append({
+            "u": int(u),
+            "v": int(v),
+            "key": int(key) if isinstance(key, (int, np.integer)) else str(key),
+            "physical_edge": physical,
+            "sample_start": sample_index,
+            "sample_end": sample_index,
+            "samples": 1,
+            "max_match_distance_m": float(distance_m or 0.0),
+        })
+
+    transition_count = max(0, len(runs) - 1)
+    continuous_transitions = 0
+    for left, right in zip(runs, runs[1:]):
+        if set(left["physical_edge"]).intersection(right["physical_edge"]):
+            continuous_transitions += 1
+
+    continuity = (
+        100.0 * continuous_transitions / transition_count
+        if transition_count > 0
+        else 100.0
+    )
+
+    return {
+        "runs": runs,
+        "sample_count": len(edge_ids),
+        "mean_distance_m": round(float(np.mean(distances)), 2) if distances else None,
+        "max_distance_m": round(float(np.max(distances)), 2) if distances else None,
+        "continuous_transitions": continuous_transitions,
+        "transition_count": transition_count,
+        "transition_continuity_percent": round(continuity, 1),
+    }
+
+
+def approximate_node_trace_from_edge_runs(G, edge_runs, requested_start_lon, requested_start_lat):
+    """
+    Convert physical edge runs to an approximate graph-node trace.
+
+    This is exact at graph junctions, but a GPX may begin/end in the middle of
+    an OSM edge. In that case we report that the trace is only approximate and
+    use the nearest graph endpoint for replay diagnostics.
+    """
+    if not edge_runs:
+        return {
+            "nodes": [],
+            "start_node": None,
+            "start_snap_distance_m": None,
+            "continuous": False,
+            "closed": False,
+            "note": "No matched edge runs were available.",
+        }
+
+    start_node = ox.distance.nearest_nodes(
+        G,
+        X=float(requested_start_lon),
+        Y=float(requested_start_lat),
+    )
+    start_node = int(start_node)
+
+    start_snap_distance_m = haversine_meters(
+        float(requested_start_lat),
+        float(requested_start_lon),
+        float(G.nodes[start_node]["y"]),
+        float(G.nodes[start_node]["x"]),
+    )
+
+    physical_edges = [tuple(run["physical_edge"]) for run in edge_runs]
+
+    # Shared junctions between consecutive physical edge runs.
+    shared_nodes = []
+    continuous = True
+    for left, right in zip(physical_edges, physical_edges[1:]):
+        shared = set(left).intersection(right)
+        if len(shared) != 1:
+            continuous = False
+            shared_nodes.append(None)
+        else:
+            shared_nodes.append(int(next(iter(shared))))
+
+    nodes = []
+    if len(physical_edges) == 1:
+        a, b = physical_edges[0]
+        nodes = [start_node, b if start_node == a else a]
+    elif continuous:
+        first_a, first_b = physical_edges[0]
+        first_shared = shared_nodes[0]
+        first_node = first_b if first_a == first_shared else first_a
+
+        last_a, last_b = physical_edges[-1]
+        last_shared = shared_nodes[-1]
+        last_node = last_b if last_a == last_shared else last_a
+
+        nodes = [int(first_node)] + [int(n) for n in shared_nodes] + [int(last_node)]
+
+        # If the nearest GPX-start graph node occurs in the trace and this is a
+        # graph-closed trace, rotate the closed cycle to that node.
+        if len(nodes) >= 2 and nodes[0] == nodes[-1] and start_node in nodes[:-1]:
+            index = nodes[:-1].index(start_node)
+            cycle = nodes[:-1]
+            cycle = cycle[index:] + cycle[:index]
+            nodes = cycle + [start_node]
+
+    closed = bool(len(nodes) >= 2 and nodes[0] == nodes[-1])
+
+    note = (
+        "Edge transitions are graph-continuous."
+        if continuous
+        else "Some consecutive nearest-edge runs do not share a graph node; the trace contains map-matching ambiguity."
+    )
+    if start_snap_distance_m > 20.0:
+        note += (
+            " The GPX starts noticeably between graph nodes, so exact beam replay "
+            "would require splitting that OSM edge at the GPX start."
+        )
+
+    return {
+        "nodes": nodes,
+        "start_node": start_node,
+        "start_snap_distance_m": round(start_snap_distance_m, 1),
+        "continuous": continuous,
+        "closed": closed,
+        "note": note,
+    }
+
+
+def replay_trace_hard_rules(
+    G,
+    node_trace,
+    start_node,
+    target_distance_meters,
+    limits,
+):
+    """
+    Replay the current hard beam rules against an approximate node trace.
+
+    Elevation is intentionally NOT a hard prune in v3. This checks graph
+    continuity, distance overshoot, and shortest-return distance lower bound.
+    """
+    if not node_trace or len(node_trace) < 2:
+        return {
+            "status": "not_replayable",
+            "first_failure": None,
+            "steps_checked": 0,
+            "message": "No usable graph-node trace could be reconstructed from the GPX.",
+        }
+
+    if int(node_trace[0]) != int(start_node):
+        return {
+            "status": "not_replayable",
+            "first_failure": "gpx_start_is_between_graph_nodes_or_trace_starts_elsewhere",
+            "steps_checked": 0,
+            "message": (
+                "The approximate GPX graph trace does not begin at the snapped beam start node. "
+                "This usually means the GPX starts partway along an OSM segment."
+            ),
+        }
+
+    S = make_simple_routing_graph(G)
+    reverse_S = S.reverse(copy=False)
+    return_distance = nx.single_source_dijkstra_path_length(
+        reverse_S,
+        start_node,
+        weight="length",
+    )
+
+    max_acceptable_distance = target_distance_meters + (
+        limits["distance_error_limit_miles"] * METERS_PER_MILE
+    )
+
+    cumulative = 0.0
+    for step, (u, v) in enumerate(zip(node_trace, node_trace[1:]), start=1):
+        if not S.has_edge(u, v):
+            return {
+                "status": "hard_failure",
+                "first_failure": "missing_directed_edge",
+                "failure_step": step,
+                "steps_checked": step - 1,
+                "message": f"Trace step {step} has no directed graph edge {u} -> {v}.",
+            }
+
+        cumulative += float(S[u][v].get("length", 0) or 0)
+
+        if cumulative > max_acceptable_distance:
+            return {
+                "status": "hard_failure",
+                "first_failure": "distance_overshoot",
+                "failure_step": step,
+                "steps_checked": step,
+                "cumulative_distance_miles": round(cumulative / METERS_PER_MILE, 3),
+                "message": (
+                    f"At trace step {step}, cumulative graph distance exceeds the maximum allowed final distance."
+                ),
+            }
+
+        if v != start_node:
+            if v not in return_distance:
+                return {
+                    "status": "hard_failure",
+                    "first_failure": "no_return_path",
+                    "failure_step": step,
+                    "steps_checked": step,
+                    "message": f"At trace step {step}, the state has no path back to the start node.",
+                }
+
+            minimum_final = cumulative + float(return_distance[v])
+            if minimum_final > max_acceptable_distance:
+                return {
+                    "status": "hard_failure",
+                    "first_failure": "return_distance_bound",
+                    "failure_step": step,
+                    "steps_checked": step,
+                    "cumulative_distance_miles": round(cumulative / METERS_PER_MILE, 3),
+                    "minimum_possible_final_miles": round(minimum_final / METERS_PER_MILE, 3),
+                    "message": (
+                        f"At trace step {step}, current distance plus the shortest possible return exceeds the allowed distance."
+                    ),
+                }
+
+    return {
+        "status": "survives_hard_rules",
+        "first_failure": None,
+        "steps_checked": len(node_trace) - 1,
+        "graph_trace_distance_miles": round(cumulative / METERS_PER_MILE, 3),
+        "message": (
+            "The reconstructed GPX trace survives the current hard pruning rules. "
+            "If the generator still misses it, the likely cause is beam ranking, state deduplication, map-matching/start-edge splitting, or the search budget."
+        ),
+    }
+
+
+async def read_and_measure_gpx(file: UploadFile):
+    filename = file.filename or "route.gpx"
+    if not filename.lower().endswith(".gpx"):
+        raise HTTPException(status_code=400, detail="Please upload a .gpx file.")
+
+    gpx_bytes = await file.read()
+    if not gpx_bytes:
+        raise HTTPException(status_code=400, detail="Uploaded GPX file is empty.")
+
+    raw_coords = parse_gpx_points(gpx_bytes)
+    raw_distance_m = polyline_distance_meters(raw_coords)
+    dense_coords = densify_polyline(raw_coords, ELEVATION_SAMPLE_SPACING_M)
+    raw_dem = elevations_for_coords(dense_coords)
+    smoothed = smooth_elevations(raw_dem, radius=ELEVATION_SMOOTHING_RADIUS)
+    ascent_m, descent_m = calculate_ascent_descent(smoothed)
+
+    return {
+        "filename": filename,
+        "raw_coords": raw_coords,
+        "dense_coords": dense_coords,
+        "distance_m": raw_distance_m,
+        "ascent_m": ascent_m,
+        "descent_m": descent_m,
+    }
+
+
+@app.post("/test-gpx")
+async def test_gpx_against_generator(file: UploadFile = File(...)):
+    """
+    Ground-truth test:
+      1. use the GPX's own start,
+      2. use its measured distance and DEM gain as the generator target,
+      3. build the allowed graph around that GPX start,
+      4. map the GPX to graph edges,
+      5. replay hard search rules where possible,
+      6. run the actual generator against the same benchmark.
+    """
+    try:
+        measured = await read_and_measure_gpx(file)
+        raw_coords = measured["raw_coords"]
+        dense_coords = measured["dense_coords"]
+        distance_m = measured["distance_m"]
+        ascent_m = measured["ascent_m"]
+        descent_m = measured["descent_m"]
+
+        start_lon, start_lat = raw_coords[0]
+        target_distance_miles = distance_m / METERS_PER_MILE
+        target_gain_ft = ascent_m * FEET_PER_METER
+
+        profile = get_route_profile(target_distance_miles)
+        limits = get_route_quality_limits(target_distance_miles, target_gain_ft)
+
+        (
+            G,
+            filtered_edges_removed,
+            graph_from_cache,
+            unique_elevation_samples,
+        ) = download_trail_graph(
+            start_lat,
+            start_lon,
+            profile["search_radius_m"],
+        )
+
+        coverage = analyze_gpx_trail_coverage(G, dense_coords)
+        edge_match = match_gpx_to_graph_edge_runs(G, dense_coords)
+        node_trace = approximate_node_trace_from_edge_runs(
+            G,
+            edge_match["runs"],
+            start_lon,
+            start_lat,
+        )
+
+        start_node = ox.distance.nearest_nodes(
+            G,
+            X=start_lon,
+            Y=start_lat,
+        )
+        start_node = int(start_node)
+
+        replay = replay_trace_hard_rules(
+            G,
+            node_trace["nodes"],
+            start_node,
+            distance_m,
+            limits,
+        )
+
+        generator = {
+            "success": False,
+            "error": None,
+            "route": [],
+        }
+
+        if target_distance_miles < 4.0:
+            try:
+                route_nodes, metrics, search_steps, states_expanded = beam_search_short_loop(
+                    G,
+                    start_node,
+                    distance_m,
+                    ascent_m,
+                    limits,
+                    profile,
+                )
+
+                route_coords = metrics.get("route_coordinates") or route_coordinates(G, route_nodes)
+                generator = {
+                    "success": True,
+                    "error": None,
+                    "actual_distance_miles": round(metrics["total_distance_meters"] / METERS_PER_MILE, 3),
+                    "actual_gain_ft": round(metrics["actual_gain_meters"] * FEET_PER_METER),
+                    "actual_descent_ft": round(metrics.get("actual_descent_meters", 0.0) * FEET_PER_METER),
+                    "distance_error_miles": round(metrics["distance_error_meters"] / METERS_PER_MILE, 3),
+                    "gain_error_ft": round(metrics["gain_error_meters"] * FEET_PER_METER),
+                    "search_steps": search_steps,
+                    "states_expanded": states_expanded,
+                    "partial_edge_used": bool(metrics.get("partial_edge_used", False)),
+                    "route": route_coords,
+                }
+            except HTTPException as exc:
+                generator["error"] = str(exc.detail)
+        else:
+            generator["error"] = "Ground-truth generator test is currently implemented for routes under 4 miles."
+
+        return {
+            "version": APP_VERSION,
+            "filename": measured["filename"],
+            "benchmark": {
+                "start": {"lat": start_lat, "lon": start_lon},
+                "distance_miles": round(target_distance_miles, 3),
+                "gain_ft": round(target_gain_ft),
+                "descent_ft": round(descent_m * FEET_PER_METER),
+                "raw_gpx_points": len(raw_coords),
+                "dem_sample_points": len(dense_coords),
+                "route": [
+                    {"lat": float(lat), "lon": float(lon)}
+                    for lon, lat in raw_coords
+                ],
+            },
+            "graph": {
+                "start_node": start_node,
+                "start_snap_distance_m": node_trace["start_snap_distance_m"],
+                "nodes": G.number_of_nodes(),
+                "edges": G.number_of_edges(),
+                "search_radius_m": profile["search_radius_m"],
+                "filtered_edges_removed": filtered_edges_removed,
+                "from_cache": graph_from_cache,
+                "elevation_samples": unique_elevation_samples,
+            },
+            "coverage": {
+                "percent": coverage["coverage_percent"],
+                "mean_distance_m": coverage["mean_distance_to_trail_m"],
+                "max_distance_m": coverage["max_distance_to_trail_m"],
+                "within_tolerance": coverage["points_within_tolerance"],
+                "checked": coverage["points_checked"],
+            },
+            "edge_trace": {
+                "physical_edge_runs": len(edge_match["runs"]),
+                "unique_physical_edges": len({tuple(run["physical_edge"]) for run in edge_match["runs"]}),
+                "transition_count": edge_match["transition_count"],
+                "continuous_transitions": edge_match["continuous_transitions"],
+                "transition_continuity_percent": edge_match["transition_continuity_percent"],
+                "mean_match_distance_m": edge_match["mean_distance_m"],
+                "max_match_distance_m": edge_match["max_distance_m"],
+                "approximate_node_count": len(node_trace["nodes"]),
+                "approximate_trace_continuous": node_trace["continuous"],
+                "approximate_trace_closed": node_trace["closed"],
+                "note": node_trace["note"],
+                "first_nodes": node_trace["nodes"][:30],
+            },
+            "hard_rule_replay": replay,
+            "generator": generator,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @app.post("/analyze-gpx")
 async def analyze_gpx(
     file: UploadFile = File(...),
@@ -2587,7 +3078,7 @@ button:disabled {
 <div id="controls">
 
 <h2>Trail Running Creator</h2>
-<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-partial-edge-v7-v2</div>
+<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-gpx-ground-truth-v3</div>
 
 <div class="input-row">
     <div class="input-group">
@@ -2647,6 +3138,7 @@ button:disabled {
     </div>
 
     <button id="analyzeGpxButton">Analyze GPX</button>
+    <button id="testGpxButton">Test Generator Against GPX</button>
     <button id="clearGpxButton">Clear GPX</button>
 
     <div id="gpxResults">
@@ -2684,6 +3176,7 @@ let snapLine = null;
 const generateButton = document.getElementById("generateButton");
 const networkButton = document.getElementById("networkButton");
 const analyzeGpxButton = document.getElementById("analyzeGpxButton");
+const testGpxButton = document.getElementById("testGpxButton");
 const clearGpxButton = document.getElementById("clearGpxButton");
 const showNetworkCheckbox = document.getElementById("showNetwork");
 
@@ -2691,6 +3184,7 @@ const showNetworkCheckbox = document.getElementById("showNetwork");
 generateButton.addEventListener("click", generateRoute);
 networkButton.addEventListener("click", reloadNetwork);
 analyzeGpxButton.addEventListener("click", analyzeGpx);
+testGpxButton.addEventListener("click", testGpxAgainstGenerator);
 clearGpxButton.addEventListener("click", clearGpx);
 showNetworkCheckbox.addEventListener("change", updateNetworkVisibility);
 
@@ -3080,6 +3574,121 @@ async function analyzeGpx() {
     } catch (error) {
         gpxResults.innerHTML = '<span class="error"><b>Error:</b> ' + error.message + "</span>";
     } finally {
+        analyzeGpxButton.disabled = false;
+    }
+}
+
+
+async function testGpxAgainstGenerator() {
+    const gpxResults = document.getElementById("gpxResults");
+    const fileInput = document.getElementById("gpxFile");
+
+    if (!fileInput.files || fileInput.files.length === 0) {
+        gpxResults.innerHTML = '<span class="error"><b>Error:</b> Choose a GPX file first.</span>';
+        return;
+    }
+
+    testGpxButton.disabled = true;
+    analyzeGpxButton.disabled = true;
+    gpxResults.innerHTML = '<span class="warning">Running ground-truth test from the GPX own start, distance, and DEM gain. This may take about 20 seconds...</span>';
+
+    try {
+        const formData = new FormData();
+        formData.append("file", fileInput.files[0]);
+
+        const response = await fetch(
+            "/test-gpx",
+            {
+                method: "POST",
+                body: formData
+            }
+        );
+
+        const result = await readJsonResponse(response);
+        const benchmark = result.benchmark;
+        const trace = result.edge_trace;
+
+        if (benchmark.route && benchmark.route.length >= 2) {
+            const benchmarkCoordinates = benchmark.route.map(point => [point.lat, point.lon]);
+            if (gpxLine) {
+                map.removeLayer(gpxLine);
+            }
+            gpxLine = L.polyline(
+                benchmarkCoordinates,
+                {
+                    weight: 6,
+                    opacity: 0.95,
+                    color: "#0066cc"
+                }
+            ).addTo(map);
+            gpxLine.bringToFront();
+        }
+        const replay = result.hard_rule_replay;
+        const generator = result.generator;
+
+        // Put the GPX benchmark start/target into the main form so a normal
+        // Generate click immediately repeats the same benchmark.
+        document.getElementById("start_lat").value = benchmark.start.lat;
+        document.getElementById("start_lon").value = benchmark.start.lon;
+        document.getElementById("end_lat").value = benchmark.start.lat;
+        document.getElementById("end_lon").value = benchmark.start.lon;
+        document.getElementById("distance").value = benchmark.distance_miles;
+        document.getElementById("gain").value = benchmark.gain_ft;
+
+        if (generator.success && generator.route && generator.route.length >= 2) {
+            const generatedCoordinates = generator.route.map(point => [point.lat, point.lon]);
+            if (routeLine) {
+                map.removeLayer(routeLine);
+            }
+            routeLine = L.polyline(
+                generatedCoordinates,
+                {
+                    weight: 6,
+                    opacity: 0.95,
+                    color: "#d60000"
+                }
+            ).addTo(map);
+            routeLine.bringToFront();
+        }
+
+        const generatorText = generator.success
+            ? '<span class="success"><b>Generator benchmark result: SUCCESS</b></span><br>' +
+              '<b>Generated distance:</b> ' + generator.actual_distance_miles + ' mi<br>' +
+              '<b>Generated gain:</b> ' + generator.actual_gain_ft + ' ft<br>' +
+              '<b>Distance error:</b> ' + generator.distance_error_miles + ' mi<br>' +
+              '<b>Gain error:</b> ' + generator.gain_error_ft + ' ft<br>' +
+              '<b>States expanded:</b> ' + generator.states_expanded + '<br>' +
+              '<b>Partial-edge tuning:</b> ' + (generator.partial_edge_used ? 'YES' : 'NO')
+            : '<span class="error"><b>Generator benchmark result: FAILED</b></span><br>' +
+              '<b>Generator error:</b> ' + (generator.error || 'Unknown error');
+
+        gpxResults.innerHTML =
+            '<span class="success"><b>GPX ground-truth test complete</b></span><br>' +
+            '<b>Version:</b> ' + result.version + '<br><br>' +
+            '<b>Benchmark start:</b> ' + benchmark.start.lat.toFixed(6) + ', ' + benchmark.start.lon.toFixed(6) + '<br>' +
+            '<b>Benchmark distance:</b> ' + benchmark.distance_miles + ' mi<br>' +
+            '<b>Benchmark DEM gain:</b> ' + benchmark.gain_ft + ' ft<br>' +
+            '<b>Benchmark descent:</b> ' + benchmark.descent_ft + ' ft<br>' +
+            '<b>Graph-start snap:</b> ' + result.graph.start_snap_distance_m + ' m<br><br>' +
+            '<b>Allowed-trail coverage:</b> ' + result.coverage.percent + '%<br>' +
+            '<b>Mean trail match distance:</b> ' + result.coverage.mean_distance_m + ' m<br>' +
+            '<b>Max trail match distance:</b> ' + result.coverage.max_distance_m + ' m<br><br>' +
+            '<b>Matched physical edge runs:</b> ' + trace.physical_edge_runs + '<br>' +
+            '<b>Unique physical edges:</b> ' + trace.unique_physical_edges + '<br>' +
+            '<b>Edge-transition continuity:</b> ' + trace.transition_continuity_percent + '%<br>' +
+            '<b>Approximate graph trace closed:</b> ' + (trace.approximate_trace_closed ? 'YES' : 'NO') + '<br>' +
+            '<b>Trace note:</b> ' + trace.note + '<br><br>' +
+            '<b>Hard-rule replay:</b> ' + replay.status + '<br>' +
+            '<b>Replay explanation:</b> ' + replay.message + '<br><br>' +
+            generatorText + '<br><br>' +
+            '<span class="small">Blue = uploaded GPX. Red = route independently found by the generator using the GPX own start/distance/gain. The form has been updated to this benchmark automatically.</span>';
+
+        await loadTrailNetwork(getInputData());
+
+    } catch (error) {
+        gpxResults.innerHTML = '<span class="error"><b>Error:</b> ' + error.message + '</span>';
+    } finally {
+        testGpxButton.disabled = false;
         analyzeGpxButton.disabled = false;
     }
 }
