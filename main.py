@@ -3500,7 +3500,7 @@ Start latitude
     id="start_lat"
     type="number"
     step="any"
-    value="33.5777"
+    value="33.589281"
 >
 
 </div>
@@ -3516,7 +3516,7 @@ Start longitude
     id="start_lon"
     type="number"
     step="any"
-    value="-112.0822"
+    value="-112.091148"
 >
 
 </div>
@@ -3532,7 +3532,7 @@ End latitude
     id="end_lat"
     type="number"
     step="any"
-    value="33.5777"
+    value="33.589281"
 >
 
 </div>
@@ -3548,7 +3548,7 @@ End longitude
     id="end_lon"
     type="number"
     step="any"
-    value="-112.0822"
+    value="-112.091148"
 >
 
 </div>
