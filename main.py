@@ -5,6 +5,7 @@ from pydantic import BaseModel
 import math
 import os
 import random
+import time
 import xml.etree.ElementTree as ET
 
 import networkx as nx
@@ -41,6 +42,9 @@ GPX_TRAIL_MATCH_TOLERANCE_M = 25.0
 MAX_CACHED_GRAPHS = 5
 GRAPH_CACHE = {}
 
+APP_VERSION = "2026-08-09-partial-edge-v6-final"
+ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
+
 
 # ============================================================
 # REQUEST MODELS
@@ -69,6 +73,7 @@ class TrailNetworkRequest(BaseModel):
 def home():
     return {
         "status": "Trail Running Creator API is running",
+        "version": APP_VERSION,
         "map": "/map",
         "docs": "/docs",
         "dem_info": "/dem-info",
@@ -88,8 +93,12 @@ def get_route_profile(target_distance_miles: float):
         return {
             "name": "short-closed-beam",
             "search_radius_m": 1800,
-            "beam_width": 1200,
-            "beam_max_steps": 120,
+            "beam_width": 500,
+            "beam_max_steps": 80,
+            "max_search_seconds": 20.0,
+            "max_expanded_states": 120000,
+            "max_closed_candidates": 150,
+            "partial_tuning_base_candidates": 24,
         }
 
     if target_distance_miles < 8.0:
@@ -674,7 +683,7 @@ def add_local_dem_edge_elevations(G):
             )
             elevations.append(float(elevation_lookup[sample_key]))
 
-        elevations = smooth_elevations(elevations, radius=2)
+        elevations = smooth_elevations(elevations, radius=ELEVATION_SMOOTHING_RADIUS)
         ascent, descent = calculate_ascent_descent(elevations)
 
         G[u][v][key]["ascent_m"] = float(ascent)
@@ -875,34 +884,80 @@ def count_immediate_reversals(route_nodes):
 
 
 # ============================================================
-# ROUTE SCORE
+# ROUTE SCORE / CONTINUOUS ELEVATION
 # ============================================================
 
-def route_score(G, route_nodes, target_distance_meters, target_gain_meters):
-    total_distance = path_distance_meters(G, route_nodes)
-    actual_gain = path_gain_meters(G, route_nodes)
+def route_geometry_metrics(coords):
+    """Authoritative distance/gain from one continuous route geometry."""
+    if len(coords) < 2:
+        return {
+            "distance_meters": 0.0,
+            "gain_meters": 0.0,
+            "descent_meters": 0.0,
+            "dem_sample_points": 0,
+        }
+
+    lonlat = [
+        (float(point["lon"]), float(point["lat"]))
+        for point in coords
+    ]
+
+    distance_m = 0.0
+    for i in range(len(lonlat) - 1):
+        lon1, lat1 = lonlat[i]
+        lon2, lat2 = lonlat[i + 1]
+        distance_m += haversine_meters(lat1, lon1, lat2, lon2)
+
+    dense = densify_polyline(lonlat, ELEVATION_SAMPLE_SPACING_M)
+    raw_elevations = elevations_for_coords(dense)
+    smoothed = smooth_elevations(
+        raw_elevations,
+        radius=ELEVATION_SMOOTHING_RADIUS,
+    )
+    ascent_m, descent_m = calculate_ascent_descent(smoothed)
+
+    return {
+        "distance_meters": float(distance_m),
+        "gain_meters": float(ascent_m),
+        "descent_meters": float(descent_m),
+        "dem_sample_points": len(dense),
+    }
+
+
+def score_route_coordinates(
+    G,
+    coords,
+    route_nodes,
+    target_distance_meters,
+    target_gain_meters,
+    partial_added_distance_m=0.0,
+):
+    geometry = route_geometry_metrics(coords)
+    total_distance = geometry["distance_meters"]
+    actual_gain = geometry["gain_meters"]
 
     if total_distance <= 0:
         return float("inf"), {}
 
     distance_error = abs(total_distance - target_distance_meters)
-    distance_ratio = distance_error / target_distance_meters
+    distance_ratio = distance_error / max(target_distance_meters, 1.0)
 
     gain_error = abs(actual_gain - target_gain_meters)
-
     if target_gain_meters > 0:
         gain_ratio = gain_error / target_gain_meters
     else:
         gain_ratio = actual_gain / 30.48
 
     repeated_edges, repeated_distance = repeated_edge_stats(G, route_nodes)
+    # A partial out-and-back repeats the same physical trail by definition.
+    repeated_distance += max(0.0, float(partial_added_distance_m) / 2.0)
     repeat_ratio = repeated_distance / total_distance
     repeated_nodes = repeated_node_occurrences(route_nodes)
     immediate_reversals = count_immediate_reversals(route_nodes)
 
     if target_distance_meters < 4 * METERS_PER_MILE:
-        repeat_weight = 70.0
-        node_weight = 8.0
+        repeat_weight = 50.0
+        node_weight = 6.0
     else:
         repeat_weight = 300.0
         node_weight = 25.0
@@ -912,7 +967,7 @@ def route_score(G, route_nodes, target_distance_meters, target_gain_meters):
         + gain_ratio * 240.0
         + repeat_ratio * repeat_weight
         + repeated_nodes * node_weight
-        + immediate_reversals * 15.0
+        + immediate_reversals * 12.0
     )
 
     return (
@@ -920,6 +975,7 @@ def route_score(G, route_nodes, target_distance_meters, target_gain_meters):
         {
             "total_distance_meters": total_distance,
             "actual_gain_meters": actual_gain,
+            "actual_descent_meters": geometry["descent_meters"],
             "distance_error_meters": distance_error,
             "gain_error_meters": gain_error,
             "repeated_edges": repeated_edges,
@@ -928,8 +984,204 @@ def route_score(G, route_nodes, target_distance_meters, target_gain_meters):
             "repeated_nodes": repeated_nodes,
             "immediate_reversals": immediate_reversals,
             "score": score,
+            "route_coordinates": coords,
+            "route_elevation_sample_count": geometry["dem_sample_points"],
+            "partial_edge_used": partial_added_distance_m > 0,
+            "partial_added_distance_meters": float(partial_added_distance_m),
         },
     )
+
+
+def route_score(G, route_nodes, target_distance_meters, target_gain_meters):
+    coords = route_coordinates(G, route_nodes)
+    return score_route_coordinates(
+        G,
+        coords,
+        route_nodes,
+        target_distance_meters,
+        target_gain_meters,
+    )
+
+
+# ============================================================
+# PARTIAL-EDGE OUT-AND-BACK TUNING
+# ============================================================
+
+def polyline_prefix_by_distance(coords, requested_distance_m):
+    """Return the first requested_distance_m of a lon/lat polyline."""
+    if not coords:
+        return []
+    if requested_distance_m <= 0:
+        return [coords[0]]
+
+    result = [coords[0]]
+    remaining = float(requested_distance_m)
+
+    for i in range(len(coords) - 1):
+        lon1, lat1 = coords[i]
+        lon2, lat2 = coords[i + 1]
+        segment_m = haversine_meters(lat1, lon1, lat2, lon2)
+
+        if segment_m <= 0:
+            continue
+
+        if remaining >= segment_m:
+            result.append((float(lon2), float(lat2)))
+            remaining -= segment_m
+            if remaining <= 0.01:
+                break
+            continue
+
+        fraction = remaining / segment_m
+        lon = lon1 + (lon2 - lon1) * fraction
+        lat = lat1 + (lat2 - lat1) * fraction
+        result.append((float(lon), float(lat)))
+        remaining = 0.0
+        break
+
+    return result
+
+
+def build_route_coordinates_with_excursion(
+    G,
+    route_nodes,
+    insert_after_index,
+    excursion_neighbor,
+    outward_distance_m,
+):
+    """Build normal route plus a partial edge out-and-back at one route node."""
+    output = []
+
+    def append_lonlat(points):
+        for lon, lat in points:
+            point = {"lat": float(lat), "lon": float(lon)}
+            if output:
+                prev = output[-1]
+                if (
+                    abs(prev["lat"] - point["lat"]) < 1e-8
+                    and abs(prev["lon"] - point["lon"]) < 1e-8
+                ):
+                    continue
+            output.append(point)
+
+    for i in range(len(route_nodes) - 1):
+        u = route_nodes[i]
+        v = route_nodes[i + 1]
+
+        if i == insert_after_index:
+            excursion_edge = get_shortest_edge(G, u, excursion_neighbor)
+            if excursion_edge is not None:
+                excursion_coords = oriented_edge_coords(
+                    G,
+                    u,
+                    excursion_neighbor,
+                    excursion_edge,
+                )
+                prefix = polyline_prefix_by_distance(
+                    excursion_coords,
+                    outward_distance_m,
+                )
+                if len(prefix) >= 2:
+                    append_lonlat(prefix)
+                    append_lonlat(list(reversed(prefix)))
+
+        edge = get_shortest_edge(G, u, v)
+        if edge is not None:
+            append_lonlat(oriented_edge_coords(G, u, v, edge))
+
+    return output
+
+
+def partial_edge_tuning_candidates(
+    G,
+    route_nodes,
+    base_metrics,
+    target_distance_meters,
+    target_gain_meters,
+    max_edges_to_try=4,
+):
+    """
+    Add one partial out-and-back to a promising closed loop.
+    We choose the flattest candidate outgoing edges and solve the outward
+    distance from the route's current distance deficit.
+    """
+    base_distance = float(base_metrics["total_distance_meters"])
+    deficit = target_distance_meters - base_distance
+
+    # Partial tuning only adds distance. Keep it for reasonably close bases.
+    if deficit < 20.0 or deficit > 0.75 * METERS_PER_MILE:
+        return []
+
+    outward_needed = deficit / 2.0
+    S = make_simple_routing_graph(G)
+    options = []
+
+    for index, u in enumerate(route_nodes[:-1]):
+        next_node = route_nodes[index + 1]
+        prev_node = route_nodes[index - 1] if index > 0 else None
+
+        for neighbor in S.successors(u):
+            data = S[u][neighbor]
+            length = float(data.get("length", 0) or 0)
+            ascent = float(data.get("ascent_m", 0) or 0)
+
+            if length < max(25.0, outward_needed * 0.75):
+                continue
+
+            # Prefer side trails, but allow the main route edge if necessary.
+            route_edge_penalty = 0.25 if neighbor in {next_node, prev_node} else 0.0
+            gain_density = ascent / max(length, 1.0)
+            options.append(
+                (
+                    gain_density + route_edge_penalty,
+                    index,
+                    neighbor,
+                    length,
+                )
+            )
+
+    options.sort(key=lambda item: item[0])
+    options = options[:max_edges_to_try]
+
+    results = []
+    for _, index, neighbor, edge_length in options:
+        # Try exact fill plus +/-25 m outward so final DEM distance has room.
+        trial_outward = {
+            max(10.0, outward_needed - 25.0),
+            max(10.0, outward_needed),
+            min(edge_length, outward_needed + 25.0),
+        }
+
+        for outward in sorted(trial_outward):
+            if outward <= 0 or outward > edge_length:
+                continue
+
+            coords = build_route_coordinates_with_excursion(
+                G,
+                route_nodes,
+                index,
+                neighbor,
+                outward,
+            )
+            if len(coords) < 2:
+                continue
+
+            partial_added = 2.0 * outward
+            score, metrics = score_route_coordinates(
+                G,
+                coords,
+                route_nodes,
+                target_distance_meters,
+                target_gain_meters,
+                partial_added_distance_m=partial_added,
+            )
+            if metrics:
+                metrics["partial_edge_from_node"] = int(route_nodes[index])
+                metrics["partial_edge_toward_node"] = int(neighbor)
+                metrics["partial_outward_distance_meters"] = float(outward)
+                results.append((score, route_nodes, metrics))
+
+    return results
 
 
 # ============================================================
@@ -944,14 +1196,7 @@ def beam_search_short_loop(
     limits,
     profile,
 ):
-    """
-    Explore actual trail edges one at a time.
-
-    A candidate is scored only when the search itself returns
-    to start_node. A shortest path home is used only as a
-    DISTANCE lower bound for pruning and is never appended.
-    """
-
+    """Budgeted multi-objective closed-loop search with partial-edge tuning."""
     S = make_simple_routing_graph(G)
     reverse_S = S.reverse(copy=False)
 
@@ -967,312 +1212,349 @@ def beam_search_short_loop(
             detail=f"Could not calculate return-distance bounds: {exc}",
         )
 
-    allowed_distance_error_m = (
-        limits["distance_error_limit_miles"] * METERS_PER_MILE
-    )
+    allowed_distance_error_m = limits["distance_error_limit_miles"] * METERS_PER_MILE
+    max_acceptable_distance = target_distance_meters + allowed_distance_error_m
 
-    allowed_gain_error_m = (
-        limits["gain_error_limit_ft"] / FEET_PER_METER
-    )
+    beam_width = int(profile.get("beam_width", 500))
+    max_steps = int(profile.get("beam_max_steps", 80))
+    max_seconds = float(profile.get("max_search_seconds", 20.0))
+    max_states = int(profile.get("max_expanded_states", 120000))
+    max_closed = int(profile.get("max_closed_candidates", 150))
+    partial_base_count = int(profile.get("partial_tuning_base_candidates", 24))
 
-    max_acceptable_distance = (
-        target_distance_meters + allowed_distance_error_m
-    )
-
-    max_allowed_gain = target_gain_meters + allowed_gain_error_m
-
-    beam_width = profile["beam_width"]
-    max_steps = profile["beam_max_steps"]
-
-    target_gain_density = target_gain_meters / target_distance_meters
-
-    beam = [
-        {
-            "route": (start_node,),
-            "node": start_node,
-            "distance": 0.0,
-            "gain": 0.0,
-            "used_edges": frozenset(),
-            "repeat_distance": 0.0,
-            "reversals": 0,
-        }
-    ]
-
-    best_acceptable_route = None
-    best_acceptable_metrics = None
-    best_acceptable_score = float("inf")
-
-    best_closed_route = None
-    best_closed_metrics = None
-    best_closed_score = float("inf")
-
+    target_gain_density = target_gain_meters / max(target_distance_meters, 1.0)
+    started = time.perf_counter()
     states_expanded = 0
+    budget_reached = False
+    last_depth = 0
+
+    beam = [{
+        "route": (start_node,),
+        "node": start_node,
+        "distance": 0.0,
+        "gain": 0.0,
+        "used_edges": frozenset(),
+        "repeat_distance": 0.0,
+        "reversals": 0,
+    }]
+
+    closed_candidates = []
+    closed_seen = set()
+
+    def budget_hit():
+        return (
+            states_expanded >= max_states
+            or (time.perf_counter() - started) >= max_seconds
+        )
+
+    def state_priorities(state, min_final_distance):
+        distance_error = abs(min_final_distance - target_distance_meters) / max(
+            target_distance_meters, 1.0
+        )
+        gain_density = state["gain"] / max(state["distance"], 1.0)
+        density_error = abs(gain_density - target_gain_density) / max(
+            target_gain_density, 0.003
+        )
+        repeat_ratio = state["repeat_distance"] / max(state["distance"], 1.0)
+        reversal_penalty = state["reversals"] * 0.02
+
+        return {
+            "balanced": distance_error * 3.0 + density_error * 0.85 + repeat_ratio * 0.25 + reversal_penalty,
+            "gain": density_error * 2.5 + distance_error * 1.0 + repeat_ratio * 0.20 + reversal_penalty,
+            "distance": distance_error * 5.0 + density_error * 0.15 + repeat_ratio * 0.15 + reversal_penalty,
+            "flat": gain_density * 8.0 + distance_error * 2.0 + repeat_ratio * 0.15 + reversal_penalty,
+        }
 
     for depth in range(max_steps):
+        last_depth = depth + 1
+        if budget_hit():
+            budget_reached = True
+            break
+
         expanded = []
 
         for state in beam:
-            current = state["node"]
+            if budget_hit():
+                budget_reached = True
+                break
 
+            current = state["node"]
             for neighbor in S.successors(current):
                 states_expanded += 1
+                if budget_hit():
+                    budget_reached = True
+                    break
 
-                edge_data = S[current][neighbor]
-                edge_length = float(edge_data.get("length", 0) or 0)
-                edge_gain = float(edge_data.get("ascent_m", 0) or 0)
-
+                edge = S[current][neighbor]
+                edge_length = float(edge.get("length", 0) or 0)
+                edge_gain = float(edge.get("ascent_m", 0) or 0)
                 if edge_length <= 0:
                     continue
 
                 new_distance = state["distance"] + edge_length
-                new_gain = state["gain"] + edge_gain
-
                 if new_distance > max_acceptable_distance:
-                    continue
-
-                if new_gain > max_allowed_gain:
                     continue
 
                 edge_key = undirected_edge_key(current, neighbor)
                 already_used = edge_key in state["used_edges"]
-
-                repeat_distance = (
-                    state["repeat_distance"]
-                    + (edge_length if already_used else 0.0)
+                repeat_distance = state["repeat_distance"] + (
+                    edge_length if already_used else 0.0
                 )
-
                 used_edges = set(state["used_edges"])
                 used_edges.add(edge_key)
 
                 route = state["route"]
-
-                immediate_reversal = 0
-                if len(route) >= 2 and neighbor == route[-2]:
-                    immediate_reversal = 1
-
+                immediate_reversal = int(len(route) >= 2 and neighbor == route[-2])
                 reversals = state["reversals"] + immediate_reversal
                 new_route = route + (neighbor,)
+                new_gain = state["gain"] + edge_gain
 
-                # ------------------------------------------------
-                # Candidate only when the search physically returns
-                # to the start node.
-                # ------------------------------------------------
                 if neighbor == start_node:
-                    if new_distance < target_distance_meters * 0.50:
+                    # Ignore tiny accidental loops, but keep bases shorter than target
+                    # because partial-edge tuning can add the missing distance later.
+                    if new_distance < target_distance_meters * 0.45:
                         continue
 
-                    candidate_route = list(new_route)
-                    score, metrics = route_score(
-                        G,
-                        candidate_route,
-                        target_distance_meters,
-                        target_gain_meters,
+                    route_key = tuple(new_route)
+                    if route_key in closed_seen:
+                        continue
+                    closed_seen.add(route_key)
+
+                    distance_ratio = abs(new_distance - target_distance_meters) / max(
+                        target_distance_meters, 1.0
                     )
-
-                    if score < best_closed_score:
-                        best_closed_score = score
-                        best_closed_route = candidate_route
-                        best_closed_metrics = metrics
-
-                    distance_error_miles = (
-                        metrics["distance_error_meters"] / METERS_PER_MILE
+                    gain_ratio = abs(new_gain - target_gain_meters) / max(
+                        target_gain_meters, 30.48
                     )
+                    repeat_ratio = repeat_distance / max(new_distance, 1.0)
+                    gain_density = new_gain / max(new_distance, 1.0)
 
-                    gain_error_ft = (
-                        metrics["gain_error_meters"] * FEET_PER_METER
-                    )
+                    closed_candidates.append({
+                        "route": list(new_route),
+                        "distance": new_distance,
+                        "gain": new_gain,
+                        "distance_ratio": distance_ratio,
+                        "gain_ratio": gain_ratio,
+                        "repeat_ratio": repeat_ratio,
+                        "gain_density": gain_density,
+                        "cheap_balanced": distance_ratio * 3.0 + gain_ratio * 1.2 + repeat_ratio * 0.25,
+                    })
 
-                    acceptable = (
-                        distance_error_miles
-                        <= limits["distance_error_limit_miles"]
-                        and gain_error_ft
-                        <= limits["gain_error_limit_ft"]
-                    )
-
-                    if acceptable and score < best_acceptable_score:
-                        best_acceptable_score = score
-                        best_acceptable_route = candidate_route
-                        best_acceptable_metrics = metrics
-
-                    if acceptable:
-                        excellent_distance = (
-                            distance_error_miles
-                            <= limits["excellent_distance_error_miles"]
+                    # Keep candidate storage bounded but diverse.
+                    if len(closed_candidates) > max_closed * 6:
+                        closed_candidates = diversify_closed_candidates(
+                            closed_candidates,
+                            target_distance_meters,
+                            target_gain_meters,
+                            max_closed * 3,
                         )
-
-                        excellent_gain = (
-                            gain_error_ft
-                            <= limits["excellent_gain_error_ft"]
-                        )
-
-                        if excellent_distance and excellent_gain:
-                            return (
-                                best_acceptable_route,
-                                best_acceptable_metrics,
-                                depth + 1,
-                                states_expanded,
-                            )
-
-                    # Do not start a second loop through the trailhead.
                     continue
 
-                # ------------------------------------------------
-                # Distance-to-home is ONLY a lower-bound prune.
-                # ------------------------------------------------
                 if neighbor not in return_distance:
                     continue
 
-                distance_home_lower_bound = float(return_distance[neighbor])
-
-                minimum_possible_final_distance = (
-                    new_distance + distance_home_lower_bound
-                )
-
-                if minimum_possible_final_distance > max_acceptable_distance:
+                min_final_distance = new_distance + float(return_distance[neighbor])
+                if min_final_distance > max_acceptable_distance:
                     continue
 
-                projected_distance_error = abs(
-                    minimum_possible_final_distance - target_distance_meters
-                ) / target_distance_meters
+                new_state = {
+                    "route": new_route,
+                    "node": neighbor,
+                    "distance": new_distance,
+                    "gain": new_gain,
+                    "used_edges": frozenset(used_edges),
+                    "repeat_distance": repeat_distance,
+                    "reversals": reversals,
+                }
+                priorities = state_priorities(new_state, min_final_distance)
+                expanded.append((priorities, new_state))
 
-                if new_distance > 0:
-                    current_gain_density = new_gain / new_distance
-                else:
-                    current_gain_density = 0.0
+            if budget_reached:
+                break
 
-                gain_density_denominator = max(
-                    target_gain_density,
-                    0.004,
-                )
-
-                gain_density_error = abs(
-                    current_gain_density - target_gain_density
-                ) / gain_density_denominator
-
-                distance_progress = min(
-                    1.0,
-                    new_distance / target_distance_meters,
-                )
-
-                if target_gain_meters > 0:
-                    gain_progress = new_gain / target_gain_meters
-                    gain_progress_error = abs(
-                        gain_progress - distance_progress
-                    )
-                else:
-                    gain_progress_error = new_gain / 30.48
-
-                repeat_ratio = repeat_distance / max(new_distance, 1.0)
-
-                node_revisited = neighbor in route
-                node_revisit_penalty = 0.03 if node_revisited else 0.0
-
-                gain_overshoot = max(
-                    0.0,
-                    new_gain - target_gain_meters,
-                )
-
-                gain_overshoot_ratio = gain_overshoot / max(
-                    target_gain_meters,
-                    20.0,
-                )
-
-                priority = (
-                    projected_distance_error * 2.2
-                    + gain_density_error * 1.4
-                    + gain_progress_error * 1.0
-                    + gain_overshoot_ratio * 4.0
-                    + repeat_ratio * 0.30
-                    + node_revisit_penalty
-                    + reversals * 0.03
-                )
-
-                expanded.append(
-                    (
-                        priority,
-                        {
-                            "route": new_route,
-                            "node": neighbor,
-                            "distance": new_distance,
-                            "gain": new_gain,
-                            "used_edges": frozenset(used_edges),
-                            "repeat_distance": repeat_distance,
-                            "reversals": reversals,
-                        },
-                    )
-                )
-
+        if budget_reached:
+            break
         if not expanded:
             break
 
-        expanded.sort(key=lambda item: item[0])
-
-        next_beam = []
+        # Deduplicate similar states first.
+        unique = []
         seen_buckets = set()
-
-        for priority, state in expanded:
+        expanded.sort(key=lambda item: item[0]["balanced"])
+        for priorities, state in expanded:
             route = state["route"]
-            previous_node = route[-2] if len(route) >= 2 else None
-
-            distance_bucket = int(state["distance"] / 20.0)
-            gain_bucket = int(state["gain"] / 1.0)
-            repeat_bucket = int(state["repeat_distance"] / 20.0)
-
+            previous = route[-2] if len(route) >= 2 else None
             bucket = (
                 state["node"],
-                previous_node,
-                distance_bucket,
-                gain_bucket,
-                repeat_bucket,
+                previous,
+                int(state["distance"] / 30.0),
+                int(state["gain"] / 6.0),
+                int(state["repeat_distance"] / 30.0),
             )
-
             if bucket in seen_buckets:
                 continue
-
             seen_buckets.add(bucket)
-            next_beam.append(state)
+            unique.append((priorities, state))
 
-            if len(next_beam) >= beam_width:
-                break
+        # Reserve beam capacity for different objectives.
+        quotas = {
+            "balanced": int(beam_width * 0.40),
+            "gain": int(beam_width * 0.30),
+            "distance": int(beam_width * 0.20),
+            "flat": beam_width - int(beam_width * 0.40) - int(beam_width * 0.30) - int(beam_width * 0.20),
+        }
 
-        beam = next_beam
+        selected = []
+        selected_routes = set()
+        for objective, quota in quotas.items():
+            ranked = sorted(unique, key=lambda item: item[0][objective])
+            count = 0
+            for _, state in ranked:
+                key = state["route"]
+                if key in selected_routes:
+                    continue
+                selected_routes.add(key)
+                selected.append(state)
+                count += 1
+                if count >= quota:
+                    break
 
-    if best_acceptable_route is not None:
-        return (
-            best_acceptable_route,
-            best_acceptable_metrics,
-            max_steps,
-            states_expanded,
-        )
+        if len(selected) < beam_width:
+            for _, state in sorted(unique, key=lambda item: item[0]["balanced"]):
+                if state["route"] in selected_routes:
+                    continue
+                selected_routes.add(state["route"])
+                selected.append(state)
+                if len(selected) >= beam_width:
+                    break
 
-    if best_closed_route is not None:
-        best_distance = (
-            best_closed_metrics["total_distance_meters"] / METERS_PER_MILE
-        )
+        beam = selected
 
-        best_gain = (
-            best_closed_metrics["actual_gain_meters"] * FEET_PER_METER
-        )
-
+    if not closed_candidates:
+        budget_text = " Search budget was reached." if budget_reached else ""
         raise HTTPException(
             status_code=400,
             detail=(
-                "True closed-loop beam search did not find a route inside "
-                "the quality limits. Best closed route found was "
-                f"{best_distance:.2f} mi / {round(best_gain)} ft gain. "
-                "Use Analyze GPX below with a manual route to compare the "
-                "same DEM and allowed trail network."
+                "No closed loop was found within the search budget."
+                + budget_text
             ),
         )
+
+    closed_candidates = diversify_closed_candidates(
+        closed_candidates,
+        target_distance_meters,
+        target_gain_meters,
+        max_closed,
+    )
+
+    accurately_scored = []
+    for candidate in closed_candidates:
+        score, metrics = route_score(
+            G,
+            candidate["route"],
+            target_distance_meters,
+            target_gain_meters,
+        )
+        if metrics:
+            accurately_scored.append((score, candidate["route"], metrics))
+
+    # Try partial-edge tuning on promising under-distance bases.
+    partial_bases = sorted(
+        accurately_scored,
+        key=lambda item: (
+            abs(item[2]["actual_gain_meters"] - target_gain_meters),
+            abs(item[2]["total_distance_meters"] - target_distance_meters),
+        ),
+    )[:partial_base_count]
+
+    for _, route_nodes, metrics in partial_bases:
+        accurately_scored.extend(
+            partial_edge_tuning_candidates(
+                G,
+                route_nodes,
+                metrics,
+                target_distance_meters,
+                target_gain_meters,
+            )
+        )
+
+    best_any = None
+    best_acceptable = None
+    for score, route_nodes, metrics in accurately_scored:
+        distance_error_miles = metrics["distance_error_meters"] / METERS_PER_MILE
+        gain_error_ft = metrics["gain_error_meters"] * FEET_PER_METER
+        acceptable = (
+            distance_error_miles <= limits["distance_error_limit_miles"]
+            and gain_error_ft <= limits["gain_error_limit_ft"]
+        )
+
+        if best_any is None or score < best_any[0]:
+            best_any = (score, route_nodes, metrics)
+        if acceptable and (best_acceptable is None or score < best_acceptable[0]):
+            best_acceptable = (score, route_nodes, metrics)
+
+    if best_acceptable is not None:
+        _, route_nodes, metrics = best_acceptable
+        return route_nodes, metrics, last_depth, states_expanded
+
+    _, best_route, best_metrics = best_any
+    best_distance = best_metrics["total_distance_meters"] / METERS_PER_MILE
+    best_gain = best_metrics["actual_gain_meters"] * FEET_PER_METER
+    budget_text = " Search budget was reached." if budget_reached else ""
 
     raise HTTPException(
         status_code=400,
         detail=(
-            "The beam search never found a closed loop inside the allowed "
-            "distance/gain search space. Use Analyze GPX below with a manual "
-            "route to diagnose which search rule is excluding it."
+            "Closed loops were found, but none met the requested quality limits. "
+            f"Best accurately scored route was {best_distance:.2f} mi / "
+            f"{round(best_gain)} ft gain."
+            + budget_text
         ),
     )
+
+
+def diversify_closed_candidates(
+    candidates,
+    target_distance_meters,
+    target_gain_meters,
+    limit,
+):
+    """Preserve candidates across distance/gain buckets, not only one score."""
+    if len(candidates) <= limit:
+        return list(candidates)
+
+    buckets = {}
+    for candidate in candidates:
+        distance_bucket = int(candidate["distance"] / 80.0)
+        gain_bucket = int(candidate["gain"] / 12.0)
+        key = (distance_bucket, gain_bucket)
+        current = buckets.get(key)
+        if current is None or candidate["cheap_balanced"] < current["cheap_balanced"]:
+            buckets[key] = candidate
+
+    diverse = list(buckets.values())
+    diverse.sort(
+        key=lambda c: (
+            c["cheap_balanced"],
+            abs(c["gain"] - target_gain_meters),
+            abs(c["distance"] - target_distance_meters),
+        )
+    )
+
+    # If bucket representatives do not fill the limit, add best leftovers.
+    if len(diverse) < limit:
+        present = {tuple(c["route"]) for c in diverse}
+        leftovers = sorted(candidates, key=lambda c: c["cheap_balanced"])
+        for candidate in leftovers:
+            key = tuple(candidate["route"])
+            if key in present:
+                continue
+            present.add(key)
+            diverse.append(candidate)
+            if len(diverse) >= limit:
+                break
+
+    return diverse[:limit]
 
 
 # ============================================================
@@ -1659,7 +1941,7 @@ async def analyze_gpx(
         raw_dem_elevations = elevations_for_coords(dense_coords)
         smoothed_dem_elevations = smooth_elevations(
             raw_dem_elevations,
-            radius=2,
+            radius=ELEVATION_SMOOTHING_RADIUS,
         )
 
         ascent_m, descent_m = calculate_ascent_descent(
@@ -1775,8 +2057,10 @@ async def analyze_gpx(
             "graph_from_cache": graph_from_cache,
             "graph_elevation_samples": unique_elevation_samples,
             "elevation_sample_spacing_m": ELEVATION_SAMPLE_SPACING_M,
-            "elevation_smoothing_window_points": 5,
+            "elevation_smoothing_window_points": 2 * ELEVATION_SMOOTHING_RADIUS + 1,
+            "elevation_smoothing_distance_m": (2 * ELEVATION_SMOOTHING_RADIUS + 1) * ELEVATION_SAMPLE_SPACING_M,
             "elevation_source": os.path.basename(DEM_PATH),
+            "version": APP_VERSION,
             "route": [
                 {
                     "lat": float(lat),
@@ -1840,6 +2124,7 @@ def trail_network(request: TrailNetworkRequest):
             "network_edges": G.number_of_edges(),
             "search_radius_m": profile["search_radius_m"],
             "route_profile": profile["name"],
+            "version": APP_VERSION,
             "requested_start": {
                 "lat": request.start_lat,
                 "lon": request.start_lon,
@@ -1892,6 +2177,8 @@ def dem_info():
                 "y": abs(src.transform.e),
             },
             "elevation_sample_spacing_m": ELEVATION_SAMPLE_SPACING_M,
+            "elevation_smoothing_window_points": 2 * ELEVATION_SMOOTHING_RADIUS + 1,
+            "version": APP_VERSION,
         }
 
 
@@ -2056,7 +2343,7 @@ def generate_route(request: RouteRequest):
             metrics["repeated_distance_meters"] / METERS_PER_MILE
         )
 
-        coords = route_coordinates(G, route_nodes)
+        coords = metrics.get("route_coordinates") or route_coordinates(G, route_nodes)
 
         return {
             "requested_distance_miles": request.target_distance_miles,
@@ -2064,6 +2351,7 @@ def generate_route(request: RouteRequest):
             "distance_error_miles": round(distance_error_miles, 2),
             "requested_gain_ft": request.target_gain_ft,
             "actual_gain_ft": round(actual_gain_ft),
+            "actual_descent_ft": round(metrics.get("actual_descent_meters", 0.0) * FEET_PER_METER),
             "elevation_error_ft": round(elevation_error_ft),
             "route_type": route_type,
             "search_method": search_method,
@@ -2095,7 +2383,14 @@ def generate_route(request: RouteRequest):
             "graph_from_cache": graph_from_cache,
             "unique_elevation_samples": unique_elevation_samples,
             "elevation_sample_spacing_m": ELEVATION_SAMPLE_SPACING_M,
+            "elevation_smoothing_window_points": 2 * ELEVATION_SMOOTHING_RADIUS + 1,
+            "elevation_smoothing_distance_m": (2 * ELEVATION_SMOOTHING_RADIUS + 1) * ELEVATION_SAMPLE_SPACING_M,
             "elevation_source": os.path.basename(DEM_PATH),
+            "route_elevation_sample_count": metrics.get("route_elevation_sample_count"),
+            "partial_edge_used": metrics.get("partial_edge_used", False),
+            "partial_added_distance_miles": round(metrics.get("partial_added_distance_meters", 0.0) / METERS_PER_MILE, 3),
+            "partial_outward_distance_meters": round(metrics.get("partial_outward_distance_meters", 0.0), 1),
+            "version": APP_VERSION,
             "snapped_start_lat": snapped_start_lat,
             "snapped_start_lon": snapped_start_lon,
             "snap_distance_m": round(snap_distance_m, 1),
@@ -2260,6 +2555,7 @@ button:disabled {
 <div id="controls">
 
 <h2>Trail Running Creator</h2>
+<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-partial-edge-v6-final</div>
 
 <div class="input-row">
     <div class="input-group">
@@ -2534,7 +2830,9 @@ async function loadTrailNetwork(data) {
         result.search_radius_m +
         " m<br>" +
         "<b>Profile:</b> " +
-        result.route_profile;
+        result.route_profile +
+        "<br><b>Version:</b> " +
+        result.version;
 
     return result;
 }
@@ -2624,7 +2922,14 @@ async function generateRoute() {
             "<b>Distance error:</b> " + result.distance_error_miles + " mi<br><br>" +
             "<b>Elevation target:</b> " + result.requested_gain_ft + " ft<br>" +
             "<b>Actual elevation gain:</b> " + result.actual_gain_ft + " ft<br>" +
-            "<b>Elevation error:</b> " + result.elevation_error_ft + " ft<br><br>" +
+            "<b>Actual descent:</b> " + result.actual_descent_ft + " ft<br>" +
+            "<b>Elevation error:</b> " + result.elevation_error_ft + " ft<br>" +
+            "<b>Partial-edge tuning:</b> " + (result.partial_edge_used ? "YES" : "NO") + "<br>" +
+            (result.partial_edge_used
+                ? "<b>Partial distance added:</b> " + result.partial_added_distance_miles + " mi<br>" +
+                  "<b>Turnaround distance from node:</b> " + result.partial_outward_distance_meters + " m<br>"
+                : "") +
+            "<br>" +
             "<b>Search method:</b> " + result.search_method + "<br>" +
             "<b>Route profile:</b> " + result.route_profile + "<br>" +
             "<b>Search depth:</b> " + result.search_steps + "<br>" +
@@ -2638,6 +2943,8 @@ async function generateRoute() {
             "<b>Graph cached:</b> " + result.graph_from_cache + "<br>" +
             "<b>Elevation samples:</b> " + result.unique_elevation_samples + "<br>" +
             "<b>Elevation sample spacing:</b> ~" + result.elevation_sample_spacing_m + " m<br>" +
+            "<b>Elevation smoothing:</b> ~" + result.elevation_smoothing_distance_m + " m (" + result.elevation_smoothing_window_points + " points)<br>" +
+            "<b>Version:</b> " + result.version + "<br>" +
             '<span class="small">Elevation source: ' + result.elevation_source + "</span>";
 
     } catch (error) {
