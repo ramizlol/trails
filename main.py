@@ -42,8 +42,9 @@ GPX_TRAIL_MATCH_TOLERANCE_M = 25.0
 MAX_CACHED_GRAPHS = 5
 GRAPH_CACHE = {}
 
-APP_VERSION = "2026-08-09-partial-edge-v6-final"
+APP_VERSION = "2026-08-09-partial-edge-v7-v2"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
+PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
 
 
 # ============================================================
@@ -98,7 +99,8 @@ def get_route_profile(target_distance_miles: float):
             "max_search_seconds": 20.0,
             "max_expanded_states": 120000,
             "max_closed_candidates": 150,
-            "partial_tuning_base_candidates": 24,
+            "partial_tuning_base_candidates": 32,
+            "continue_through_start_below_target": True,
         }
 
     if target_distance_miles < 8.0:
@@ -1109,7 +1111,7 @@ def partial_edge_tuning_candidates(
     deficit = target_distance_meters - base_distance
 
     # Partial tuning only adds distance. Keep it for reasonably close bases.
-    if deficit < 20.0 or deficit > 0.75 * METERS_PER_MILE:
+    if deficit < 20.0 or deficit > PARTIAL_TUNING_MAX_DEFICIT_M:
         return []
 
     outward_needed = deficit / 2.0
@@ -1310,44 +1312,74 @@ def beam_search_short_loop(
                 new_gain = state["gain"] + edge_gain
 
                 if neighbor == start_node:
-                    # Ignore tiny accidental loops, but keep bases shorter than target
-                    # because partial-edge tuning can add the missing distance later.
-                    if new_distance < target_distance_meters * 0.45:
+                    # A partial out-and-back can add at most 0.75 mi. Therefore a
+                    # closed loop shorter than target - 0.75 mi is NOT a useful
+                    # final/tuning base yet. Keep searching through the trailhead
+                    # instead of terminating the state there.
+                    tunable_min_distance = max(
+                        0.0,
+                        target_distance_meters - PARTIAL_TUNING_MAX_DEFICIT_M,
+                    )
+
+                    if new_distance >= tunable_min_distance:
+                        route_key = tuple(new_route)
+                        if route_key not in closed_seen:
+                            closed_seen.add(route_key)
+
+                            distance_ratio = abs(new_distance - target_distance_meters) / max(
+                                target_distance_meters, 1.0
+                            )
+                            gain_ratio = abs(new_gain - target_gain_meters) / max(
+                                target_gain_meters, 30.48
+                            )
+                            repeat_ratio = repeat_distance / max(new_distance, 1.0)
+                            gain_density = new_gain / max(new_distance, 1.0)
+
+                            closed_candidates.append({
+                                "route": list(new_route),
+                                "distance": new_distance,
+                                "gain": new_gain,
+                                "distance_ratio": distance_ratio,
+                                "gain_ratio": gain_ratio,
+                                "repeat_ratio": repeat_ratio,
+                                "gain_density": gain_density,
+                                "cheap_balanced": distance_ratio * 3.0 + gain_ratio * 1.2 + repeat_ratio * 0.25,
+                            })
+
+                            # Keep candidate storage bounded but diverse.
+                            if len(closed_candidates) > max_closed * 6:
+                                closed_candidates = diversify_closed_candidates(
+                                    closed_candidates,
+                                    target_distance_meters,
+                                    target_gain_meters,
+                                    max_closed * 3,
+                                )
+
+                    # Do not automatically terminate just because we touched the
+                    # start. If we are still below target, the route may leave the
+                    # trailhead again and combine another loop/branch before the
+                    # final closure. This is especially important for short routes.
+                    continue_through_start = bool(
+                        profile.get("continue_through_start_below_target", True)
+                    )
+
+                    if (
+                        not continue_through_start
+                        or new_distance >= target_distance_meters
+                    ):
                         continue
 
-                    route_key = tuple(new_route)
-                    if route_key in closed_seen:
-                        continue
-                    closed_seen.add(route_key)
-
-                    distance_ratio = abs(new_distance - target_distance_meters) / max(
-                        target_distance_meters, 1.0
-                    )
-                    gain_ratio = abs(new_gain - target_gain_meters) / max(
-                        target_gain_meters, 30.48
-                    )
-                    repeat_ratio = repeat_distance / max(new_distance, 1.0)
-                    gain_density = new_gain / max(new_distance, 1.0)
-
-                    closed_candidates.append({
-                        "route": list(new_route),
+                    new_state = {
+                        "route": new_route,
+                        "node": start_node,
                         "distance": new_distance,
                         "gain": new_gain,
-                        "distance_ratio": distance_ratio,
-                        "gain_ratio": gain_ratio,
-                        "repeat_ratio": repeat_ratio,
-                        "gain_density": gain_density,
-                        "cheap_balanced": distance_ratio * 3.0 + gain_ratio * 1.2 + repeat_ratio * 0.25,
-                    })
-
-                    # Keep candidate storage bounded but diverse.
-                    if len(closed_candidates) > max_closed * 6:
-                        closed_candidates = diversify_closed_candidates(
-                            closed_candidates,
-                            target_distance_meters,
-                            target_gain_meters,
-                            max_closed * 3,
-                        )
+                        "used_edges": frozenset(used_edges),
+                        "repeat_distance": repeat_distance,
+                        "reversals": reversals,
+                    }
+                    priorities = state_priorities(new_state, new_distance)
+                    expanded.append((priorities, new_state))
                     continue
 
                 if neighbor not in return_distance:
@@ -2555,7 +2587,7 @@ button:disabled {
 <div id="controls">
 
 <h2>Trail Running Creator</h2>
-<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-partial-edge-v6-final</div>
+<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-partial-edge-v7-v2</div>
 
 <div class="input-row">
     <div class="input-group">
