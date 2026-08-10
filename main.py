@@ -84,7 +84,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-10-v27-route-controls"
+APP_VERSION = "2026-08-10-v28-edit-filters-history"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -162,7 +162,7 @@ SMALL_SUBLOOP_MAX_M = 1.50 * METERS_PER_MILE
 # then every returned route must pass through at least one natural-trail
 # candidate inside that zone. Multiple points are supported.
 DEFAULT_PASS_THROUGH_TOLERANCE_MILES = 0.25
-MAX_REQUIRED_PASS_POINTS = 5
+MAX_REQUIRED_PASS_POINTS = 10
 PASS_POINT_CANDIDATES_PER_ZONE = 18
 
 # V25 avoid zones. These are hard exclusions: routing edges that touch an
@@ -233,6 +233,9 @@ class RouteRequest(BaseModel):
     target_distance_miles: float
     target_gain_ft: float
     pass_points: list[RequiredPassPoint] = Field(default_factory=list)
+    # Direct route-edit handles are kept separate in the UI but use the same
+    # required-zone routing machinery on the backend.
+    route_edit_points: list[RequiredPassPoint] = Field(default_factory=list)
     avoid_areas: list[AvoidArea] = Field(default_factory=list)
     avoid_segments: list[TrailSegmentPoint] = Field(default_factory=list)
     prefer_segments: list[TrailSegmentPoint] = Field(default_factory=list)
@@ -7039,10 +7042,12 @@ def generate_route(request: RouteRequest):
                 Y=request.end_lat,
             )
 
-        # V16: pass-through markers are snapped to nearby natural trails and
-        # inserted as temporary routing nodes. They do not rebuild the start
-        # workspace or alter the saved offline master graph.
-        G, required_pass_points = resolve_required_pass_points(G, request.pass_points)
+        # Pass-through markers and V28 direct-edit handles are both snapped to
+        # nearby natural trails and inserted as temporary routing nodes. Direct
+        # edit handles stay visually separate in the browser, but routing treats
+        # them as additional hard corridor requirements.
+        combined_pass_points = list(request.pass_points or []) + list(request.route_edit_points or [])
+        G, required_pass_points = resolve_required_pass_points(G, combined_pass_points)
         if start_node not in G:
             raise HTTPException(status_code=500, detail="Start node was lost while inserting required pass-through points.")
 
@@ -7266,6 +7271,7 @@ def generate_route(request: RouteRequest):
             "partial_outward_distance_meters": round(metrics.get("partial_outward_distance_meters", 0.0), 1),
             "required_pass_points": metrics.get("required_pass_points", []),
             "required_pass_points_count": len(required_pass_points),
+            "route_edit_points_count": len(request.route_edit_points or []),
             "avoid_areas_count": len(resolved_avoid_areas),
             "avoid_segments_count": len(resolved_avoid_segments),
             "prefer_segments_count": len(resolved_prefer_segments),
@@ -7612,6 +7618,230 @@ input[type="range"] {
     margin-top: 8px;
 }
 
+
+/* V28 compact accordion sidebar + modification controls */
+.sidebar-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 10px;
+}
+
+.sidebar-header h2 {
+    margin: 0;
+    font-size: 20px;
+}
+
+.history-buttons {
+    display: flex;
+    gap: 5px;
+    flex: 0 0 auto;
+}
+
+.icon-button {
+    width: 34px;
+    height: 32px;
+    padding: 0;
+    margin: 0;
+    border-radius: 7px;
+    background: #e2e8f0;
+    color: #0f172a;
+    font-size: 20px;
+    line-height: 1;
+}
+
+.icon-button:disabled {
+    opacity: 0.35;
+    cursor: default;
+}
+
+.control-section {
+    border: 1px solid #dbe2ea;
+    border-radius: 9px;
+    margin: 8px 0;
+    background: #fff;
+    overflow: hidden;
+}
+
+.control-section > summary {
+    cursor: pointer;
+    list-style: none;
+    padding: 10px 12px;
+    font-size: 13px;
+    font-weight: 700;
+    color: #0f172a;
+    background: #f8fafc;
+    user-select: none;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.control-section > summary::-webkit-details-marker { display: none; }
+.control-section > summary::after {
+    content: "▾";
+    color: #64748b;
+    font-size: 12px;
+    transition: transform 0.15s ease;
+}
+.control-section:not([open]) > summary::after { transform: rotate(-90deg); }
+.control-section[open] > summary { border-bottom: 1px solid #e5e7eb; }
+
+.section-content {
+    padding: 10px;
+    background: #fff;
+}
+
+.tool-block,
+#pass-point-panel,
+#avoid-area-panel,
+#segment-control-panel,
+#diversity-panel {
+    border: 0;
+    border-radius: 8px;
+    padding: 9px;
+    margin: 0 0 9px 0;
+    background: #f8fafc;
+}
+
+.tool-block:last-child { margin-bottom: 0; }
+.tool-heading { font-size: 12px; font-weight: 700; margin-bottom: 4px; color: #0f172a; }
+.compact-tool-block { padding-bottom: 7px; }
+.tool-action { margin-top: 7px; }
+
+.secondary-button {
+    background: #475569;
+}
+
+.primary-actions {
+    position: sticky;
+    bottom: 0;
+    z-index: 600;
+    display: grid;
+    grid-template-columns: 1fr;
+    gap: 6px;
+    padding: 9px 0 8px 0;
+    margin-top: 8px;
+    background: linear-gradient(to bottom, rgba(255,255,255,0.84), #fff 24%);
+}
+
+.primary-actions button {
+    width: 100%;
+    margin: 0;
+}
+
+#generateButton { background: #0f172a; }
+#downloadGpxButton { background: #166534; }
+
+.toggle-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+}
+.simple-toggle-row { margin-bottom: 9px; font-size: 12px; font-weight: 600; }
+
+.switch {
+    position: relative;
+    display: inline-block;
+    width: 40px;
+    height: 22px;
+    flex: 0 0 40px;
+    margin: 0;
+}
+.switch input { opacity: 0; width: 0; height: 0; }
+.switch .slider {
+    position: absolute;
+    inset: 0;
+    cursor: pointer;
+    background: #cbd5e1;
+    border-radius: 999px;
+    transition: .18s;
+}
+.switch .slider::before {
+    content: "";
+    position: absolute;
+    height: 16px;
+    width: 16px;
+    left: 3px;
+    top: 3px;
+    background: #fff;
+    border-radius: 50%;
+    box-shadow: 0 1px 2px rgba(0,0,0,.2);
+    transition: .18s;
+}
+.switch input:checked + .slider { background: #0f766e; }
+.switch input:checked + .slider::before { transform: translateX(18px); }
+
+.quality-filter-fields {
+    margin-top: 8px;
+    transition: opacity .15s ease;
+}
+.disabled-block {
+    opacity: .42;
+    pointer-events: none;
+}
+
+.range-labels {
+    display: flex;
+    justify-content: space-between;
+    font-size: 10px;
+    color: #64748b;
+    margin-top: -2px;
+}
+
+.route-edit-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 7px 0 0 0;
+    margin-top: 7px;
+    border-top: 1px solid #e5e7eb;
+    font-size: 11px;
+}
+.route-edit-remove { background: #64748b; margin: 0; padding: 6px 8px; font-size: 11px; }
+
+.route-edit-handle.leaflet-marker-icon {
+    filter: hue-rotate(320deg) saturate(1.4);
+}
+
+.filter-badge {
+    display: inline-block;
+    margin-left: 4px;
+    padding: 2px 6px;
+    border-radius: 999px;
+    background: #e2e8f0;
+    color: #334155;
+    font-size: 10px;
+    font-weight: 700;
+}
+
+.route-card-title-line {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+}
+.edited-badge {
+    display: inline-block;
+    padding: 1px 5px;
+    border-radius: 999px;
+    background: rgba(255,255,255,.18);
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: .03em;
+}
+.route-choice:not(.selected) .edited-badge {
+    background: #fee2e2;
+    color: #991b1b;
+}
+
+#qualityFilterStatus { margin-top: 3px; }
+#routeEditStatus { margin-top: 5px; }
+
 @media (max-width: 900px) {
     body {
         display: block;
@@ -7653,88 +7883,159 @@ input[type="range"] {
 
 <div id="controls">
 
-<h2>Trail Running Creator</h2>
-<div class="input-row">
-    <div class="input-group">
-        <label for="start_lat">Start latitude</label>
-        <input id="start_lat" type="number" step="any" value="33.586055">
-    </div>
-
-    <div class="input-group">
-        <label for="start_lon">Start longitude</label>
-        <input id="start_lon" type="number" step="any" value="-112.083341">
-    </div>
-
-    <div class="input-group">
-        <label for="end_lat">End latitude</label>
-        <input id="end_lat" type="number" step="any" value="33.586055">
-    </div>
-
-    <div class="input-group">
-        <label for="end_lon">End longitude</label>
-        <input id="end_lon" type="number" step="any" value="-112.083341">
+<div class="sidebar-header">
+    <h2>Trail Running Creator</h2>
+    <div class="history-buttons" aria-label="Undo and redo">
+        <button id="undoButton" type="button" class="icon-button" disabled title="Undo last change">↶</button>
+        <button id="redoButton" type="button" class="icon-button" disabled title="Redo last change">↷</button>
     </div>
 </div>
 
-<button id="chooseStartButton" type="button">Choose start on map</button>
-<div id="startPointStatus" class="small">Click anywhere on the map to choose the starting point.</div>
+<details class="control-section" open>
+    <summary>Route request</summary>
+    <div class="section-content">
+        <div class="input-row">
+            <div class="input-group">
+                <label for="start_lat">Start latitude</label>
+                <input id="start_lat" type="number" step="any" value="33.586055">
+            </div>
+            <div class="input-group">
+                <label for="start_lon">Start longitude</label>
+                <input id="start_lon" type="number" step="any" value="-112.083341">
+            </div>
+            <div class="input-group">
+                <label for="end_lat">End latitude</label>
+                <input id="end_lat" type="number" step="any" value="33.586055">
+            </div>
+            <div class="input-group">
+                <label for="end_lon">End longitude</label>
+                <input id="end_lon" type="number" step="any" value="-112.083341">
+            </div>
+        </div>
 
-<div class="input-row">
-    <div class="input-group">
-        <label for="distance">Target distance (miles)</label>
-        <input id="distance" type="number" step="0.1" min="0.1" value="2.5">
+        <button id="chooseStartButton" type="button" class="secondary-button">Choose start on map</button>
+        <div id="startPointStatus" class="small">Click anywhere on the map to choose the starting point.</div>
+
+        <div class="input-row request-target-row">
+            <div class="input-group">
+                <label for="distance">Target distance (miles)</label>
+                <input id="distance" type="number" step="0.1" min="0.1" value="2.5">
+            </div>
+            <div class="input-group">
+                <label for="gain">Target elevation gain (ft)</label>
+                <input id="gain" type="number" step="25" min="0" value="200">
+            </div>
+        </div>
     </div>
+</details>
 
-    <div class="input-group">
-        <label for="gain">Target elevation gain (ft)</label>
-        <input id="gain" type="number" step="25" min="0" value="200">
+<details class="control-section">
+    <summary>Route settings</summary>
+    <div class="section-content">
+        <div id="diversity-panel" class="tool-block compact-tool-block">
+            <div class="tool-heading">Route diversity</div>
+            <input id="routeDiversity" type="range" min="0" max="100" step="5" value="50">
+            <div class="range-labels"><span>Similar</span><span>Very different</span></div>
+            <div class="small">Current: <span id="diversityValue">50</span>/100</div>
+        </div>
+
+        <div id="quality-filter-panel" class="tool-block">
+            <div class="toggle-row">
+                <div>
+                    <div class="tool-heading">Route quality filters</div>
+                    <div class="small">Optional limits applied to the route choices you see.</div>
+                </div>
+                <label class="switch" title="Enable route quality filters">
+                    <input id="enableQualityFilters" type="checkbox">
+                    <span class="slider"></span>
+                </label>
+            </div>
+            <div id="qualityFilterFields" class="quality-filter-fields disabled-block">
+                <div class="input-row">
+                    <div class="input-group">
+                        <label for="maxRetrace">Max retrace (%)</label>
+                        <input id="maxRetrace" type="number" min="0" max="100" step="1" value="15">
+                    </div>
+                    <div class="input-group">
+                        <label for="maxConnector">Max connector (%)</label>
+                        <input id="maxConnector" type="number" min="0" max="100" step="1" value="5">
+                    </div>
+                    <div class="input-group">
+                        <label for="minTrail">Minimum trail (%)</label>
+                        <input id="minTrail" type="number" min="0" max="100" step="1" value="95">
+                    </div>
+                    <div class="input-group">
+                        <label for="distanceTolerance">Distance tolerance (±%)</label>
+                        <input id="distanceTolerance" type="number" min="0" max="100" step="1" value="10">
+                    </div>
+                </div>
+                <div id="qualityFilterStatus" class="small"></div>
+            </div>
+        </div>
     </div>
-</div>
+</details>
 
-<div id="diversity-panel">
-    <b>Route diversity</b><br>
-    <span class="small">Similar routes</span>
-    <input id="routeDiversity" type="range" min="0" max="100" step="5" value="50">
-    <div class="small">Current: <span id="diversityValue">50</span>/100 · higher = alternatives use more different trail corridors</div>
-</div>
+<details class="control-section">
+    <summary>Modify route</summary>
+    <div class="section-content">
+        <div id="direct-edit-panel" class="tool-block">
+            <div class="tool-heading">Direct route editing</div>
+            <div class="small">Choose Edit route, click the selected red route, then drag the edit handle onto the trail corridor you want. The route is regenerated through that corridor when you release it.</div>
+            <div class="segment-button-row">
+                <button id="editRouteButton" type="button" disabled>Edit selected route</button>
+                <button id="clearRouteEditsButton" type="button" class="secondary-button" disabled>Clear edit points</button>
+            </div>
+            <div id="routeEditStatus" class="small"></div>
+            <div id="routeEditRows"></div>
+        </div>
 
-<div id="pass-point-panel">
-    <b>Required pass-through points</b><br>
-    <span class="small">Add a point, then click the map. The generated route must use a natural trail inside the tolerance circle. Points do not need to be exactly on a trail.</span><br>
-    <button id="addPassPointButton" type="button" style="margin-top:8px;">Add pass-through point</button>
-    <div id="passPointStatus" class="small"></div>
-    <div id="passPointRows"></div>
-</div>
+        <div id="pass-point-panel" class="tool-block">
+            <div class="tool-heading">Required pass-through points</div>
+            <div class="small">Force the route through a nearby trail corridor.</div>
+            <button id="addPassPointButton" type="button" class="secondary-button tool-action">Add pass-through point</button>
+            <div id="passPointStatus" class="small"></div>
+            <div id="passPointRows"></div>
+        </div>
 
-<div id="avoid-area-panel">
-    <b>Avoid areas</b><br>
-    <span class="small">Add an area, then click the map. Generated routes will not use any routing trail or connector that enters the circle.</span><br>
-    <button id="addAvoidAreaButton" type="button" style="margin-top:8px;">Add avoid area</button>
-    <div id="avoidAreaStatus" class="small"></div>
-    <div id="avoidAreaRows"></div>
-</div>
+        <div id="avoid-area-panel" class="tool-block">
+            <div class="tool-heading">Avoid areas</div>
+            <div class="small">Block routing through a circular area.</div>
+            <button id="addAvoidAreaButton" type="button" class="secondary-button tool-action">Add avoid area</button>
+            <div id="avoidAreaStatus" class="small"></div>
+            <div id="avoidAreaRows"></div>
+        </div>
 
-<div id="segment-control-panel">
-    <b>Trail segment controls</b><br>
-    <span class="small">Choose a mode, then click directly on a gray trail. Avoid removes that segment from routing. Prefer makes it more attractive but does not require it.</span>
-    <div class="segment-button-row">
-        <button id="avoidTrailSegmentButton" type="button">Avoid trail segment</button>
-        <button id="preferTrailSegmentButton" type="button">Prefer trail segment</button>
+        <div id="segment-control-panel" class="tool-block">
+            <div class="tool-heading">Trail segment controls</div>
+            <div class="small">Click a gray trail to avoid it completely or softly prefer it.</div>
+            <div class="segment-button-row">
+                <button id="avoidTrailSegmentButton" type="button">Avoid trail segment</button>
+                <button id="preferTrailSegmentButton" type="button">Prefer trail segment</button>
+            </div>
+            <div id="segmentStatus" class="small"></div>
+            <div id="segmentRows"></div>
+        </div>
     </div>
-    <div id="segmentStatus" class="small"></div>
-    <div id="segmentRows"></div>
-</div>
+</details>
 
-<button id="generateButton">Generate Trail Route</button>
-<button id="findMoreButton" disabled>Find More Routes</button>
-<button id="downloadGpxButton" disabled>Download GPX for COROS</button>
-<button id="networkButton">Load / Refresh Start Area</button>
+<details class="control-section">
+    <summary>Map & network</summary>
+    <div class="section-content">
+        <div class="network-control toggle-row simple-toggle-row">
+            <span>Show TIFF-wide trail network</span>
+            <label class="switch">
+                <input id="showNetwork" type="checkbox" checked>
+                <span class="slider"></span>
+            </label>
+        </div>
+        <button id="networkButton" class="secondary-button">Load / Refresh Start Area</button>
+    </div>
+</details>
 
-<div class="network-control">
-    <label>
-        <input id="showNetwork" type="checkbox" checked>
-        Show TIFF-wide trail network
-    </label>
+<div class="primary-actions">
+    <button id="generateButton">Generate Trail Route</button>
+    <button id="findMoreButton" disabled>Find More Routes</button>
+    <button id="downloadGpxButton" disabled>Download GPX for COROS</button>
 </div>
 
 <div id="results">Ready.</div>
@@ -7791,11 +8092,23 @@ let preferSegments = [];
 let trailSegmentLayers = [];
 let trailSegmentPlacementMode = null; // "avoid" | "prefer" | null
 let nextTrailSegmentId = 1;
+let routeEditMode = false;
+let routeEditPoints = [];
+let routeEditLayers = [];
+let nextRouteEditId = 1;
 let elevationHoverMarker = null;
 let elevationRenderState = null;
 let currentSearchSeed = Math.floor(Date.now() % 2147483647);
 let findMoreBatch = 0;
 let lastSearchConfigKey = null;
+
+// V28 undo/redo tracks planner settings and map modification controls. Generated
+// route batches are intentionally not copied into history, keeping browser memory
+// bounded even after many Find More searches.
+let undoStack = [];
+let redoStack = [];
+let currentPlannerState = null;
+let restoringPlannerState = false;
 
 const generateButton = document.getElementById("generateButton");
 const findMoreButton = document.getElementById("findMoreButton");
@@ -7809,6 +8122,15 @@ const avoidTrailSegmentButton = document.getElementById("avoidTrailSegmentButton
 const preferTrailSegmentButton = document.getElementById("preferTrailSegmentButton");
 const routeDiversityInput = document.getElementById("routeDiversity");
 const diversityValue = document.getElementById("diversityValue");
+const editRouteButton = document.getElementById("editRouteButton");
+const clearRouteEditsButton = document.getElementById("clearRouteEditsButton");
+const undoButton = document.getElementById("undoButton");
+const redoButton = document.getElementById("redoButton");
+const enableQualityFilters = document.getElementById("enableQualityFilters");
+const maxRetraceInput = document.getElementById("maxRetrace");
+const maxConnectorInput = document.getElementById("maxConnector");
+const minTrailInput = document.getElementById("minTrail");
+const distanceToleranceInput = document.getElementById("distanceTolerance");
 
 
 generateButton.addEventListener("click", generateRoute);
@@ -7821,15 +8143,420 @@ addPassPointButton.addEventListener("click", beginPassPointPlacement);
 addAvoidAreaButton.addEventListener("click", beginAvoidAreaPlacement);
 avoidTrailSegmentButton.addEventListener("click", () => beginTrailSegmentPlacement("avoid"));
 preferTrailSegmentButton.addEventListener("click", () => beginTrailSegmentPlacement("prefer"));
+editRouteButton.addEventListener("click", beginRouteEditMode);
+clearRouteEditsButton.addEventListener("click", clearRouteEditPoints);
+undoButton.addEventListener("click", undoPlannerChange);
+redoButton.addEventListener("click", redoPlannerChange);
 routeDiversityInput.addEventListener("input", () => {
     diversityValue.textContent = routeDiversityInput.value;
 });
+routeDiversityInput.addEventListener("change", commitPlannerState);
+enableQualityFilters.addEventListener("change", () => {
+    updateQualityFilterUi();
+    commitPlannerState();
+    refreshQualityFilterView();
+});
+[maxRetraceInput, maxConnectorInput, minTrailInput, distanceToleranceInput].forEach(input => {
+    input.addEventListener("change", () => {
+        commitPlannerState();
+        refreshQualityFilterView();
+    });
+});
+["start_lat", "start_lon", "end_lat", "end_lon", "distance", "gain"].forEach(id => {
+    document.getElementById(id).addEventListener("change", () => {
+        if (id === "start_lat" || id === "start_lon") {
+            const lat = Number(document.getElementById("start_lat").value);
+            const lon = Number(document.getElementById("start_lon").value);
+            if (Number.isFinite(lat) && Number.isFinite(lon)) {
+                loadedWorkspaceStartKey = null;
+                lastWorkspaceResult = null;
+                createRequestedStartMarker(lat, lon, "Selected start · drag to adjust", false);
+            }
+        }
+        commitPlannerState();
+    });
+});
 map.on("click", handleMapPlacementClick);
+document.addEventListener("keydown", event => {
+    const tag = String(document.activeElement?.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select") return;
+    const modifier = event.ctrlKey || event.metaKey;
+    if (!modifier) return;
+    if (event.key.toLowerCase() === "z" && !event.shiftKey) {
+        event.preventDefault();
+        undoPlannerChange();
+    } else if ((event.key.toLowerCase() === "z" && event.shiftKey) || event.key.toLowerCase() === "y") {
+        event.preventDefault();
+        redoPlannerChange();
+    }
+});
 window.addEventListener("resize", () => {
     map.invalidateSize();
     const selected = getSelectedRouteOption();
     if (selected) renderElevationProfile(selected);
 });
+
+
+
+function deepClonePlannerValue(value) {
+    return JSON.parse(JSON.stringify(value));
+}
+
+
+function capturePlannerState() {
+    return {
+        start_lat: document.getElementById("start_lat").value,
+        start_lon: document.getElementById("start_lon").value,
+        end_lat: document.getElementById("end_lat").value,
+        end_lon: document.getElementById("end_lon").value,
+        distance: document.getElementById("distance").value,
+        gain: document.getElementById("gain").value,
+        route_diversity: routeDiversityInput.value,
+        pass_points: deepClonePlannerValue(passPoints),
+        avoid_areas: deepClonePlannerValue(avoidAreas),
+        avoid_segments: deepClonePlannerValue(avoidSegments),
+        prefer_segments: deepClonePlannerValue(preferSegments),
+        route_edit_points: deepClonePlannerValue(routeEditPoints),
+        quality_enabled: enableQualityFilters.checked,
+        max_retrace: maxRetraceInput.value,
+        max_connector: maxConnectorInput.value,
+        min_trail: minTrailInput.value,
+        distance_tolerance: distanceToleranceInput.value,
+        show_network: showNetworkCheckbox.checked
+    };
+}
+
+
+function plannerStateKey(state) {
+    return JSON.stringify(state);
+}
+
+
+function updateUndoRedoButtons() {
+    undoButton.disabled = undoStack.length === 0;
+    redoButton.disabled = redoStack.length === 0;
+}
+
+
+function resetPlannerHistory() {
+    undoStack = [];
+    redoStack = [];
+    currentPlannerState = capturePlannerState();
+    updateUndoRedoButtons();
+}
+
+
+function commitPlannerState() {
+    if (restoringPlannerState) return;
+    const nextState = capturePlannerState();
+    if (currentPlannerState === null) {
+        currentPlannerState = nextState;
+        updateUndoRedoButtons();
+        return;
+    }
+    if (plannerStateKey(nextState) === plannerStateKey(currentPlannerState)) return;
+    undoStack.push(deepClonePlannerValue(currentPlannerState));
+    if (undoStack.length > 60) undoStack.shift();
+    currentPlannerState = nextState;
+    redoStack = [];
+    updateUndoRedoButtons();
+}
+
+
+function applyPlannerState(state) {
+    if (!state) return;
+    restoringPlannerState = true;
+    try {
+        const oldStartLat = Number(document.getElementById("start_lat").value);
+        const oldStartLon = Number(document.getElementById("start_lon").value);
+
+        document.getElementById("start_lat").value = state.start_lat;
+        document.getElementById("start_lon").value = state.start_lon;
+        document.getElementById("end_lat").value = state.end_lat;
+        document.getElementById("end_lon").value = state.end_lon;
+        document.getElementById("distance").value = state.distance;
+        document.getElementById("gain").value = state.gain;
+        routeDiversityInput.value = state.route_diversity ?? 50;
+        diversityValue.textContent = routeDiversityInput.value;
+
+        passPoints = deepClonePlannerValue(state.pass_points || []);
+        avoidAreas = deepClonePlannerValue(state.avoid_areas || []);
+        avoidSegments = deepClonePlannerValue(state.avoid_segments || []);
+        preferSegments = deepClonePlannerValue(state.prefer_segments || []);
+        routeEditPoints = deepClonePlannerValue(state.route_edit_points || []);
+
+        nextPassPointId = Math.max(0, ...passPoints.map(p => Number(p.id) || 0)) + 1;
+        nextAvoidAreaId = Math.max(0, ...avoidAreas.map(p => Number(p.id) || 0)) + 1;
+        nextTrailSegmentId = Math.max(0, ...avoidSegments.concat(preferSegments).map(p => Number(p.id) || 0)) + 1;
+        nextRouteEditId = Math.max(0, ...routeEditPoints.map(p => Number(p.id) || 0)) + 1;
+
+        enableQualityFilters.checked = Boolean(state.quality_enabled);
+        maxRetraceInput.value = state.max_retrace ?? 15;
+        maxConnectorInput.value = state.max_connector ?? 5;
+        minTrailInput.value = state.min_trail ?? 95;
+        distanceToleranceInput.value = state.distance_tolerance ?? 10;
+        showNetworkCheckbox.checked = state.show_network !== false;
+
+        clearPlacementModes();
+        renderPassPointRows();
+        drawPassPointLayers();
+        renderAvoidAreaRows();
+        drawAvoidAreaLayers();
+        renderTrailSegmentRows();
+        drawTrailSegmentLayers();
+        renderRouteEditRows();
+        drawRouteEditLayers();
+        updateQualityFilterUi();
+        updateNetworkVisibility();
+
+        const newStartLat = Number(state.start_lat);
+        const newStartLon = Number(state.start_lon);
+        if (Number.isFinite(newStartLat) && Number.isFinite(newStartLon)) {
+            createRequestedStartMarker(newStartLat, newStartLon, "Selected start · drag to adjust", false);
+        }
+        if (Math.abs(newStartLat - oldStartLat) > 1e-8 || Math.abs(newStartLon - oldStartLon) > 1e-8) {
+            loadedWorkspaceStartKey = null;
+            lastWorkspaceResult = null;
+        }
+
+        refreshQualityFilterView(true);
+        document.getElementById("routeEditStatus").textContent =
+            "Planner change restored. Generate again if you want the route search recalculated.";
+    } finally {
+        restoringPlannerState = false;
+    }
+}
+
+
+function undoPlannerChange() {
+    if (!undoStack.length) return;
+    const previous = undoStack.pop();
+    redoStack.push(deepClonePlannerValue(currentPlannerState));
+    currentPlannerState = deepClonePlannerValue(previous);
+    applyPlannerState(previous);
+    updateUndoRedoButtons();
+}
+
+
+function redoPlannerChange() {
+    if (!redoStack.length) return;
+    const next = redoStack.pop();
+    undoStack.push(deepClonePlannerValue(currentPlannerState));
+    currentPlannerState = deepClonePlannerValue(next);
+    applyPlannerState(next);
+    updateUndoRedoButtons();
+}
+
+
+function updateQualityFilterUi() {
+    const fields = document.getElementById("qualityFilterFields");
+    fields.classList.toggle("disabled-block", !enableQualityFilters.checked);
+}
+
+
+function getQualityFilterConfig() {
+    return {
+        enabled: enableQualityFilters.checked,
+        maxRetrace: Math.max(0, Number(maxRetraceInput.value) || 0),
+        maxConnector: Math.max(0, Number(maxConnectorInput.value) || 0),
+        minTrail: Math.max(0, Number(minTrailInput.value) || 0),
+        distanceTolerance: Math.max(0, Number(distanceToleranceInput.value) || 0)
+    };
+}
+
+
+function routePassesQualityFilters(option) {
+    const filter = getQualityFilterConfig();
+    if (!filter.enabled) return true;
+    const targetDistance = Number(lastGeneratedRoute?.requested_distance_miles ?? document.getElementById("distance").value);
+    const actualDistance = Number(option.actual_distance_miles || 0);
+    const distanceToleranceMiles = targetDistance * filter.distanceTolerance / 100.0;
+    return Number(option.retrace_percent ?? 0) <= filter.maxRetrace + 1e-9 &&
+        Number(option.connector_percent ?? 0) <= filter.maxConnector + 1e-9 &&
+        Number(option.trail_percent ?? 0) >= filter.minTrail - 1e-9 &&
+        Math.abs(actualDistance - targetDistance) <= distanceToleranceMiles + 1e-9;
+}
+
+
+function getVisibleRouteIndices() {
+    if (!lastGeneratedRoute) return [];
+    return (lastGeneratedRoute.route_options || [])
+        .map((option, index) => routePassesQualityFilters(option) ? index : -1)
+        .filter(index => index >= 0);
+}
+
+
+function refreshQualityFilterView(redrawMap = true) {
+    updateQualityFilterUi();
+    if (!lastGeneratedRoute) return;
+    const visible = getVisibleRouteIndices();
+    const status = document.getElementById("qualityFilterStatus");
+    if (enableQualityFilters.checked) {
+        status.textContent = `${visible.length} of ${(lastGeneratedRoute.route_options || []).length} route choices meet these limits.`;
+    } else {
+        status.textContent = "";
+    }
+    let nextIndex = selectedRouteOptionIndex;
+    if (!visible.includes(nextIndex)) nextIndex = visible.length ? visible[0] : -1;
+    renderRouteResults("Route choices updated");
+    if (redrawMap) {
+        drawRouteOptions(lastGeneratedRoute, nextIndex >= 0 ? nextIndex : 0, false);
+    }
+}
+
+
+function beginRouteEditMode() {
+    if (!getSelectedRouteOption()) return;
+    clearPlacementModes();
+    routeEditMode = true;
+    editRouteButton.textContent = "Click the red route...";
+    document.getElementById("routeEditStatus").textContent =
+        "Click the selected red route where you want an edit handle, then drag that handle onto another trail corridor.";
+}
+
+
+function addRouteEditPointFromRoute(latlng) {
+    if (routeEditPoints.length >= 5) {
+        document.getElementById("routeEditStatus").textContent = "Maximum of 5 direct route edit points reached.";
+        routeEditMode = false;
+        editRouteButton.textContent = "Edit selected route";
+        return;
+    }
+    routeEditPoints.push({
+        id: nextRouteEditId++,
+        lat: Number(latlng.lat.toFixed(7)),
+        lon: Number(latlng.lng.toFixed(7)),
+        tolerance_miles: 0.03
+    });
+    routeEditMode = false;
+    editRouteButton.textContent = "Edit selected route";
+    renderRouteEditRows();
+    drawRouteEditLayers();
+    commitPlannerState();
+    document.getElementById("routeEditStatus").textContent =
+        "Edit handle added. Drag it onto the trail corridor you want; rerouting starts when you release it.";
+}
+
+
+function renderRouteEditRows() {
+    const container = document.getElementById("routeEditRows");
+    if (!container) return;
+    container.innerHTML = "";
+    routeEditPoints.forEach((point, index) => {
+        const row = document.createElement("div");
+        row.className = "route-edit-row";
+        row.innerHTML = `
+            <span>Edit ${index + 1} · ${Number(point.lat).toFixed(5)}, ${Number(point.lon).toFixed(5)}</span>
+            <button type="button" class="route-edit-remove" data-route-edit-id="${point.id}">Remove</button>
+        `;
+        container.appendChild(row);
+    });
+    container.querySelectorAll("button[data-route-edit-id]").forEach(button => {
+        button.addEventListener("click", () => {
+            const id = Number(button.dataset.routeEditId);
+            routeEditPoints = routeEditPoints.filter(item => item.id !== id);
+            renderRouteEditRows();
+            drawRouteEditLayers();
+            commitPlannerState();
+            document.getElementById("routeEditStatus").textContent =
+                "Edit point removed. Generate again to recalculate without it.";
+        });
+    });
+    clearRouteEditsButton.disabled = routeEditPoints.length === 0;
+}
+
+
+function drawRouteEditLayers() {
+    for (const layer of routeEditLayers) {
+        if (layer && map.hasLayer(layer)) map.removeLayer(layer);
+    }
+    routeEditLayers = [];
+    routeEditPoints.forEach((point, index) => {
+        const marker = L.marker([Number(point.lat), Number(point.lon)], {
+            draggable: true,
+            title: `Route edit ${index + 1}`
+        }).addTo(map).bindTooltip(`Route edit ${index + 1} · drag to reroute`);
+        marker.on("dragstart", event => {
+            const start = event.target.getLatLng();
+            event.target._routeEditDragOrigin = L.latLng(start.lat, start.lng);
+        });
+        marker.on("dragend", async event => {
+            const markerLayer = event.target;
+            const moved = markerLayer.getLatLng();
+            const nearest = findNearestOverlayTrailSegment(moved);
+            if (!nearest || nearest.distancePx > 40) {
+                if (markerLayer._routeEditDragOrigin) markerLayer.setLatLng(markerLayer._routeEditDragOrigin);
+                document.getElementById("routeEditStatus").textContent =
+                    "No trail was close enough. Zoom in and drag the handle directly onto the desired trail.";
+                return;
+            }
+            point.lat = Number(nearest.lat.toFixed(7));
+            point.lon = Number(nearest.lon.toFixed(7));
+            markerLayer.setLatLng([point.lat, point.lon]);
+            renderRouteEditRows();
+            commitPlannerState();
+            await rerouteThroughEditPoints();
+        });
+        routeEditLayers.push(marker);
+    });
+    clearRouteEditsButton.disabled = routeEditPoints.length === 0;
+}
+
+
+function clearRouteEditPoints() {
+    if (!routeEditPoints.length) return;
+    routeEditPoints = [];
+    renderRouteEditRows();
+    drawRouteEditLayers();
+    commitPlannerState();
+    document.getElementById("routeEditStatus").textContent =
+        "Direct edit points cleared. Existing route choices are kept; Generate recalculates without edit constraints.";
+}
+
+
+async function rerouteThroughEditPoints() {
+    if (!lastGeneratedRoute || !routeEditPoints.length) return;
+    const status = document.getElementById("routeEditStatus");
+    const data = getInputData();
+    currentSearchSeed = Math.floor((Date.now() + Math.random() * 1000000) % 2147483647);
+    data.search_seed = currentSearchSeed;
+    generateButton.disabled = true;
+    findMoreButton.disabled = true;
+    editRouteButton.disabled = true;
+    status.textContent = "Rerouting selected route through the dragged trail corridor...";
+    try {
+        const result = await requestRouteBatch(data);
+        const incoming = ensureRouteOptions(result);
+        if (!incoming.length) throw new Error("No edited route was returned.");
+        const edited = incoming.find(option => routePassesQualityFilters(option)) || incoming[0];
+        edited.is_edited = true;
+        const signature = browserRouteSignature(edited);
+        let selectedIndex = (lastGeneratedRoute.route_options || []).findIndex(option => browserRouteSignature(option) === signature);
+        if (selectedIndex < 0) {
+            lastGeneratedRoute.route_options.push(edited);
+            reindexRouteOptions(lastGeneratedRoute.route_options);
+            selectedIndex = lastGeneratedRoute.route_options.length - 1;
+        }
+        lastGeneratedRoute.route_options_count = lastGeneratedRoute.route_options.length;
+        lastGeneratedRoute.route_edit_points_count = routeEditPoints.length;
+        lastSearchConfigKey = searchConfigKey(data);
+        renderRouteResults("Route edited through dragged corridor");
+        if (routePassesQualityFilters(lastGeneratedRoute.route_options[selectedIndex])) {
+            drawRouteOptions(lastGeneratedRoute, selectedIndex, false);
+            selectRouteOption(selectedIndex, false);
+            status.textContent = "Edited route added and selected.";
+        } else {
+            drawRouteOptions(lastGeneratedRoute, selectedRouteOptionIndex, false);
+            status.textContent = "Edited route was added, but your quality filters currently hide it.";
+        }
+    } catch (error) {
+        status.textContent = "Route edit error: " + error.message;
+    } finally {
+        generateButton.disabled = false;
+        findMoreButton.disabled = !lastGeneratedRoute;
+        editRouteButton.disabled = !getSelectedRouteOption();
+    }
+}
 
 
 function resetTrailSegmentPlacementButtons() {
@@ -7843,9 +8570,11 @@ function clearPlacementModes() {
     passPointPlacementMode = false;
     avoidAreaPlacementMode = false;
     trailSegmentPlacementMode = null;
+    routeEditMode = false;
     chooseStartButton.textContent = "Choose start on map";
     addPassPointButton.textContent = "Add pass-through point";
     addAvoidAreaButton.textContent = "Add avoid area";
+    editRouteButton.textContent = "Edit selected route";
     resetTrailSegmentPlacementButtons();
 }
 
@@ -7966,6 +8695,7 @@ function setStartPoint(latlng, statusText = "Start selected. Generate a route or
     document.getElementById("startPointStatus").textContent = statusText;
     document.getElementById("results").innerHTML =
         '<span class="success">Start selected from map. Drag the marker to fine-tune it.</span>';
+    commitPlannerState();
 }
 
 
@@ -8061,6 +8791,7 @@ function addClickedTrailSegment(kind, latlng) {
         kind === "avoid"
             ? "Trail segment marked to avoid."
             : "Trail segment marked as preferred (soft preference only).";
+    commitPlannerState();
 }
 
 
@@ -8084,6 +8815,7 @@ function handleMapPlacementClick(event) {
         drawPassPointLayers();
         document.getElementById("passPointStatus").textContent =
             "Pass-through point added. Drag its marker or edit the values below.";
+        commitPlannerState();
         return;
     }
 
@@ -8100,6 +8832,7 @@ function handleMapPlacementClick(event) {
         drawAvoidAreaLayers();
         document.getElementById("avoidAreaStatus").textContent =
             "Avoid area added. Drag its marker or edit the center/radius below.";
+        commitPlannerState();
         return;
     }
 
@@ -8135,6 +8868,7 @@ function renderTrailSegmentRows() {
             }
             renderTrailSegmentRows();
             drawTrailSegmentLayers();
+            commitPlannerState();
         });
     });
 }
@@ -8200,6 +8934,7 @@ function renderPassPointRows() {
             if (!point) return;
             point[input.dataset.field] = Number(input.value);
             drawPassPointLayers();
+            commitPlannerState();
         });
     });
 
@@ -8209,6 +8944,7 @@ function renderPassPointRows() {
             passPoints = passPoints.filter(item => item.id !== id);
             renderPassPointRows();
             drawPassPointLayers();
+            commitPlannerState();
         });
     });
 }
@@ -8243,6 +8979,7 @@ function drawPassPointLayers() {
             point.lon = Number(moved.lng.toFixed(7));
             renderPassPointRows();
             drawPassPointLayers();
+            commitPlannerState();
         });
         passPointLayers.push(circle, marker);
     });
@@ -8280,6 +9017,7 @@ function renderAvoidAreaRows() {
             if (!area) return;
             area[input.dataset.field] = Number(input.value);
             drawAvoidAreaLayers();
+            commitPlannerState();
         });
     });
 
@@ -8289,6 +9027,7 @@ function renderAvoidAreaRows() {
             avoidAreas = avoidAreas.filter(item => item.id !== id);
             renderAvoidAreaRows();
             drawAvoidAreaLayers();
+            commitPlannerState();
         });
     });
 }
@@ -8324,6 +9063,7 @@ function drawAvoidAreaLayers() {
             area.lon = Number(moved.lng.toFixed(7));
             renderAvoidAreaRows();
             drawAvoidAreaLayers();
+            commitPlannerState();
         });
         avoidAreaLayers.push(circle, marker);
     });
@@ -8384,7 +9124,8 @@ function getSelectedRouteOption() {
     }
     const options = lastGeneratedRoute.route_options || [];
     if (options.length > 0) {
-        return options[Math.max(0, Math.min(selectedRouteOptionIndex, options.length - 1))];
+        if (selectedRouteOptionIndex < 0 || selectedRouteOptionIndex >= options.length) return null;
+        return options[selectedRouteOptionIndex];
     }
     return lastGeneratedRoute;
 }
@@ -8433,7 +9174,7 @@ function clearElevationHover() {
 function clearGeneratedRouteLines() {
     clearElevationHover();
     for (const line of routeOptionLines) {
-        if (map.hasLayer(line)) {
+        if (line && map.hasLayer(line)) {
             map.removeLayer(line);
         }
     }
@@ -8647,11 +9388,13 @@ function selectRouteOption(index, fitMap = true) {
     if (!lastGeneratedRoute || !lastGeneratedRoute.route_options) return;
     const options = lastGeneratedRoute.route_options;
     if (index < 0 || index >= options.length) return;
+    if (!routePassesQualityFilters(options[index])) return;
 
     selectedRouteOptionIndex = index;
     clearElevationHover();
 
     routeOptionLines.forEach((line, lineIndex) => {
+        if (!line) return;
         if (lineIndex === index) {
             line.setStyle({weight: 7, opacity: 0.96, color: "#d60000"});
             line.bringToFront();
@@ -8669,6 +9412,7 @@ function selectRouteOption(index, fitMap = true) {
     renderSelectedRouteDetails(selected);
     renderElevationProfile(selected);
     downloadGpxButton.disabled = false;
+    editRouteButton.disabled = false;
 
     if (fitMap && routeLine) {
         map.fitBounds(routeLine.getBounds(), {padding: [30, 30]});
@@ -8679,8 +9423,10 @@ function selectRouteOption(index, fitMap = true) {
 function drawRouteOptions(result, selectedIndex = 0, fitMap = true) {
     clearGeneratedRouteLines();
     const options = result.route_options || [];
+    routeOptionLines = new Array(options.length).fill(null);
 
     options.forEach((option, index) => {
+        if (!routePassesQualityFilters(option)) return;
         const coordinates = option.route.map(point => [point.lat, point.lon]);
         const line = L.polyline(coordinates, {
             weight: 4,
@@ -8690,6 +9436,10 @@ function drawRouteOptions(result, selectedIndex = 0, fitMap = true) {
         }).addTo(map);
         line.on("click", event => {
             L.DomEvent.stopPropagation(event);
+            if (routeEditMode && index === selectedRouteOptionIndex) {
+                addRouteEditPointFromRoute(event.latlng);
+                return;
+            }
             selectRouteOption(index, false);
         });
         line.on("mousemove", event => {
@@ -8700,14 +9450,25 @@ function drawRouteOptions(result, selectedIndex = 0, fitMap = true) {
         line.on("mouseout", () => {
             if (index === selectedRouteOptionIndex) clearElevationHover();
         });
-        routeOptionLines.push(line);
+        routeOptionLines[index] = line;
     });
 
-    if (options.length > 0) {
-        const safeIndex = Math.max(0, Math.min(selectedIndex, options.length - 1));
-        selectRouteOption(safeIndex, fitMap);
+    const visible = getVisibleRouteIndices();
+    if (visible.length > 0) {
+        const requestedIndex = visible.includes(selectedIndex) ? selectedIndex : visible[0];
+        selectRouteOption(requestedIndex, fitMap);
+    } else {
+        selectedRouteOptionIndex = -1;
+        routeLine = null;
+        downloadGpxButton.disabled = true;
+        editRouteButton.disabled = true;
+        renderElevationProfile(null);
+        const details = document.getElementById("selectedRouteDetails");
+        if (details) details.innerHTML = '<span class="warning">No route choices meet the active quality filters.</span>';
     }
+    drawRouteEditLayers();
 }
+
 
 function updateNetworkVisibility() {
     if (showNetworkCheckbox.checked) {
@@ -8734,6 +9495,11 @@ function getInputData() {
             lat: Number(point.lat),
             lon: Number(point.lon),
             tolerance_miles: Number(point.tolerance_miles)
+        })),
+        route_edit_points: routeEditPoints.map(point => ({
+            lat: Number(point.lat),
+            lon: Number(point.lon),
+            tolerance_miles: Number(point.tolerance_miles || 0.03)
         })),
         avoid_areas: avoidAreas.map(area => ({
             lat: Number(area.lat),
@@ -9040,7 +9806,10 @@ function searchConfigKey(data) {
 function routeChoiceCardHtml(option, index) {
     return `
         <button type="button" class="route-choice" data-route-index="${index}">
-            <span class="route-card-title">${option.name}</span>
+            <span class="route-card-title-line">
+                <span class="route-card-title">${option.name}</span>
+                ${option.is_edited ? '<span class="edited-badge">edited</span>' : ''}
+            </span>
             <span class="route-card-primary">${option.actual_distance_miles} mi · ${option.actual_gain_ft} ft gain</span>
             <span class="route-card-secondary">Retrace ${option.retrace_percent ?? 0}% · Connector ${option.connector_percent ?? 0}% · Reach ${option.max_reach_miles ?? 0} mi · Trail ${option.trail_percent ?? 0}%</span>
         </button>
@@ -9052,18 +9821,27 @@ function renderRouteResults(statusMessage = "Route search complete") {
     if (!lastGeneratedRoute) return;
     const results = document.getElementById("results");
     const options = lastGeneratedRoute.route_options || [];
-    const routeButtons = options.map(routeChoiceCardHtml).join("");
+    const visibleEntries = options
+        .map((option, index) => ({option, index}))
+        .filter(entry => routePassesQualityFilters(entry.option));
+    const routeButtons = visibleEntries.map(entry => routeChoiceCardHtml(entry.option, entry.index)).join("");
+    const filters = getQualityFilterConfig();
+    const filterLine = filters.enabled
+        ? `<span class="filter-badge">${visibleEntries.length}/${options.length} pass filters</span>`
+        : "";
 
     results.innerHTML =
-        `<span class="success"><b>${statusMessage}</b></span><br>` +
-        `<b>Route choices:</b> ${options.length}<br>` +
-        `<div class="route-choice-grid">${routeButtons}</div>` +
-        '<div id="selectedRouteDetails"></div><br>' +
+        `<span class="success"><b>${statusMessage}</b></span> ${filterLine}<br>` +
+        `<b>Route choices:</b> ${visibleEntries.length}${filters.enabled ? ` shown · ${options.length} found` : ""}<br>` +
+        (visibleEntries.length
+            ? `<div class="route-choice-grid">${routeButtons}</div><div id="selectedRouteDetails"></div><br>`
+            : '<div class="warning" style="margin:8px 0;">No routes meet the active quality filters. Relax the limits or turn filters off; the found routes are still kept.</div><div id="selectedRouteDetails"></div><br>') +
         `<b>Target:</b> ${lastGeneratedRoute.requested_distance_miles} mi · ${lastGeneratedRoute.requested_gain_ft} ft<br>` +
         `<b>Diversity:</b> ${Math.round(Number(lastGeneratedRoute.route_diversity ?? routeDiversityInput.value))}/100<br>` +
         (lastGeneratedRoute.required_pass_points_count
-            ? `<b>Required pass-through points:</b> ${lastGeneratedRoute.required_pass_points_count}<br>`
+            ? `<b>Required routing points:</b> ${lastGeneratedRoute.required_pass_points_count}<br>`
             : "") +
+        (routeEditPoints.length ? `<b>Direct edit points:</b> ${routeEditPoints.length}<br>` : "") +
         (avoidSegments.length ? `<b>Avoided trail segments:</b> ${avoidSegments.length}<br>` : "") +
         (preferSegments.length ? `<b>Preferred trail segments:</b> ${preferSegments.length}<br>` : "");
 
@@ -9074,11 +9852,17 @@ function renderRouteResults(statusMessage = "Route search complete") {
     });
 
     const selected = getSelectedRouteOption();
-    if (selected) {
+    if (selected && routePassesQualityFilters(selected)) {
         renderSelectedRouteDetails(selected);
         document.querySelectorAll(".route-choice").forEach(button => {
             button.classList.toggle("selected", Number(button.dataset.routeIndex) === selectedRouteOptionIndex);
         });
+    }
+    const filterStatus = document.getElementById("qualityFilterStatus");
+    if (filterStatus) {
+        filterStatus.textContent = filters.enabled
+            ? `${visibleEntries.length} of ${options.length} route choices meet these limits.`
+            : "";
     }
 }
 
@@ -9198,6 +9982,9 @@ async function findMoreRoutes() {
 // Load only the TIFF-wide gray overlay on page load. Do not spend time
 // preparing the old default start: the first normal map click chooses the
 // user's start point, then Generate/Load prepares that start workspace.
+updateQualityFilterUi();
+renderRouteEditRows();
+resetPlannerHistory();
 loadMasterTrailOverlayOnce().catch(error => {
     console.warn("Trail overlay load failed:", error);
 });
