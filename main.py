@@ -51,8 +51,9 @@ MAX_CACHED_GRAPHS = 10
 GRAPH_CACHE = {}
 
 # One filtered OSM natural-trail graph covering the entire DEM/TIFF footprint.
-# Walkable roads are NOT stored TIFF-wide. V9 fetches only a few narrow
-# connector corridors on demand for long routes, which keeps Render memory low.
+# V14 keeps the runtime fully offline. Natural trails plus a sparse set of
+# useful prebuilt walking connectors are loaded from disk; normal requests never
+# contact OpenStreetMap/Overpass.
 MASTER_GRAPH = None
 MASTER_GRAPH_INFO = {}
 MASTER_GRAPH_LOCK = threading.Lock()
@@ -60,6 +61,16 @@ MASTER_GRAPH_GRAPHML_PATH = os.path.join(BASE_DIR, "master_trails.graphml")
 MASTER_GRAPH_PICKLE_PATH = os.path.join(BASE_DIR, "master_trails.pkl")
 # GraphML is the portable repository file. The pickle is an optional fast cache.
 MASTER_GRAPH_PATH = MASTER_GRAPH_GRAPHML_PATH
+
+# Prebuilt runtime routing graph: trail master + only the useful connector paths
+# selected during the one-time offline build. This is the production graph.
+MASTER_ROUTING_GRAPH = None
+MASTER_ROUTING_INFO = {}
+MASTER_ROUTING_LOCK = threading.Lock()
+MASTER_ROUTING_GRAPHML_PATH = os.path.join(BASE_DIR, "master_routing.graphml")
+MASTER_ROUTING_PICKLE_PATH = os.path.join(BASE_DIR, "master_routing.pkl")
+ROUTING_NETWORK_SCHEMA = "trail-plus-sparse-connectors-v14-offline"
+
 DEM_BOUNDS_WGS84_CACHE = None
 
 # Cache DEM values by rounded lat/lon. Graph construction already samples
@@ -68,7 +79,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-09-v13-big-loop-preference"
+APP_VERSION = "2026-08-09-v14-offline-connectors-fast-search"
 MASTER_NETWORK_SCHEMA = "trail-only-v11-offline-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -84,9 +95,8 @@ CONNECTOR_CHEAP_SCORE_WEIGHT = 90.0
 MAX_ROUTE_OPTIONS = 5
 MAX_ROUTE_SHARED_FRACTION = 0.80
 
-# V9 keeps the TIFF-wide master graph trail-only. For long routes it downloads
-# only a few narrow walkable-road corridors needed to bridge nearby disconnected
-# trail systems. This avoids holding the entire urban street network in memory.
+# V14 builds only a sparse connector backbone OFFLINE. It never stores the full
+# city street network, and normal route requests never make live connector calls.
 SELECTIVE_CONNECTORS_MIN_RADIUS_M = 8.0 * METERS_PER_MILE
 SELECTIVE_CONNECTOR_MAX_COUNT = 4
 SELECTIVE_CONNECTOR_MIN_COMPONENT_TRAIL_M = 250.0
@@ -95,7 +105,19 @@ SELECTIVE_CONNECTOR_ATTACH_MAX_M = 90.0
 SELECTIVE_CONNECTOR_CACHE = {}
 MAX_SELECTIVE_CONNECTOR_CACHE = 16
 
-# V12 separates the expensive routing-area preparation from distance/elevation
+# One-time sparse offline connector builder. These values intentionally keep the
+# stored routing graph small: only practical bridges between meaningful trail
+# components are saved, never the complete Phoenix street network.
+OFFLINE_CONNECTOR_MAX_COUNT = 28
+OFFLINE_CONNECTOR_NEIGHBORS_PER_COMPONENT = 8
+OFFLINE_CONNECTOR_MAX_GAP_M = 7000.0
+OFFLINE_CONNECTOR_MIN_COMPONENT_TRAIL_M = 250.0
+
+# Per-search baseline waypoint-leg cache. A cached unpenalized leg is reused when
+# it does not touch any edge already used by the current candidate loop.
+WAYPOINT_LEG_CACHE_MAX = 4096
+
+# V14 separates the start workspace from distance/elevation
 # targets. A workspace is keyed only by the requested start coordinate and
 # contains the TIFF-wide trail graph plus the small selective connector set.
 # Changing distance/gain reuses this workspace and only creates a cheap in-memory
@@ -109,7 +131,7 @@ WORKSPACE_CACHE_LOCK = threading.Lock()
 # it while distance/elevation targets change.
 MASTER_TRAIL_OVERLAY_JSON = None
 MASTER_TRAIL_OVERLAY_LOCK = threading.Lock()
-CONNECTOR_FILTER = '["highway"~"footway|pedestrian|cycleway|bridleway|residential|living_street|service|unclassified|tertiary|secondary|primary|road"]'
+CONNECTOR_FILTER = '["highway"~"path|track|steps|footway|pedestrian|cycleway|bridleway|residential|living_street|service|unclassified|tertiary|secondary|primary|road"]'
 
 
 # ============================================================
@@ -178,7 +200,7 @@ def get_route_profile(target_distance_miles: float):
             "anchor_counts": [2, 3, 3, 3],
             "min_anchor_distance_m": 150,
             "min_anchor_separation_m": 140,
-            "accurate_finalists": 24,
+            "accurate_finalists": 14,
             "candidate_pool_multiplier": 3,
         }
     if target_distance_miles < 15.0:
@@ -189,7 +211,7 @@ def get_route_profile(target_distance_miles: float):
             "anchor_counts": [3, 4, 4, 4],
             "min_anchor_distance_m": 300,
             "min_anchor_separation_m": 250,
-            "accurate_finalists": 24,
+            "accurate_finalists": 14,
             "candidate_pool_multiplier": 3,
         }
     return {
@@ -199,7 +221,7 @@ def get_route_profile(target_distance_miles: float):
         "anchor_counts": [4, 4, 5],
         "min_anchor_distance_m": 400,
         "min_anchor_separation_m": 300,
-        "accurate_finalists": 24,
+        "accurate_finalists": 14,
         "candidate_pool_multiplier": 3,
     }
 
@@ -1170,6 +1192,7 @@ def configure_osmnx_trail_tags():
 def master_graph_metadata(G, loaded_from_disk=False):
     physical = set()
     trail_physical = set()
+    connector_physical = set()
 
     for u, v, key, data in G.edges(keys=True, data=True):
         pk = (
@@ -1178,14 +1201,17 @@ def master_graph_metadata(G, loaded_from_disk=False):
             round(float(data.get("length", 0) or 0), 1),
         )
         physical.add(pk)
-        trail_physical.add(pk)
+        if str(data.get("route_class", "trail")) == "connector":
+            connector_physical.add(pk)
+        else:
+            trail_physical.add(pk)
 
     return {
         "nodes": int(G.number_of_nodes()),
         "edges": int(G.number_of_edges()),
         "physical_segments": len(physical),
         "trail_physical_segments": len(trail_physical),
-        "connector_physical_segments": 0,
+        "connector_physical_segments": len(connector_physical),
         "filtered_edges_removed": int(
             float(G.graph.get("master_filtered_edges_removed", 0) or 0)
         ),
@@ -1198,7 +1224,18 @@ def master_graph_metadata(G, loaded_from_disk=False):
         ),
         "bbox": get_dem_bounds_wgs84(),
         "saved_graph": os.path.basename(
-            str(G.graph.get("master_loaded_source", MASTER_GRAPH_PATH))
+            str(
+                G.graph.get(
+                    "master_loaded_source",
+                    G.graph.get("routing_loaded_source", MASTER_GRAPH_PATH),
+                )
+            )
+        ),
+        "offline_connector_count": int(
+            float(G.graph.get("offline_connector_count", 0) or 0)
+        ),
+        "offline_connector_path_meters": float(
+            G.graph.get("offline_connector_path_meters", 0.0) or 0.0
         ),
     }
 
@@ -1421,6 +1458,349 @@ def get_master_trail_graph():
         )
 
     return MASTER_GRAPH, MASTER_GRAPH_INFO
+
+
+
+
+def _validate_offline_routing_graph(G):
+    if G is None:
+        return False
+    if not isinstance(G, (nx.MultiDiGraph, nx.MultiGraph, nx.DiGraph, nx.Graph)):
+        return False
+    if str(G.graph.get("dem_signature", "")) != get_dem_signature():
+        return False
+    if str(G.graph.get("routing_network_schema", "")) != ROUTING_NETWORK_SCHEMA:
+        return False
+    if str(G.graph.get("master_elevation_precomputed", "0")) != "1":
+        return False
+    if not G.number_of_nodes() or not G.number_of_edges():
+        return False
+
+    # Trail heuristics must be baked into the offline file. Connector heuristic
+    # elevation may remain zero because finalists are still scored against the
+    # continuous 5 m DEM profile.
+    for _, _, _, data in G.edges(keys=True, data=True):
+        route_class = str(data.get("route_class", "trail"))
+        try:
+            float(data.get("length", 0) or 0)
+            float(data.get("routing_cost", edge_routing_cost(data)))
+            if route_class == "trail":
+                float(data["ascent_m"])
+                float(data["descent_m"])
+        except Exception:
+            return False
+    return True
+
+
+def _normalize_loaded_routing_graph(G):
+    """Normalize numeric edge attributes once when the runtime graph loads."""
+    for _, _, _, data in G.edges(keys=True, data=True):
+        data["length"] = float(data.get("length", 0) or 0)
+        data["ascent_m"] = float(data.get("ascent_m", 0) or 0)
+        data["descent_m"] = float(data.get("descent_m", 0) or 0)
+        data["elevation_sample_count"] = int(
+            float(data.get("elevation_sample_count", 0) or 0)
+        )
+        data["routing_cost"] = float(edge_routing_cost(data))
+    return G
+
+
+def try_load_saved_routing_graph():
+    """Load the sparse trail+connector production graph entirely from disk."""
+    if os.path.exists(MASTER_ROUTING_PICKLE_PATH):
+        try:
+            with open(MASTER_ROUTING_PICKLE_PATH, "rb") as f:
+                G = pickle.load(f)
+            if _validate_offline_routing_graph(G):
+                G = _normalize_loaded_routing_graph(G)
+                G.graph["routing_loaded_source"] = MASTER_ROUTING_PICKLE_PATH
+                G.graph["master_loaded_source"] = MASTER_ROUTING_PICKLE_PATH
+                return G
+        except Exception:
+            pass
+
+    if os.path.exists(MASTER_ROUTING_GRAPHML_PATH):
+        try:
+            G = ox.io.load_graphml(filepath=MASTER_ROUTING_GRAPHML_PATH)
+            if _validate_offline_routing_graph(G):
+                G = _normalize_loaded_routing_graph(G)
+                G.graph["routing_loaded_source"] = MASTER_ROUTING_GRAPHML_PATH
+                G.graph["master_loaded_source"] = MASTER_ROUTING_GRAPHML_PATH
+                # Best-effort local binary cache. Commit the GraphML; the pickle
+                # is optional because Python/library versions can invalidate it.
+                try:
+                    tmp = MASTER_ROUTING_PICKLE_PATH + ".tmp"
+                    with open(tmp, "wb") as f:
+                        pickle.dump(G, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    os.replace(tmp, MASTER_ROUTING_PICKLE_PATH)
+                except Exception:
+                    pass
+                return G
+        except Exception:
+            pass
+    return None
+
+
+def save_master_routing_graph(G):
+    try:
+        ox.io.save_graphml(G, filepath=MASTER_ROUTING_GRAPHML_PATH)
+    except Exception:
+        return False
+
+    tmp = MASTER_ROUTING_PICKLE_PATH + ".tmp"
+    try:
+        with open(tmp, "wb") as f:
+            pickle.dump(G, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp, MASTER_ROUTING_PICKLE_PATH)
+    except Exception:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+    return True
+
+
+def _component_centroid(G, nodes):
+    coords = [
+        (float(G.nodes[n]["y"]), float(G.nodes[n]["x"]))
+        for n in nodes
+        if n in G
+    ]
+    if not coords:
+        return None
+    arr = np.asarray(coords, dtype=float)
+    return float(arr[:, 0].mean()), float(arr[:, 1].mean())
+
+
+def _offline_connector_candidate_pairs(G, components, component_lengths):
+    """
+    Build a compact candidate list between meaningful trail components.
+
+    For small component counts we inspect every pair. For larger sets we use
+    centroid-nearest neighbors first, then calculate the true closest node pair
+    only for those candidates. This is one-time builder work, not request work.
+    """
+    useful = [
+        i for i, nodes in enumerate(components)
+        if component_lengths.get(i, 0.0) >= OFFLINE_CONNECTOR_MIN_COMPONENT_TRAIL_M
+    ]
+    if len(useful) < 2:
+        return []
+
+    pair_ids = set()
+    if len(useful) <= 40:
+        for ai in range(len(useful)):
+            for bi in range(ai + 1, len(useful)):
+                pair_ids.add((useful[ai], useful[bi]))
+    else:
+        centroids = []
+        centroid_ids = []
+        for i in useful:
+            c = _component_centroid(G, components[i])
+            if c is not None:
+                centroids.append(c)
+                centroid_ids.append(i)
+
+        if centroids:
+            radians = np.radians(np.asarray(centroids, dtype=float))
+            tree = BallTree(radians, metric="haversine")
+            k = min(
+                len(centroids),
+                OFFLINE_CONNECTOR_NEIGHBORS_PER_COMPONENT + 1,
+            )
+            _, indices = tree.query(radians, k=k)
+            for row, neighbors in enumerate(indices):
+                a = centroid_ids[row]
+                for idx in neighbors[1:]:
+                    b = centroid_ids[int(idx)]
+                    if a == b:
+                        continue
+                    pair_ids.add(tuple(sorted((a, b))))
+
+    rows = []
+    print(f"Evaluating {len(pair_ids)} possible sparse connector pairs...")
+    for count, (a, b) in enumerate(sorted(pair_ids), start=1):
+        pair = _closest_node_pair_same_graph(G, components[a], components[b])
+        if pair is None:
+            continue
+        source_hint, target_hint, gap_m = pair
+        if gap_m > OFFLINE_CONNECTOR_MAX_GAP_M:
+            continue
+
+        trail_bonus = 1.0 + min(
+            component_lengths.get(a, 0.0) + component_lengths.get(b, 0.0),
+            16000.0,
+        ) / 16000.0 * 0.35
+        score = float(gap_m) / trail_bonus
+        rows.append((score, float(gap_m), a, b, source_hint, target_hint))
+
+        if count % 100 == 0:
+            print(f"  checked {count}/{len(pair_ids)} component pairs")
+
+    rows.sort(key=lambda row: (row[0], row[1]))
+    return rows
+
+
+def build_master_routing_graph(rebuild_trails=False):
+    """
+    ONE-TIME V14 ROUTING BUILD.
+
+    Start from the compact natural-trail master and add only a sparse backbone
+    of useful real walkable connector paths. Each corridor is downloaded during
+    this one-time build, reduced immediately to one shortest connector path, and
+    then the surrounding street network is discarded.
+
+    Normal FastAPI requests never contact OpenStreetMap/Overpass.
+    """
+    configure_osmnx_trail_tags()
+
+    trail_G = None
+    if not rebuild_trails:
+        trail_G = try_load_saved_master_graph()
+    if trail_G is None:
+        print("Trail master missing/incompatible; rebuilding it first...")
+        trail_G = build_master_trail_graph()
+
+    G = trail_G.copy()
+    trail_base = trail_only_graph(G)
+    components = [set(c) for c in nx.connected_components(trail_base.to_undirected(as_view=True))]
+    component_lengths = {
+        i: _component_unique_trail_length(G, nodes)
+        for i, nodes in enumerate(components)
+    }
+
+    useful_count = sum(
+        1 for i in range(len(components))
+        if component_lengths.get(i, 0.0) >= OFFLINE_CONNECTOR_MIN_COMPONENT_TRAIL_M
+    )
+
+    print("Building sparse OFFLINE connector backbone...")
+    print(f"Trail components: {len(components)} total / {useful_count} useful")
+
+    candidate_rows = _offline_connector_candidate_pairs(
+        G,
+        components,
+        component_lengths,
+    )
+
+    union = nx.utils.UnionFind(range(len(components)))
+    connector_count = 0
+    connector_queries = 0
+    connector_path_meters = 0.0
+    errors = []
+
+    # Short useful bridges first. Kruskal-style union prevents redundant city
+    # connectors from accumulating once two trail systems are already joined.
+    for _, gap_m, a, b, source_hint, target_hint in candidate_rows:
+        if connector_count >= OFFLINE_CONNECTOR_MAX_COUNT:
+            break
+        if union[a] == union[b]:
+            continue
+
+        connector_queries += 1
+        print(
+            f"  connector query {connector_queries}: components {a}<->{b}, "
+            f"straight gap {gap_m:.0f} m"
+        )
+
+        result, error = _download_connector_corridor(
+            G,
+            components[a],
+            components[b],
+            source_hint,
+            target_hint,
+        )
+        if result is None:
+            if error:
+                errors.append(f"{a}<->{b}: {error}")
+                print(f"    skipped: {error}")
+            continue
+
+        copied = _merge_connector_path(G, result, connector_count + 1)
+        union.union(a, b)
+        connector_count += 1
+        connector_path_meters += float(copied)
+        print(f"    added {copied:.0f} m connector path")
+
+    # Make connector heuristic fields explicit so GraphML round trips cleanly.
+    for _, _, _, data in G.edges(keys=True, data=True):
+        if str(data.get("route_class", "trail")) == "connector":
+            data["ascent_m"] = float(data.get("ascent_m", 0) or 0)
+            data["descent_m"] = float(data.get("descent_m", 0) or 0)
+            data["elevation_sample_count"] = int(
+                float(data.get("elevation_sample_count", 0) or 0)
+            )
+            data["routing_cost"] = float(edge_routing_cost(data))
+
+    before = len(components)
+    after = nx.number_connected_components(G.to_undirected(as_view=True))
+
+    G.graph["dem_signature"] = get_dem_signature()
+    G.graph["master_network_schema"] = MASTER_NETWORK_SCHEMA
+    G.graph["master_elevation_precomputed"] = "1"
+    G.graph["routing_network_schema"] = ROUTING_NETWORK_SCHEMA
+    G.graph["routing_network_version"] = APP_VERSION
+    G.graph["offline_connectors_prebuilt"] = "1"
+    G.graph["offline_connector_count"] = int(connector_count)
+    G.graph["offline_connector_queries"] = int(connector_queries)
+    G.graph["offline_connector_path_meters"] = float(connector_path_meters)
+    G.graph["offline_components_before"] = int(before)
+    G.graph["offline_components_after"] = int(after)
+    G.graph["offline_connector_errors_json"] = json.dumps(errors[:50])
+
+    if not save_master_routing_graph(G):
+        raise RuntimeError(f"Could not save {MASTER_ROUTING_GRAPHML_PATH}")
+
+    graphml_mb = os.path.getsize(MASTER_ROUTING_GRAPHML_PATH) / (1024 * 1024)
+    print(f"Saved production routing graph: {MASTER_ROUTING_GRAPHML_PATH}")
+    print(f"Routing GraphML size: {graphml_mb:.2f} MB")
+    if os.path.exists(MASTER_ROUTING_PICKLE_PATH):
+        pickle_mb = os.path.getsize(MASTER_ROUTING_PICKLE_PATH) / (1024 * 1024)
+        print(f"Saved optional fast cache: {MASTER_ROUTING_PICKLE_PATH} ({pickle_mb:.2f} MB)")
+    print(
+        f"Offline connectors added: {connector_count}; "
+        f"selected connector mileage: {connector_path_meters / METERS_PER_MILE:.2f} mi"
+    )
+    print(
+        "Commit master_routing.graphml beside main.py. Normal Render requests "
+        "will make zero Overpass connector calls."
+    )
+    return G
+
+
+def get_master_routing_graph():
+    global MASTER_ROUTING_GRAPH, MASTER_ROUTING_INFO
+
+    if MASTER_ROUTING_GRAPH is not None:
+        return MASTER_ROUTING_GRAPH, MASTER_ROUTING_INFO
+
+    with MASTER_ROUTING_LOCK:
+        if MASTER_ROUTING_GRAPH is not None:
+            return MASTER_ROUTING_GRAPH, MASTER_ROUTING_INFO
+
+        G = try_load_saved_routing_graph()
+        if G is None:
+            reason = (
+                "Offline V14 routing graph is missing or incompatible. Put "
+                "master_routing.graphml beside main.py. Create it once with: "
+                "python main.py --build-routing"
+            )
+            raise HTTPException(status_code=503, detail=reason)
+
+        MASTER_ROUTING_GRAPH = G
+        MASTER_ROUTING_INFO = master_graph_metadata(G, loaded_from_disk=True)
+        MASTER_ROUTING_INFO["offline_components_before"] = int(
+            float(G.graph.get("offline_components_before", 0) or 0)
+        )
+        MASTER_ROUTING_INFO["offline_components_after"] = int(
+            float(G.graph.get("offline_components_after", 0) or 0)
+        )
+        MASTER_ROUTING_INFO["offline_connector_queries"] = int(
+            float(G.graph.get("offline_connector_queries", 0) or 0)
+        )
+
+    return MASTER_ROUTING_GRAPH, MASTER_ROUTING_INFO
 
 
 def extract_local_master_subgraph(master_G, lat, lon, radius_meters):
@@ -2109,7 +2489,7 @@ def workspace_cache_key(lat, lon):
         round(float(lat), 5),
         round(float(lon), 5),
         os.path.basename(DEM_PATH),
-        "start-workspace-v12",
+        "start-workspace-v14",
     )
 
 
@@ -2143,34 +2523,44 @@ def physical_trail_segment_count(G):
     return len(seen)
 
 
+def _vectorized_node_radial_distances(G, start_lat, start_lon):
+    """Fast haversine distances from one start to every graph node."""
+    nodes = list(G.nodes)
+    if not nodes:
+        return {}
+
+    lats = np.fromiter(
+        (float(G.nodes[n]["y"]) for n in nodes),
+        dtype=float,
+        count=len(nodes),
+    )
+    lons = np.fromiter(
+        (float(G.nodes[n]["x"]) for n in nodes),
+        dtype=float,
+        count=len(nodes),
+    )
+
+    phi1 = math.radians(float(start_lat))
+    lam1 = math.radians(float(start_lon))
+    phi2 = np.radians(lats)
+    lam2 = np.radians(lons)
+    dphi = phi2 - phi1
+    dlam = lam2 - lam1
+    a = np.sin(dphi / 2.0) ** 2 + np.cos(phi1) * np.cos(phi2) * np.sin(dlam / 2.0) ** 2
+    a = np.clip(a, 0.0, 1.0)
+    distances = 6371000.0 * 2.0 * np.arctan2(np.sqrt(a), np.sqrt(1.0 - a))
+    return {node: float(distance) for node, distance in zip(nodes, distances)}
+
+
 def finalize_workspace_graph(G, start_node, start_lat, start_lon):
     """
-    Prepare routing metadata once for a start-specific workspace.
+    Prepare only start-specific metadata.
 
-    Natural-trail elevation heuristics are already baked into the offline
-    master. Connector heuristics remain cheap here; authoritative route gain is
-    still measured from the full 5 m DEM profile for finalists.
+    V14 normalizes the production routing graph once at load time, so we no
+    longer walk every edge on every new start. Only the newly split exact-start
+    edges need any defaults, and those inherit their source edge attributes.
     """
-    for u, v, key, data in G.edges(keys=True, data=True):
-        data["ascent_m"] = float(data.get("ascent_m", 0) or 0)
-        data["descent_m"] = float(data.get("descent_m", 0) or 0)
-        data["elevation_sample_count"] = int(
-            float(data.get("elevation_sample_count", 0) or 0)
-        )
-        data["routing_cost"] = float(edge_routing_cost(data))
-
-    radial = {}
-    for node, data in G.nodes(data=True):
-        try:
-            radial[node] = haversine_meters(
-                float(start_lat),
-                float(start_lon),
-                float(data["y"]),
-                float(data["x"]),
-            )
-        except Exception:
-            radial[node] = float("inf")
-
+    radial = _vectorized_node_radial_distances(G, start_lat, start_lon)
     radial[start_node] = 0.0
 
     try:
@@ -2184,8 +2574,7 @@ def finalize_workspace_graph(G, start_node, start_lat, start_lon):
         reachable = {start_node}
 
     routeable_edges = sum(
-        1
-        for u, v in G.edges()
+        1 for u, v in G.edges()
         if u in reachable and v in reachable
     )
 
@@ -2198,11 +2587,13 @@ def finalize_workspace_graph(G, start_node, start_lat, start_lon):
 
 def get_start_workspace(lat, lon, force_rebuild=False):
     """
-    Build/load the expensive routing workspace keyed ONLY by start coordinate.
+    Build/load a start-specific workspace with ZERO live OSM calls.
 
-    Distance and elevation are intentionally absent from the key. The workspace
-    contains the entire offline TIFF trail graph plus the small selective
-    connector set, so target changes never trigger OSM/connector preparation.
+    The expensive trail/connector discovery was moved into master_routing.graphml
+    during the one-time V14 build. A new start now only:
+      1) loads/reuses the in-memory production graph,
+      2) inserts the exact start point (one graph copy, not two),
+      3) computes vectorized radial distances and connectivity.
     """
     if not point_inside_dem(lat, lon):
         left, bottom, right, top = get_dem_bounds_wgs84()
@@ -2225,28 +2616,13 @@ def get_start_workspace(lat, lon, force_rebuild=False):
             return WORKSPACE_CACHE[key], True
 
         started = time.perf_counter()
-        master_G, master_info = get_master_trail_graph()
-
+        routing_G, routing_info = get_master_routing_graph()
         max_radius_m = workspace_max_radius_meters(lat, lon)
 
-        # add_selective_connectors only considers target systems out to ~55% of
-        # its radius. Doubling the TIFF-covering radius makes every trail system
-        # in the TIFF eligible during this one start-specific preparation pass.
-        connector_radius_m = max(
-            SELECTIVE_CONNECTORS_MIN_RADIUS_M,
-            max_radius_m * 2.0,
-        )
-
-        G, connector_stats = add_selective_connectors(
-            master_G,
-            float(lat),
-            float(lon),
-            connector_radius_m,
-        )
-
-        # Insert/split the exact requested start only once per workspace.
+        # insert_exact_routing_point performs the single required graph copy so
+        # the shared production graph remains immutable between users/starts.
         G, start_node, start_info = insert_exact_routing_point(
-            G,
+            routing_G,
             float(lat),
             float(lon),
         )
@@ -2259,6 +2635,16 @@ def get_start_workspace(lat, lon, force_rebuild=False):
         )
 
         build_seconds = time.perf_counter() - started
+        connector_stats = {
+            "attempted": False,
+            "offline": True,
+            "components_before": int(routing_info.get("offline_components_before", 0) or 0),
+            "components_after": int(routing_info.get("offline_components_after", 0) or 0),
+            "connectors_added": int(routing_info.get("offline_connector_count", 0) or 0),
+            "connector_queries": 0,
+            "connector_path_meters": float(routing_info.get("offline_connector_path_meters", 0.0) or 0.0),
+            "errors": [],
+        }
 
         G.graph["selective_connector_stats"] = connector_stats
         G.graph["workspace_start_node"] = start_node
@@ -2266,11 +2652,11 @@ def get_start_workspace(lat, lon, force_rebuild=False):
         G.graph["workspace_start_lat"] = float(lat)
         G.graph["workspace_start_lon"] = float(lon)
         G.graph["workspace_max_radius_m"] = float(max_radius_m)
-        G.graph["workspace_connector_radius_m"] = float(connector_radius_m)
+        G.graph["workspace_connector_radius_m"] = float(max_radius_m)
         G.graph["workspace_build_seconds"] = float(build_seconds)
-        G.graph["workspace_master_file"] = master_info.get(
+        G.graph["workspace_master_file"] = routing_info.get(
             "saved_graph",
-            os.path.basename(MASTER_GRAPH_PATH),
+            os.path.basename(MASTER_ROUTING_GRAPHML_PATH),
         )
 
         workspace = {
@@ -2278,10 +2664,10 @@ def get_start_workspace(lat, lon, force_rebuild=False):
             "start_node": start_node,
             "start_info": dict(start_info),
             "max_radius_m": float(max_radius_m),
-            "connector_radius_m": float(connector_radius_m),
+            "connector_radius_m": float(max_radius_m),
             "build_seconds": float(build_seconds),
-            "filtered_edges_removed": master_info["filtered_edges_removed"],
-            "master_info": master_info,
+            "filtered_edges_removed": routing_info["filtered_edges_removed"],
+            "master_info": routing_info,
         }
 
         if force_rebuild:
@@ -2293,6 +2679,7 @@ def get_start_workspace(lat, lon, force_rebuild=False):
 
         WORKSPACE_CACHE[key] = workspace
         return workspace, False
+
 
 
 def extract_route_graph_from_workspace(workspace, radius_meters):
@@ -2399,7 +2786,7 @@ def get_master_trail_overlay_json():
         if MASTER_TRAIL_OVERLAY_JSON is not None:
             return MASTER_TRAIL_OVERLAY_JSON
 
-        master_G, master_info = get_master_trail_graph()
+        master_G, master_info = get_master_routing_graph()
         segments = graph_debug_segments(master_G)
         payload = {
             "allowed_trails": segments,
@@ -2408,7 +2795,7 @@ def get_master_trail_overlay_json():
             "master_network_edges": master_info["edges"],
             "master_graph_file": master_info.get(
                 "saved_graph",
-                os.path.basename(MASTER_GRAPH_PATH),
+                os.path.basename(MASTER_ROUTING_GRAPHML_PATH),
             ),
             "master_tiff": os.path.basename(DEM_PATH),
             "version": APP_VERSION,
@@ -3581,12 +3968,32 @@ def diversify_closed_candidates(
 # WAYPOINT SEARCH FOR 4+ MILE ROUTES
 # ============================================================
 
-def waypoint_path(S, source, target, used_edges):
-    def weight(u, v, data):
-        cost = float(data.get("routing_cost", data.get("length", 1.0)))
-        if undirected_edge_key(u, v) in used_edges:
-            cost *= 40.0
-        return cost
+def _route_edge_key_set(path):
+    return {
+        undirected_edge_key(path[i], path[i + 1])
+        for i in range(len(path) - 1)
+    }
+
+
+def waypoint_path(S, source, target, used_edges, leg_cache=None, cache_stats=None):
+    """
+    A* leg with a safe baseline-path cache.
+
+    The cached path is an ordinary shortest path. It is reused only when none
+    of its physical edges have already been used by this candidate loop. If it
+    would overlap, V14 falls back to the original 40x repeat-penalized A*.
+    """
+    key = (source, target)
+    if leg_cache is not None:
+        cached = leg_cache.get(key)
+        if cached is not None:
+            cached_path, cached_edges = cached
+            if not used_edges.intersection(cached_edges):
+                if cache_stats is not None:
+                    cache_stats["hits"] = cache_stats.get("hits", 0) + 1
+                return list(cached_path)
+            if cache_stats is not None:
+                cache_stats["blocked"] = cache_stats.get("blocked", 0) + 1
 
     def heuristic(a, b):
         try:
@@ -3599,13 +4006,38 @@ def waypoint_path(S, source, target, used_edges):
         except Exception:
             return 0.0
 
-    return nx.astar_path(
+    # With no used edges, this is a baseline path and is safe to cache.
+    if not used_edges:
+        path = nx.astar_path(
+            S,
+            source,
+            target,
+            heuristic=heuristic,
+            weight="routing_cost",
+        )
+        if leg_cache is not None and len(leg_cache) < WAYPOINT_LEG_CACHE_MAX:
+            leg_cache[key] = (tuple(path), _route_edge_key_set(path))
+        if cache_stats is not None:
+            cache_stats["misses"] = cache_stats.get("misses", 0) + 1
+        return path
+
+    def weight(u, v, data):
+        cost = float(data.get("routing_cost", data.get("length", 1.0)))
+        if undirected_edge_key(u, v) in used_edges:
+            cost *= 40.0
+        return cost
+
+    path = nx.astar_path(
         S,
         source,
         target,
         heuristic=heuristic,
         weight=weight,
     )
+    if cache_stats is not None:
+        cache_stats["penalized_searches"] = cache_stats.get("penalized_searches", 0) + 1
+    return path
+
 
 
 def cheap_waypoint_score(
@@ -3766,6 +4198,46 @@ def generate_waypoint_loop(
     pool_multiplier = int(profile.get("candidate_pool_multiplier", 3))
     pool_limit = max(accurate_finalists, accurate_finalists * pool_multiplier)
 
+    # V14: one static shortest-path tree from the start replaces hundreds of
+    # repeated start->first-anchor A* calls. Additional baseline legs are cached
+    # lazily and reused only when they do not overlap already-used loop edges.
+    leg_cache = {}
+    leg_cache_stats = {"hits": 0, "misses": 0, "blocked": 0, "penalized_searches": 0}
+    try:
+        _, start_paths = nx.single_source_dijkstra(
+            S,
+            start_node,
+            weight="routing_cost",
+        )
+        reverse_S = S.reverse(copy=False)
+        _, reverse_start_paths = nx.single_source_dijkstra(
+            reverse_S,
+            start_node,
+            weight="routing_cost",
+        )
+        for node in candidates:
+            if len(leg_cache) >= WAYPOINT_LEG_CACHE_MAX:
+                break
+
+            path = start_paths.get(node)
+            if path and len(path) >= 2:
+                path_tuple = tuple(path)
+                leg_cache[(start_node, node)] = (
+                    path_tuple,
+                    _route_edge_key_set(path_tuple),
+                )
+
+            reverse_path = reverse_start_paths.get(node)
+            if reverse_path and len(reverse_path) >= 2:
+                # reverse graph path start->node becomes original node->start
+                to_start = tuple(reversed(reverse_path))
+                leg_cache[(node, start_node)] = (
+                    to_start,
+                    _route_edge_key_set(to_start),
+                )
+    except Exception:
+        pass
+
     exploratory = []
     seen_routes = set()
 
@@ -3820,6 +4292,8 @@ def generate_waypoint_loop(
                     current,
                     destination,
                     used_edges,
+                    leg_cache=leg_cache,
+                    cache_stats=leg_cache_stats,
                 )
             except nx.NetworkXNoPath:
                 failed = True
@@ -3931,6 +4405,8 @@ def generate_waypoint_loop(
         metrics["waypoint_unique_candidates"] = len(exploratory)
         metrics["waypoint_accurate_finalists"] = accurately_scored
         metrics["waypoint_cheap_score"] = cheap_score
+        metrics["waypoint_leg_cache_hits"] = int(leg_cache_stats.get("hits", 0))
+        metrics["waypoint_penalized_searches"] = int(leg_cache_stats.get("penalized_searches", 0))
 
         if score < best_any_score:
             best_any_score = score
@@ -4886,7 +5362,7 @@ def trail_network(request: TrailNetworkRequest):
             "routeable_component_edges": int(float(G.graph.get("routeable_component_edges", 0) or 0)),
             "master_loaded_from_disk": master_info["loaded_from_disk"],
             "master_elevation_precomputed": master_info.get("elevation_precomputed", False),
-            "master_graph_file": master_info.get("saved_graph", os.path.basename(MASTER_GRAPH_PATH)),
+            "master_graph_file": master_info.get("saved_graph", os.path.basename(MASTER_ROUTING_GRAPHML_PATH)),
             "request_edge_dem_samples": 0,
             "master_tiff": os.path.basename(DEM_PATH),
             "search_radius_m": profile["search_radius_m"],
@@ -5424,7 +5900,7 @@ button:disabled {
 <div id="controls">
 
 <h2>Trail Running Creator</h2>
-<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-v12-start-workspace-overlay-cache</div>
+<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-v14-offline-connectors-fast-search</div>
 
 <div class="input-row">
     <div class="input-group">
@@ -5970,9 +6446,9 @@ async function loadTrailNetwork(data) {
         " → " +
         result.trail_components_after +
         "<br>" +
-        "<b>Selective connectors:</b> " +
+        "<b>Offline connectors:</b> " +
         result.selective_connectors_added +
-        " added (" + result.selective_connector_queries + " corridor queries)<br>" +
+        " prebuilt (" + result.selective_connector_queries + " live queries)<br>" +
         "<b>Routeable component:</b> " +
         result.routeable_component_nodes +
         " nodes / " + result.routeable_component_edges + " edges<br>" +
@@ -6382,19 +6858,33 @@ reloadNetwork();
 
 
 # ============================================================
-# ONE-TIME OFFLINE MASTER BUILD CLI
+# ONE-TIME OFFLINE BUILD CLI
 # ============================================================
 
 if __name__ == "__main__":
     if "--build-master" in sys.argv:
         try:
+            # Full rebuild: natural trail master first, then the sparse offline
+            # connector production graph.
             build_master_trail_graph()
+            build_master_routing_graph(rebuild_trails=False)
         except Exception as exc:
-            print(f"MASTER BUILD FAILED: {exc}", file=sys.stderr)
+            print(f"MASTER/ROUTING BUILD FAILED: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+        raise SystemExit(0)
+
+    if "--build-routing" in sys.argv:
+        try:
+            # Fast path when master_trails.graphml already exists.
+            build_master_routing_graph(rebuild_trails=False)
+        except Exception as exc:
+            print(f"ROUTING BUILD FAILED: {exc}", file=sys.stderr)
             raise SystemExit(1)
         raise SystemExit(0)
 
     print(
-        "This file is the FastAPI app. Start it with uvicorn, or create the "
-        "offline master graph with: python main.py --build-master"
+        "This file is the FastAPI app. Start it with uvicorn. To build only the "
+        "V14 sparse offline routing graph from an existing master_trails.graphml, "
+        "run: python main.py --build-routing. For a full rebuild, run: "
+        "python main.py --build-master"
     )
