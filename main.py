@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Query
 from fastapi.responses import HTMLResponse, Response
 from fastapi.middleware.gzip import GZipMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 import math
 import os
@@ -83,7 +83,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-09-v15-local-pbf-zero-overpass"
+APP_VERSION = "2026-08-09-v16-required-pass-through"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -121,6 +121,15 @@ OFFLINE_CONNECTOR_MIN_COMPONENT_TRAIL_M = 250.0
 # it does not touch any edge already used by the current candidate loop.
 WAYPOINT_LEG_CACHE_MAX = 4096
 
+# V16 required pass-through zones. A user point is not treated as an off-trail
+# routing coordinate: it is snapped to a natural trail inside the tolerance,
+# then every returned route must pass through at least one natural-trail
+# candidate inside that zone. Multiple points are supported.
+DEFAULT_PASS_THROUGH_TOLERANCE_MILES = 0.25
+MAX_REQUIRED_PASS_POINTS = 5
+PASS_POINT_CANDIDATES_PER_ZONE = 18
+
+
 # V15 separates the start workspace from distance/elevation
 # targets. A workspace is keyed only by the requested start coordinate and
 # contains the TIFF-wide trail graph plus the small selective connector set.
@@ -142,6 +151,12 @@ CONNECTOR_FILTER = '["highway"~"path|track|steps|footway|pedestrian|cycleway|bri
 # REQUEST MODELS
 # ============================================================
 
+class RequiredPassPoint(BaseModel):
+    lat: float
+    lon: float
+    tolerance_miles: float = DEFAULT_PASS_THROUGH_TOLERANCE_MILES
+
+
 class RouteRequest(BaseModel):
     start_lat: float
     start_lon: float
@@ -149,6 +164,7 @@ class RouteRequest(BaseModel):
     end_lon: float
     target_distance_miles: float
     target_gain_ft: float
+    pass_points: list[RequiredPassPoint] = Field(default_factory=list)
 
 
 class TrailNetworkRequest(BaseModel):
@@ -750,6 +766,281 @@ def insert_exact_routing_point(G, lat, lon):
         "source_edge": [int(u), int(v), str(key)],
         "split_directed_pieces": split_count,
     }
+
+
+# ============================================================
+# REQUIRED PASS-THROUGH POINTS
+# ============================================================
+
+def _next_virtual_node_id(G):
+    node = -1
+    while node in G:
+        node -= 1
+    return node
+
+
+def insert_required_pass_point(G, lat, lon, tolerance_meters):
+    """
+    Snap a required user marker to the nearest NATURAL trail inside its
+    tolerance and insert a temporary routing node on that trail.
+
+    Unlike the exact start, the temporary node is placed on the projected
+    trail position rather than at the user's possibly off-trail coordinate.
+    This guarantees that the suggested route stays on the trail while still
+    satisfying the user's pass-near requirement.
+    """
+    lat = float(lat)
+    lon = float(lon)
+    tolerance_meters = float(tolerance_meters)
+
+    if tolerance_meters <= 0:
+        raise HTTPException(status_code=400, detail="Pass-through tolerance must be greater than 0.")
+
+    snap_graph = trail_only_graph(G)
+    if snap_graph.number_of_edges() == 0:
+        raise HTTPException(status_code=400, detail="No natural trails are available near the required pass-through point.")
+
+    projected = ox.projection.project_graph(snap_graph)
+    projected_crs = projected.graph.get("crs")
+    if projected_crs is None:
+        raise HTTPException(status_code=500, detail="Could not project trail graph for required pass-through point.")
+
+    transformer = Transformer.from_crs("EPSG:4326", projected_crs, always_xy=True)
+    x, y = transformer.transform(lon, lat)
+
+    edge_id, edge_distance_m = ox.distance.nearest_edges(
+        projected, X=float(x), Y=float(y), return_dist=True
+    )
+    values = list(edge_id) if not isinstance(edge_id, tuple) else list(edge_id)
+    if len(values) < 3:
+        raise HTTPException(status_code=500, detail="Nearest trail edge returned an invalid identifier for pass-through point.")
+
+    u, v, key = values[:3]
+    edge_distance_m = float(np.atleast_1d(edge_distance_m)[0])
+    if edge_distance_m > tolerance_meters:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Required pass-through point is {edge_distance_m:.0f} m from the nearest natural trail, "
+                f"outside its {tolerance_meters:.0f} m tolerance."
+            ),
+        )
+
+    selected_data = G.get_edge_data(u, v, key)
+    if selected_data is None:
+        selected_data = get_shortest_edge(G, u, v)
+    if selected_data is None:
+        raise HTTPException(status_code=500, detail="Could not read nearest trail edge for pass-through point.")
+
+    selected_coords = oriented_edge_coords(G, u, v, selected_data)
+    nearest = nearest_position_on_polyline(selected_coords, lon, lat)
+    if nearest is None:
+        raise HTTPException(status_code=500, detail="Could not project required pass-through point onto trail geometry.")
+
+    split_lon = float(nearest["projected_lon"])
+    split_lat = float(nearest["projected_lat"])
+
+    # If projection lands almost exactly at an existing endpoint, reuse it.
+    endpoint_candidates = []
+    for endpoint in (u, v):
+        d = haversine_meters(
+            split_lat, split_lon,
+            float(G.nodes[endpoint]["y"]), float(G.nodes[endpoint]["x"]),
+        )
+        endpoint_candidates.append((d, endpoint))
+    endpoint_candidates.sort(key=lambda item: item[0])
+    if endpoint_candidates and endpoint_candidates[0][0] <= 1.0:
+        node = endpoint_candidates[0][1]
+        return G, node, {
+            "requested_lat": lat,
+            "requested_lon": lon,
+            "routing_lat": float(G.nodes[node]["y"]),
+            "routing_lon": float(G.nodes[node]["x"]),
+            "trail_offset_m": round(edge_distance_m, 2),
+            "tolerance_m": float(tolerance_meters),
+            "virtual_inserted": False,
+            "source_edge": [int(u), int(v), str(key)],
+        }
+
+    H = G.copy()
+    virtual_node = _next_virtual_node_id(H)
+    elevation = elevations_for_coords([(split_lon, split_lat)])[0]
+    H.add_node(
+        virtual_node,
+        x=split_lon,
+        y=split_lat,
+        elevation=float(elevation),
+        virtual_pass_point=True,
+    )
+
+    candidates = []
+    for a, b in [(u, v), (v, u)]:
+        edge_dict = G.get_edge_data(a, b) or {}
+        for candidate_key, data in edge_dict.items():
+            if str(data.get("route_class", "trail")) != "trail":
+                continue
+            coords = oriented_edge_coords(G, a, b, data)
+            position = nearest_position_on_polyline(coords, split_lon, split_lat)
+            if position is None:
+                continue
+            if position["distance_m"] <= 1.5:
+                candidates.append((a, b, candidate_key, data, coords, position))
+
+    if not candidates:
+        candidates.append((u, v, key, selected_data, selected_coords, nearest))
+
+    split_count = 0
+    for a, b, candidate_key, data, coords, position in candidates:
+        if H.has_edge(a, b, candidate_key):
+            H.remove_edge(a, b, candidate_key)
+
+        left, right = split_polyline_at_position(
+            coords,
+            position["segment_index"],
+            position["t"],
+            split_lon,
+            split_lat,
+        )
+
+        if polyline_distance_meters(left) > 0.25:
+            H.add_edge(a, virtual_node, key=candidate_key, **edge_attributes_for_split_part(data, left))
+            split_count += 1
+        if polyline_distance_meters(right) > 0.25:
+            H.add_edge(virtual_node, b, key=candidate_key, **edge_attributes_for_split_part(data, right))
+            split_count += 1
+
+    if H.degree(virtual_node) == 0:
+        H.remove_node(virtual_node)
+        raise HTTPException(status_code=500, detail="Could not insert required pass-through point on the trail graph.")
+
+    return H, virtual_node, {
+        "requested_lat": lat,
+        "requested_lon": lon,
+        "routing_lat": split_lat,
+        "routing_lon": split_lon,
+        "trail_offset_m": round(edge_distance_m, 2),
+        "tolerance_m": float(tolerance_meters),
+        "virtual_inserted": True,
+        "source_edge": [int(u), int(v), str(key)],
+        "split_directed_pieces": split_count,
+    }
+
+
+def resolve_required_pass_points(G, pass_points):
+    """Insert required zones and build small candidate-node sets for each."""
+    pass_points = list(pass_points or [])
+    if len(pass_points) > MAX_REQUIRED_PASS_POINTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A maximum of {MAX_REQUIRED_PASS_POINTS} required pass-through points is supported.",
+        )
+
+    H = G
+    resolved = []
+
+    for index, point in enumerate(pass_points):
+        lat = float(point.lat)
+        lon = float(point.lon)
+        tolerance_miles = float(point.tolerance_miles)
+        if not math.isfinite(lat) or not math.isfinite(lon):
+            raise HTTPException(status_code=400, detail=f"Pass-through point {index + 1} has invalid coordinates.")
+        if tolerance_miles <= 0 or tolerance_miles > 5.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Pass-through point {index + 1} tolerance must be between 0 and 5 miles.",
+            )
+
+        tolerance_m = tolerance_miles * METERS_PER_MILE
+        H, primary_node, info = insert_required_pass_point(H, lat, lon, tolerance_m)
+        info["index"] = index
+        info["tolerance_miles"] = tolerance_miles
+        info["primary_node"] = primary_node
+        resolved.append(info)
+
+    if not resolved:
+        return H, []
+
+    # Candidate alternatives let the search use any natural trail inside the
+    # zone, rather than forcing only the single closest trail segment.
+    trail_nodes = set()
+    for u, v, data in H.edges(data=True):
+        if str(data.get("route_class", "trail")) == "trail":
+            trail_nodes.add(u)
+            trail_nodes.add(v)
+
+    for info in resolved:
+        nearby = []
+        for node in trail_nodes:
+            d = haversine_meters(
+                info["requested_lat"], info["requested_lon"],
+                float(H.nodes[node]["y"]), float(H.nodes[node]["x"]),
+            )
+            if d <= info["tolerance_m"] + 0.5:
+                nearby.append((float(d), node))
+
+        # The projected primary node should always be present, but explicitly
+        # include it in case numerical filtering omitted it.
+        primary = info["primary_node"]
+        primary_distance = haversine_meters(
+            info["requested_lat"], info["requested_lon"],
+            float(H.nodes[primary]["y"]), float(H.nodes[primary]["x"]),
+        )
+        nearby.append((float(primary_distance), primary))
+
+        best_by_node = {}
+        for d, node in nearby:
+            if node not in best_by_node or d < best_by_node[node]:
+                best_by_node[node] = d
+        nearby = sorted((d, node) for node, d in best_by_node.items())
+        nearby = nearby[:PASS_POINT_CANDIDATES_PER_ZONE]
+
+        info["candidate_nodes"] = [node for _, node in nearby]
+        info["candidate_offsets_m"] = [round(d, 1) for d, _ in nearby]
+
+    return H, resolved
+
+
+def required_pass_metrics_for_coords(coords, required_pass_points):
+    if not required_pass_points:
+        return []
+    lonlat = [(float(p["lon"]), float(p["lat"])) for p in coords]
+    result = []
+    for info in required_pass_points:
+        nearest = nearest_position_on_polyline(
+            lonlat, info["requested_lon"], info["requested_lat"]
+        )
+        distance_m = float(nearest["distance_m"]) if nearest else float("inf")
+        result.append({
+            "index": int(info["index"]),
+            "requested_lat": float(info["requested_lat"]),
+            "requested_lon": float(info["requested_lon"]),
+            "tolerance_miles": round(float(info["tolerance_miles"]), 3),
+            "tolerance_m": round(float(info["tolerance_m"]), 1),
+            "nearest_route_distance_m": round(distance_m, 1),
+            "nearest_route_distance_miles": round(distance_m / METERS_PER_MILE, 3),
+            "satisfied": bool(distance_m <= float(info["tolerance_m"]) + 2.0),
+            "snapped_trail_lat": float(info["routing_lat"]),
+            "snapped_trail_lon": float(info["routing_lon"]),
+            "marker_to_nearest_trail_m": round(float(info["trail_offset_m"]), 1),
+        })
+    return result
+
+
+def required_waypoint_profile(profile, target_distance_miles):
+    """Give sub-4-mile constrained routes a waypoint-search profile."""
+    if "attempts" in profile:
+        return dict(profile)
+    return {
+        "name": "short-required-waypoint",
+        "search_radius_m": profile["search_radius_m"],
+        "attempts": 1000,
+        "anchor_counts": [1, 2, 2, 3],
+        "min_anchor_distance_m": 60,
+        "min_anchor_separation_m": 70,
+        "accurate_finalists": 14,
+        "candidate_pool_multiplier": 3,
+    }
+
 
 
 # ============================================================
@@ -3589,6 +3880,7 @@ def build_route_option_payload(
         "partial_edge_used": bool(metrics.get("partial_edge_used", False)),
         "partial_added_distance_miles": round(metrics.get("partial_added_distance_meters", 0.0) / METERS_PER_MILE, 3),
         "partial_outward_distance_meters": round(metrics.get("partial_outward_distance_meters", 0.0), 1),
+        "required_pass_points": metrics.get("required_pass_points", []),
     }
 
 
@@ -4355,6 +4647,7 @@ def generate_waypoint_loop(
     target_gain_meters,
     profile,
     limits,
+    required_pass_points=None,
 ):
     """
     Two-stage waypoint search for 4+ mile loops.
@@ -4392,6 +4685,17 @@ def generate_waypoint_loop(
         )
     )
 
+    required_pass_points = list(required_pass_points or [])
+    required_groups = []
+    for info in required_pass_points:
+        group = [node for node in info.get("candidate_nodes", []) if node in reachable_nodes and node in S]
+        if not group:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Required pass-through point {int(info.get('index', 0)) + 1} is near a trail, but that trail is not reachable from the selected start.",
+            )
+        required_groups.append(group)
+
     trail_nodes = set()
     for u, v, data in G.edges(data=True):
         if str(data.get("route_class", "trail")) == "trail":
@@ -4417,10 +4721,12 @@ def generate_waypoint_loop(
         ):
             candidates.append(node)
 
-    if len(candidates) < max(profile["anchor_counts"]):
+    max_total_anchors = max(profile["anchor_counts"])
+    max_optional_anchors = max(0, max_total_anchors - len(required_groups))
+    if len(candidates) < max_optional_anchors:
         raise HTTPException(
             status_code=400,
-            detail="Not enough trail junctions for this route.",
+            detail="Not enough trail junctions for this route and its required pass-through points.",
         )
 
     accurate_finalists = int(profile.get("accurate_finalists", 40))
@@ -4471,32 +4777,47 @@ def generate_waypoint_loop(
     seen_routes = set()
 
     for _ in range(profile["attempts"]):
-        anchor_count = random.choice(profile["anchor_counts"])
-        anchors = random.sample(candidates, anchor_count)
+        desired_anchor_count = random.choice(profile["anchor_counts"])
 
-        spacing_bad = False
+        # Pick one allowed trail node from every required pass-through zone.
+        required_anchors = []
+        for group in required_groups:
+            # Prefer candidates closest to the user's marker while occasionally
+            # exploring the rest of the accepted zone for route diversity.
+            close_pool = group[: min(6, len(group))]
+            pool = close_pool if random.random() < 0.8 else group
+            required_anchors.append(random.choice(pool))
 
-        for i in range(len(anchors)):
-            for j in range(i + 1, len(anchors)):
-                a = anchors[i]
-                b = anchors[j]
+        # Remove duplicate required nodes (e.g. overlapping pass-through zones).
+        required_anchors = list(dict.fromkeys(required_anchors))
+        optional_count = max(0, desired_anchor_count - len(required_anchors))
 
+        available = [node for node in candidates if node not in required_anchors]
+        random.shuffle(available)
+        optional_anchors = []
+        for candidate in available:
+            if len(optional_anchors) >= optional_count:
+                break
+            # Keep optional anchors geographically separated. Required points are
+            # hard constraints and are never rejected for being close together.
+            spacing_bad = False
+            for existing in optional_anchors + required_anchors:
                 separation = haversine_meters(
-                    float(G.nodes[a]["y"]),
-                    float(G.nodes[a]["x"]),
-                    float(G.nodes[b]["y"]),
-                    float(G.nodes[b]["x"]),
+                    float(G.nodes[candidate]["y"]),
+                    float(G.nodes[candidate]["x"]),
+                    float(G.nodes[existing]["y"]),
+                    float(G.nodes[existing]["x"]),
                 )
-
                 if separation < profile["min_anchor_separation_m"]:
                     spacing_bad = True
                     break
+            if not spacing_bad:
+                optional_anchors.append(candidate)
 
-            if spacing_bad:
-                break
-
-        if spacing_bad:
+        if len(optional_anchors) < optional_count:
             continue
+
+        anchors = required_anchors + optional_anchors
 
         anchors.sort(
             key=lambda node: node_angle_from_start(
@@ -4628,6 +4949,15 @@ def generate_waypoint_loop(
         accurately_scored += 1
 
         if not metrics:
+            continue
+
+        pass_metrics = required_pass_metrics_for_coords(
+            metrics.get("route_coordinates", []),
+            required_pass_points,
+        )
+        metrics["required_pass_points"] = pass_metrics
+        if pass_metrics and not all(item.get("satisfied") for item in pass_metrics):
+            # Hard requirement: numerical target quality never overrides a missed zone.
             continue
 
         metrics["waypoint_attempts"] = profile["attempts"]
@@ -5764,8 +6094,37 @@ def generate_route(request: RouteRequest):
         snapped_start_lon = float(G.nodes[start_node]["x"])
         snap_distance_m = float(start_info["routing_offset_m"])
 
+        # V16: pass-through markers are snapped to nearby natural trails and
+        # inserted as temporary routing nodes. They do not rebuild the start
+        # workspace or alter the saved offline master graph.
+        G, required_pass_points = resolve_required_pass_points(G, request.pass_points)
+        if start_node not in G:
+            raise HTTPException(status_code=500, detail="Start node was lost while inserting required pass-through points.")
+
         if same_point:
-            if request.target_distance_miles < 4.0:
+            if required_pass_points:
+                constrained_profile = required_waypoint_profile(
+                    profile, request.target_distance_miles
+                )
+                (
+                    route_nodes,
+                    metrics,
+                    search_steps,
+                ) = generate_waypoint_loop(
+                    G,
+                    start_node,
+                    target_distance_meters,
+                    target_gain_meters,
+                    constrained_profile,
+                    limits,
+                    required_pass_points=required_pass_points,
+                )
+                profile = constrained_profile
+                route_type = "required pass-through trail loop"
+                search_method = "required-waypoint"
+                states_expanded = None
+
+            elif request.target_distance_miles < 4.0:
                 (
                     route_nodes,
                     metrics,
@@ -5804,19 +6163,37 @@ def generate_route(request: RouteRequest):
         else:
             S = make_simple_routing_graph(G)
 
-            try:
-                route_nodes = nx.shortest_path(
-                    S,
-                    start_node,
-                    end_node,
-                    weight="length",
+            destinations = []
+            remaining = list(required_pass_points)
+            current_node = start_node
+            # Automatic order: greedily visit the geographically nearest
+            # required zone next, then finish at the requested end point.
+            while remaining:
+                current_lat = float(G.nodes[current_node]["y"])
+                current_lon = float(G.nodes[current_node]["x"])
+                remaining.sort(
+                    key=lambda info: haversine_meters(
+                        current_lat, current_lon,
+                        info["requested_lat"], info["requested_lon"],
+                    )
                 )
+                info = remaining.pop(0)
+                node = info["candidate_nodes"][0]
+                destinations.append(node)
+                current_node = node
+            destinations.append(end_node)
+
+            route_nodes = [start_node]
+            current = start_node
+            try:
+                for destination in destinations:
+                    leg = nx.shortest_path(S, current, destination, weight="routing_cost")
+                    route_nodes.extend(leg[1:])
+                    current = destination
             except nx.NetworkXNoPath:
                 raise HTTPException(
                     status_code=400,
-                    detail=(
-                        "No connected trail route found between start and finish."
-                    ),
+                    detail="No connected trail route found through all required pass-through points.",
                 )
 
             _, metrics = route_score(
@@ -5825,11 +6202,14 @@ def generate_route(request: RouteRequest):
                 target_distance_meters,
                 target_gain_meters,
             )
+            metrics["required_pass_points"] = required_pass_metrics_for_coords(
+                metrics.get("route_coordinates", []), required_pass_points
+            )
 
             search_steps = 1
             states_expanded = None
-            search_method = "point-to-point"
-            route_type = "trail point-to-point"
+            search_method = "required-point-to-point" if required_pass_points else "point-to-point"
+            route_type = "trail point-to-point with required pass-through" if required_pass_points else "trail point-to-point"
 
         route_distance_miles = (
             metrics["total_distance_meters"] / METERS_PER_MILE
@@ -5935,6 +6315,8 @@ def generate_route(request: RouteRequest):
             "partial_edge_used": metrics.get("partial_edge_used", False),
             "partial_added_distance_miles": round(metrics.get("partial_added_distance_meters", 0.0) / METERS_PER_MILE, 3),
             "partial_outward_distance_meters": round(metrics.get("partial_outward_distance_meters", 0.0), 1),
+            "required_pass_points": metrics.get("required_pass_points", []),
+            "required_pass_points_count": len(required_pass_points),
             "version": APP_VERSION,
             "snapped_start_lat": snapped_start_lat,
             "snapped_start_lon": snapped_start_lon,
@@ -6085,6 +6467,36 @@ button:disabled {
     color: #666;
 }
 
+#pass-point-panel {
+    border: 1px solid #ddd;
+    border-radius: 6px;
+    padding: 10px;
+    margin: 10px 0;
+    background: #fafafa;
+}
+
+.pass-point-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: end;
+    margin-top: 8px;
+    padding-top: 8px;
+    border-top: 1px solid #e5e5e5;
+}
+
+.pass-point-row input[type="number"] {
+    width: 150px;
+}
+
+.pass-point-remove {
+    background: #666;
+}
+
+#passPointStatus {
+    margin-top: 6px;
+}
+
 .route-choice-grid {
     display: flex;
     flex-wrap: wrap;
@@ -6129,7 +6541,7 @@ button:disabled {
 <div id="controls">
 
 <h2>Trail Running Creator</h2>
-<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-v14-offline-connectors-fast-search</div>
+<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-v16-required-pass-through</div>
 
 <div class="input-row">
     <div class="input-group">
@@ -6163,6 +6575,14 @@ button:disabled {
         <label for="gain">Target elevation gain (ft)</label>
         <input id="gain" type="number" step="25" min="0" value="200">
     </div>
+</div>
+
+<div id="pass-point-panel">
+    <b>Required pass-through points</b><br>
+    <span class="small">Add a point, then click the map. The generated route must use a natural trail inside the tolerance circle. Points do not need to be exactly on a trail.</span><br>
+    <button id="addPassPointButton" type="button" style="margin-top:8px;">Add pass-through point</button>
+    <div id="passPointStatus" class="small"></div>
+    <div id="passPointRows"></div>
 </div>
 
 <button id="generateButton">Generate Trail Route</button>
@@ -6231,6 +6651,10 @@ let loadedWorkspaceStartKey = null;
 let lastWorkspaceResult = null;
 let masterTrailOverlayLoaded = false;
 let masterTrailOverlayPromise = null;
+let passPoints = [];
+let passPointLayers = [];
+let passPointPlacementMode = false;
+let nextPassPointId = 1;
 
 const generateButton = document.getElementById("generateButton");
 const downloadGpxButton = document.getElementById("downloadGpxButton");
@@ -6239,6 +6663,7 @@ const analyzeGpxButton = document.getElementById("analyzeGpxButton");
 const testGpxButton = document.getElementById("testGpxButton");
 const clearGpxButton = document.getElementById("clearGpxButton");
 const showNetworkCheckbox = document.getElementById("showNetwork");
+const addPassPointButton = document.getElementById("addPassPointButton");
 
 
 generateButton.addEventListener("click", generateRoute);
@@ -6248,6 +6673,114 @@ analyzeGpxButton.addEventListener("click", analyzeGpx);
 testGpxButton.addEventListener("click", testGpxAgainstGenerator);
 clearGpxButton.addEventListener("click", clearGpx);
 showNetworkCheckbox.addEventListener("change", updateNetworkVisibility);
+addPassPointButton.addEventListener("click", beginPassPointPlacement);
+map.on("click", handleMapPassPointClick);
+
+
+function beginPassPointPlacement() {
+    if (passPoints.length >= 5) {
+        document.getElementById("passPointStatus").textContent = "Maximum of 5 pass-through points reached.";
+        return;
+    }
+    passPointPlacementMode = true;
+    addPassPointButton.textContent = "Click map to place point...";
+    document.getElementById("passPointStatus").textContent = "Click anywhere on the map. The route will use a nearby natural trail inside the tolerance circle.";
+}
+
+
+function handleMapPassPointClick(event) {
+    if (!passPointPlacementMode) {
+        return;
+    }
+    passPointPlacementMode = false;
+    addPassPointButton.textContent = "Add pass-through point";
+    passPoints.push({
+        id: nextPassPointId++,
+        lat: Number(event.latlng.lat.toFixed(7)),
+        lon: Number(event.latlng.lng.toFixed(7)),
+        tolerance_miles: 0.25
+    });
+    renderPassPointRows();
+    drawPassPointLayers();
+    document.getElementById("passPointStatus").textContent = "Pass-through point added. Dragging is not required; edit its coordinates or remove it below.";
+}
+
+
+function renderPassPointRows() {
+    const container = document.getElementById("passPointRows");
+    container.innerHTML = "";
+    passPoints.forEach((point, index) => {
+        const row = document.createElement("div");
+        row.className = "pass-point-row";
+        row.innerHTML = `
+            <div class="input-group">
+                <label>Point ${index + 1} latitude</label>
+                <input type="number" step="any" data-pass-id="${point.id}" data-field="lat" value="${point.lat}">
+            </div>
+            <div class="input-group">
+                <label>Point ${index + 1} longitude</label>
+                <input type="number" step="any" data-pass-id="${point.id}" data-field="lon" value="${point.lon}">
+            </div>
+            <div class="input-group">
+                <label>Tolerance (mi)</label>
+                <input type="number" min="0.01" max="5" step="0.05" data-pass-id="${point.id}" data-field="tolerance_miles" value="${point.tolerance_miles}">
+            </div>
+            <button type="button" class="pass-point-remove" data-remove-pass-id="${point.id}">Remove</button>
+        `;
+        container.appendChild(row);
+    });
+
+    container.querySelectorAll("input[data-pass-id]").forEach(input => {
+        input.addEventListener("change", () => {
+            const id = Number(input.dataset.passId);
+            const point = passPoints.find(item => item.id === id);
+            if (!point) return;
+            point[input.dataset.field] = Number(input.value);
+            drawPassPointLayers();
+        });
+    });
+
+    container.querySelectorAll("button[data-remove-pass-id]").forEach(button => {
+        button.addEventListener("click", () => {
+            const id = Number(button.dataset.removePassId);
+            passPoints = passPoints.filter(item => item.id !== id);
+            renderPassPointRows();
+            drawPassPointLayers();
+        });
+    });
+}
+
+
+function drawPassPointLayers() {
+    for (const layer of passPointLayers) {
+        if (map.hasLayer(layer)) map.removeLayer(layer);
+    }
+    passPointLayers = [];
+
+    passPoints.forEach((point, index) => {
+        const lat = Number(point.lat);
+        const lon = Number(point.lon);
+        const toleranceMiles = Number(point.tolerance_miles);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(toleranceMiles)) return;
+
+        const circle = L.circle([lat, lon], {
+            radius: Math.max(1, toleranceMiles * 1609.344),
+            color: "#7e22ce",
+            weight: 2,
+            opacity: 0.75,
+            fillColor: "#a855f7",
+            fillOpacity: 0.08
+        }).addTo(map);
+        const marker = L.circleMarker([lat, lon], {
+            radius: 7,
+            color: "#581c87",
+            weight: 2,
+            fillColor: "#a855f7",
+            fillOpacity: 0.95
+        }).bindTooltip(`Required point ${index + 1}`).addTo(map);
+        passPointLayers.push(circle, marker);
+    });
+}
 
 
 function escapeXml(value) {
@@ -6371,7 +6904,12 @@ function renderSelectedRouteDetails(option) {
         "<b>Extra subloops:</b> " + (option.extra_subloops ?? 0) + "<br>" +
         "<b>Route footprint:</b> " + (option.footprint_sq_miles ?? 0) + " sq mi · " +
         "<b>Big-loop penalty:</b> " + (option.shape_penalty ?? 0) + "<br>" +
-        "<b>Partial-edge tuning:</b> " + (option.partial_edge_used ? "YES" : "NO");
+        "<b>Partial-edge tuning:</b> " + (option.partial_edge_used ? "YES" : "NO") +
+        ((option.required_pass_points || []).length > 0
+            ? "<br><b>Required points:</b> " + option.required_pass_points.map((point, index) =>
+                `P${index + 1}: ${point.nearest_route_distance_m} m from marker / ${point.tolerance_m} m allowed`
+              ).join(" · ")
+            : "");
 }
 
 
@@ -6450,7 +6988,12 @@ function getInputData() {
         end_lat: parseFloat(document.getElementById("end_lat").value),
         end_lon: parseFloat(document.getElementById("end_lon").value),
         target_distance_miles: parseFloat(document.getElementById("distance").value),
-        target_gain_ft: parseFloat(document.getElementById("gain").value)
+        target_gain_ft: parseFloat(document.getElementById("gain").value),
+        pass_points: passPoints.map(point => ({
+            lat: Number(point.lat),
+            lon: Number(point.lon),
+            tolerance_miles: Number(point.tolerance_miles)
+        }))
     };
 }
 
@@ -6796,7 +7339,8 @@ async function generateRoute() {
                 route_score: result.route_score,
                 partial_edge_used: result.partial_edge_used,
                 partial_added_distance_miles: result.partial_added_distance_miles,
-                partial_outward_distance_meters: result.partial_outward_distance_meters
+                partial_outward_distance_meters: result.partial_outward_distance_meters,
+                required_pass_points: result.required_pass_points || []
             }];
         }
 
@@ -6817,7 +7361,8 @@ async function generateRoute() {
             '<div class="route-choice-grid">' + routeButtons + '</div>' +
             '<div id="selectedRouteDetails"></div><br>' +
             '<b>Distance target:</b> ' + result.requested_distance_miles + ' mi<br>' +
-            '<b>Elevation target:</b> ' + result.requested_gain_ft + ' ft<br><br>' +
+            '<b>Elevation target:</b> ' + result.requested_gain_ft + ' ft<br>' +
+            '<b>Required pass-through points:</b> ' + (result.required_pass_points_count || 0) + '<br><br>' +
             '<b>Search method:</b> ' + result.search_method + '<br>' +
             '<b>Route profile:</b> ' + result.route_profile + '<br>' +
             '<b>Search depth:</b> ' + result.search_steps + '<br>' +
