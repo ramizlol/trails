@@ -83,7 +83,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-09-v17-natural-retrace"
+APP_VERSION = "2026-08-10-v18-outward-natural-loop"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -121,19 +121,37 @@ OFFLINE_CONNECTOR_MIN_COMPONENT_TRAIL_M = 250.0
 # it does not touch any edge already used by the current candidate loop.
 WAYPOINT_LEG_CACHE_MAX = 4096
 
-# V17 route-quality tuning. Reusing a trail is no longer treated as nearly
-# forbidden. Ordinary retracing is still discouraged, but if an edge is a graph
-# bridge (a stem/corridor that has no alternate graph connection), retracing it
-# is treated as effectively necessary and receives only a very small penalty.
-REUSED_EDGE_COST_MULTIPLIER = 3.5
-NECESSARY_REUSED_EDGE_COST_MULTIPLIER = 1.15
+# V18 route-quality tuning.
+#
+# A single sensible out-and-back is cheap. Reusing the same corridor a third
+# time is expensive, which prevents the search from solving mileage by stacking
+# repeated laps. Literal graph bridges get even more lenient second-traversal
+# treatment because there may truly be no alternative way back.
+REUSED_EDGE_SECOND_COST_MULTIPLIER = 1.50
+REUSED_EDGE_THIRD_PLUS_COST_MULTIPLIER = 10.0
+NECESSARY_REUSED_EDGE_SECOND_COST_MULTIPLIER = 1.05
+NECESSARY_REUSED_EDGE_THIRD_PLUS_COST_MULTIPLIER = 3.0
+
+# Final/cheap repeated-distance scoring distinguishes one return traversal from
+# third-and-later traversals. This is the key difference between a natural
+# out-and-back stem and spaghetti/lap behavior.
+OPTIONAL_SECOND_RETRACE_SCORE_FACTOR = 0.35
+NECESSARY_SECOND_RETRACE_SCORE_FACTOR = 0.05
+OPTIONAL_THIRD_PLUS_RETRACE_SCORE_FACTOR = 2.00
+NECESSARY_THIRD_PLUS_RETRACE_SCORE_FACTOR = 0.50
 NECESSARY_RETRACE_SCORE_FACTOR = 0.10
-LONG_REPEAT_SCORE_WEIGHT = 90.0
+LONG_REPEAT_SCORE_WEIGHT = 70.0
 LONG_REPEATED_NODE_WEIGHT = 4.0
 LONG_IMMEDIATE_REVERSAL_WEIGHT = 3.0
-CHEAP_REPEAT_SCORE_WEIGHT = 70.0
+CHEAP_REPEAT_SCORE_WEIGHT = 55.0
 CHEAP_REPEATED_NODE_WEIGHT = 4.0
 CHEAP_IMMEDIATE_REVERSAL_WEIGHT = 3.0
+
+# Explicitly discourage small independent loops that exist only to avoid a
+# reasonable retrace. The threshold scales with the target but is capped so a
+# legitimate large secondary loop is not treated as "tiny".
+SMALL_SUBLOOP_MIN_M = 120.0
+SMALL_SUBLOOP_MAX_M = 1.50 * METERS_PER_MILE
 
 # V16 required pass-through zones. A user point is not treated as an off-trail
 # routing coordinate: it is snapped to a natural trail inside the tolerance,
@@ -212,7 +230,8 @@ def home():
 # ============================================================
 
 def get_route_profile(target_distance_miles: float):
-    search_radius_m = max(250, int(float(target_distance_miles) * METERS_PER_MILE))
+    target_distance_m = float(target_distance_miles) * METERS_PER_MILE
+    search_radius_m = max(250, int(target_distance_m))
 
     if target_distance_miles < 4.0:
         return {
@@ -232,8 +251,9 @@ def get_route_profile(target_distance_miles: float):
             "search_radius_m": search_radius_m,
             "attempts": 1200,
             "anchor_counts": [2, 3, 3, 3],
-            "min_anchor_distance_m": 150,
-            "min_anchor_separation_m": 140,
+            "min_anchor_distance_m": max(150, int(target_distance_m * 0.08)),
+            "min_anchor_separation_m": max(140, int(target_distance_m * 0.07)),
+            "far_anchor_min_ratio": 0.26,
             "accurate_finalists": 14,
             "candidate_pool_multiplier": 3,
         }
@@ -243,8 +263,11 @@ def get_route_profile(target_distance_miles: float):
             "search_radius_m": search_radius_m,
             "attempts": 900,
             "anchor_counts": [3, 4, 4, 4],
-            "min_anchor_distance_m": 300,
-            "min_anchor_separation_m": 250,
+            # Long routes should not be allowed to build every waypoint within a
+            # few hundred meters of the start. Scale spacing with requested length.
+            "min_anchor_distance_m": max(300, int(target_distance_m * 0.15)),
+            "min_anchor_separation_m": max(250, int(target_distance_m * 0.10)),
+            "far_anchor_min_ratio": 0.32,
             "accurate_finalists": 14,
             "candidate_pool_multiplier": 3,
         }
@@ -253,8 +276,9 @@ def get_route_profile(target_distance_miles: float):
         "search_radius_m": search_radius_m,
         "attempts": 700,
         "anchor_counts": [4, 4, 5],
-        "min_anchor_distance_m": 400,
-        "min_anchor_separation_m": 300,
+        "min_anchor_distance_m": max(400, int(target_distance_m * 0.18)),
+        "min_anchor_separation_m": max(300, int(target_distance_m * 0.12)),
+        "far_anchor_min_ratio": 0.35,
         "accurate_finalists": 14,
         "candidate_pool_multiplier": 3,
     }
@@ -3344,7 +3368,26 @@ def get_master_trail_overlay_json():
 # SIMPLE ROUTING GRAPH
 # ============================================================
 
-def make_simple_routing_graph(G):
+def connector_path_multiplier_for_target(target_distance_meters):
+    """Long routes may use short connectors to unlock much larger trail systems."""
+    miles = float(target_distance_meters) / METERS_PER_MILE
+    if miles < 8.0:
+        return CONNECTOR_PATH_COST_MULTIPLIER
+    if miles < 15.0:
+        return 1.60
+    return 1.45
+
+
+def connector_score_weight_for_target(target_distance_meters, cheap=False):
+    miles = float(target_distance_meters) / METERS_PER_MILE
+    if miles < 8.0:
+        return CONNECTOR_CHEAP_SCORE_WEIGHT if cheap else CONNECTOR_FINAL_SCORE_WEIGHT
+    if miles < 15.0:
+        return 55.0 if cheap else 70.0
+    return 45.0 if cheap else 60.0
+
+
+def make_simple_routing_graph(G, connector_multiplier=None):
     S = nx.DiGraph()
     S.add_nodes_from(G.nodes(data=True))
     for u, v, data in G.edges(data=True):
@@ -3353,7 +3396,10 @@ def make_simple_routing_graph(G):
             continue
         ascent = float(data.get("ascent_m", 0) or 0)
         route_class = str(data.get("route_class", "trail"))
-        routing_cost = float(data.get("routing_cost", edge_routing_cost(data)))
+        if route_class == "connector" and connector_multiplier is not None:
+            routing_cost = length * float(connector_multiplier)
+        else:
+            routing_cost = float(data.get("routing_cost", edge_routing_cost(data)))
         if not S.has_edge(u, v) or routing_cost < float(S[u][v].get("routing_cost", float("inf"))):
             S.add_edge(u, v, length=length, ascent_m=ascent, route_class=route_class, routing_cost=routing_cost)
     return S
@@ -3415,21 +3461,37 @@ def repeated_edge_breakdown(G, route_nodes, bridge_edges=None):
     repeated_distance = 0.0
     necessary_repeated_distance = 0.0
     optional_repeated_distance = 0.0
+    necessary_second_distance = 0.0
+    optional_second_distance = 0.0
+    necessary_third_plus_distance = 0.0
+    optional_third_plus_distance = 0.0
 
     for edge_key, count in counts.items():
         if count <= 1:
             continue
-        extra_distance = lengths.get(edge_key, 0.0) * (count - 1)
+
+        length = lengths.get(edge_key, 0.0)
+        second_distance = length
+        third_plus_distance = length * max(0, count - 2)
+        extra_distance = second_distance + third_plus_distance
+
         repeated_edges += count - 1
         repeated_distance += extra_distance
+
         if edge_key in bridge_edges:
             necessary_repeated_distance += extra_distance
+            necessary_second_distance += second_distance
+            necessary_third_plus_distance += third_plus_distance
         else:
             optional_repeated_distance += extra_distance
+            optional_second_distance += second_distance
+            optional_third_plus_distance += third_plus_distance
 
     effective_repeated_distance = (
-        optional_repeated_distance
-        + necessary_repeated_distance * NECESSARY_RETRACE_SCORE_FACTOR
+        optional_second_distance * OPTIONAL_SECOND_RETRACE_SCORE_FACTOR
+        + necessary_second_distance * NECESSARY_SECOND_RETRACE_SCORE_FACTOR
+        + optional_third_plus_distance * OPTIONAL_THIRD_PLUS_RETRACE_SCORE_FACTOR
+        + necessary_third_plus_distance * NECESSARY_THIRD_PLUS_RETRACE_SCORE_FACTOR
     )
 
     return {
@@ -3437,6 +3499,10 @@ def repeated_edge_breakdown(G, route_nodes, bridge_edges=None):
         "repeated_distance_meters": repeated_distance,
         "necessary_repeated_distance_meters": necessary_repeated_distance,
         "optional_repeated_distance_meters": optional_repeated_distance,
+        "necessary_second_retrace_meters": necessary_second_distance,
+        "optional_second_retrace_meters": optional_second_distance,
+        "necessary_third_plus_retrace_meters": necessary_third_plus_distance,
+        "optional_third_plus_retrace_meters": optional_third_plus_distance,
         "effective_repeated_distance_meters": effective_repeated_distance,
     }
 
@@ -3581,6 +3647,101 @@ def route_topology_metrics(route_nodes):
     }
 
 
+def small_subloop_metrics(G, route_nodes, target_distance_meters):
+    """Detect short mostly-unique closed detours, not ordinary out-and-backs."""
+    if len(route_nodes) < 4:
+        return {"count": 0, "distance_meters": 0.0, "threshold_meters": 0.0}
+
+    threshold = min(
+        SMALL_SUBLOOP_MAX_M,
+        max(0.40 * METERS_PER_MILE, float(target_distance_meters) * 0.10),
+    )
+
+    edge_lengths = []
+    edge_keys = []
+    cumulative = [0.0]
+    for i in range(len(route_nodes) - 1):
+        u = route_nodes[i]
+        v = route_nodes[i + 1]
+        edge = get_shortest_edge(G, u, v)
+        length = float(edge.get("length", 0) or 0) if edge else 0.0
+        edge_lengths.append(length)
+        edge_keys.append(undirected_edge_key(u, v))
+        cumulative.append(cumulative[-1] + length)
+
+    occurrences = {}
+    for idx, node in enumerate(route_nodes):
+        occurrences.setdefault(node, []).append(idx)
+
+    candidate_intervals = []
+    final_index = len(route_nodes) - 1
+    start_node = route_nodes[0]
+
+    for node, positions in occurrences.items():
+        if len(positions) < 2:
+            continue
+        for a, b in zip(positions, positions[1:]):
+            if node == start_node and a == 0 and b == final_index:
+                continue
+            span = cumulative[b] - cumulative[a]
+            if span < SMALL_SUBLOOP_MIN_M or span > threshold:
+                continue
+            segment_keys = edge_keys[a:b]
+            if len(segment_keys) < 2:
+                continue
+            # A true little loop mostly uses each edge once. An out-and-back
+            # segment has many duplicated physical edges and is intentionally
+            # excluded from this penalty.
+            unique_fraction = len(set(segment_keys)) / max(len(segment_keys), 1)
+            if unique_fraction < 0.80:
+                continue
+            candidate_intervals.append((a, b, span))
+
+    # Keep a minimal non-duplicate set. Nested detections of the same tiny loop
+    # can otherwise appear at multiple nodes along its boundary.
+    candidate_intervals.sort(key=lambda row: (row[2], row[0]))
+    kept = []
+    for row in candidate_intervals:
+        a, b, span = row
+        overlaps_same = False
+        for ka, kb, kspan in kept:
+            overlap = max(0, min(b, kb) - max(a, ka))
+            width = max(1, min(b - a, kb - ka))
+            if overlap / width > 0.65:
+                overlaps_same = True
+                break
+        if not overlaps_same:
+            kept.append(row)
+
+    return {
+        "count": len(kept),
+        "distance_meters": float(sum(row[2] for row in kept)),
+        "threshold_meters": float(threshold),
+    }
+
+
+def small_subloop_penalty(G, route_nodes, target_distance_meters, cheap=False):
+    metrics = small_subloop_metrics(G, route_nodes, target_distance_meters)
+    target_miles = float(target_distance_meters) / METERS_PER_MILE
+    if target_miles < 4.0:
+        return 0.0, metrics
+
+    if target_miles < 8.0:
+        count_weight = 16.0 if cheap else 24.0
+        distance_weight = 12.0 if cheap else 18.0
+    elif target_miles < 15.0:
+        count_weight = 32.0 if cheap else 46.0
+        distance_weight = 20.0 if cheap else 30.0
+    else:
+        count_weight = 38.0 if cheap else 55.0
+        distance_weight = 24.0 if cheap else 36.0
+
+    distance_ratio = metrics["distance_meters"] / max(float(target_distance_meters), 1.0)
+    penalty = metrics["count"] * count_weight + distance_ratio * distance_weight
+    metrics["penalty"] = float(penalty)
+    return float(penalty), metrics
+
+
 def route_max_radial_meters_from_nodes(G, route_nodes):
     if not route_nodes:
         return 0.0
@@ -3683,19 +3844,19 @@ def big_loop_shape_penalty(
         footprint_target = 0.016
         footprint_weight = 0.0 if cheap else 10.0
     elif target_miles < 15.0:
-        target_radial_ratio = 0.30
-        cycle_weight = 28.0 if cheap else 40.0
-        branch_weight = 5.0 if cheap else 7.0
-        spread_weight = 30.0 if cheap else 48.0
-        footprint_target = 0.020
-        footprint_weight = 0.0 if cheap else 22.0
+        target_radial_ratio = 0.34
+        cycle_weight = 42.0 if cheap else 62.0
+        branch_weight = 6.0 if cheap else 9.0
+        spread_weight = 46.0 if cheap else 68.0
+        footprint_target = 0.024
+        footprint_weight = 0.0 if cheap else 30.0
     else:
-        target_radial_ratio = 0.31
-        cycle_weight = 34.0 if cheap else 48.0
-        branch_weight = 6.0 if cheap else 8.0
-        spread_weight = 36.0 if cheap else 58.0
-        footprint_target = 0.022
-        footprint_weight = 0.0 if cheap else 28.0
+        target_radial_ratio = 0.36
+        cycle_weight = 50.0 if cheap else 74.0
+        branch_weight = 7.0 if cheap else 10.0
+        spread_weight = 54.0 if cheap else 80.0
+        footprint_target = 0.026
+        footprint_weight = 0.0 if cheap else 36.0
 
     spread_shortfall = max(0.0, target_radial_ratio - radial_ratio) / max(
         target_radial_ratio,
@@ -3802,7 +3963,9 @@ def score_route_coordinates(
     # it as an ordinary (not automatically necessary) retrace for scoring.
     partial_repeat = max(0.0, float(partial_added_distance_m) / 2.0)
     repeated_distance += partial_repeat
-    effective_repeated_distance += partial_repeat
+    # A single partial out-and-back is exactly the kind of natural second
+    # traversal V18 allows. Do not score it like a third/lap traversal.
+    effective_repeated_distance += partial_repeat * OPTIONAL_SECOND_RETRACE_SCORE_FACTOR
     repeat_ratio = effective_repeated_distance / total_distance
 
     node_breakdown = repeated_node_breakdown(route_nodes, bridge_edges)
@@ -3825,6 +3988,16 @@ def score_route_coordinates(
         footprint_area_m2=footprint_area_m2,
         cheap=False,
     )
+    subloop_penalty, subloop_metrics = small_subloop_penalty(
+        G,
+        route_nodes,
+        target_distance_meters,
+        cheap=False,
+    )
+    connector_score_weight = connector_score_weight_for_target(
+        target_distance_meters,
+        cheap=False,
+    )
 
     if target_distance_meters < 4 * METERS_PER_MILE:
         repeat_weight = 35.0
@@ -3841,8 +4014,9 @@ def score_route_coordinates(
         + repeat_ratio * repeat_weight
         + effective_repeated_nodes * node_weight
         + effective_immediate_reversals * reversal_weight
-        + connector_ratio * CONNECTOR_FINAL_SCORE_WEIGHT
+        + connector_ratio * connector_score_weight
         + shape_penalty
+        + subloop_penalty
     )
 
     return (
@@ -3877,6 +4051,9 @@ def score_route_coordinates(
             "footprint_area_m2": footprint_area_m2,
             "footprint_ratio": shape_metrics["footprint_ratio"],
             "shape_penalty": shape_metrics["shape_penalty"],
+            "small_subloops": subloop_metrics["count"],
+            "small_subloop_distance_meters": subloop_metrics["distance_meters"],
+            "small_subloop_penalty": subloop_penalty,
             "score": score,
             "route_coordinates": coords,
             "route_elevation_sample_count": geometry["dem_sample_points"],
@@ -4640,22 +4817,24 @@ def _route_edge_key_set(path):
     }
 
 
-def waypoint_path(S, source, target, used_edges, leg_cache=None, cache_stats=None, bridge_edges=None):
+def waypoint_path(S, source, target, edge_use_counts, leg_cache=None, cache_stats=None, bridge_edges=None):
     """
     A* leg with a safe baseline-path cache.
 
-    The cached path is an ordinary shortest path. It is reused only when none
-    of its physical edges have already been used by this candidate loop. If it
-    would overlap, V17 runs a lightly repeat-penalized A*. Ordinary reused
-    edges cost 3.5x, while graph-bridge/stem edges cost only 1.15x because
-    returning over those corridors is often unavoidable.
+    V18 allows a normal second traversal of the same corridor, especially when
+    that corridor is a bridge/stem. A third-and-later traversal is deliberately
+    expensive so the search does not manufacture repeated laps or spaghetti.
     """
     key = (source, target)
+    used_edge_keys = {
+        edge_key for edge_key, count in (edge_use_counts or {}).items() if count > 0
+    }
+
     if leg_cache is not None:
         cached = leg_cache.get(key)
         if cached is not None:
             cached_path, cached_edges = cached
-            if not used_edges.intersection(cached_edges):
+            if not used_edge_keys.intersection(cached_edges):
                 if cache_stats is not None:
                     cache_stats["hits"] = cache_stats.get("hits", 0) + 1
                 return list(cached_path)
@@ -4673,8 +4852,7 @@ def waypoint_path(S, source, target, used_edges, leg_cache=None, cache_stats=Non
         except Exception:
             return 0.0
 
-    # With no used edges, this is a baseline path and is safe to cache.
-    if not used_edges:
+    if not used_edge_keys:
         path = nx.astar_path(
             S,
             source,
@@ -4693,12 +4871,16 @@ def waypoint_path(S, source, target, used_edges, leg_cache=None, cache_stats=Non
     def weight(u, v, data):
         cost = float(data.get("routing_cost", data.get("length", 1.0)))
         edge_key = undirected_edge_key(u, v)
-        if edge_key in used_edges:
-            if edge_key in bridge_edges:
-                cost *= NECESSARY_REUSED_EDGE_COST_MULTIPLIER
-            else:
-                cost *= REUSED_EDGE_COST_MULTIPLIER
-        return cost
+        prior_count = int((edge_use_counts or {}).get(edge_key, 0))
+        if prior_count <= 0:
+            return cost
+        if edge_key in bridge_edges:
+            if prior_count == 1:
+                return cost * NECESSARY_REUSED_EDGE_SECOND_COST_MULTIPLIER
+            return cost * NECESSARY_REUSED_EDGE_THIRD_PLUS_COST_MULTIPLIER
+        if prior_count == 1:
+            return cost * REUSED_EDGE_SECOND_COST_MULTIPLIER
+        return cost * REUSED_EDGE_THIRD_PLUS_COST_MULTIPLIER
 
     path = nx.astar_path(
         S,
@@ -4768,6 +4950,16 @@ def cheap_waypoint_score(
         footprint_area_m2=None,
         cheap=True,
     )
+    subloop_penalty, subloop_metrics = small_subloop_penalty(
+        G,
+        route_nodes,
+        target_distance_meters,
+        cheap=True,
+    )
+    connector_score_weight = connector_score_weight_for_target(
+        target_distance_meters,
+        cheap=True,
+    )
 
     # Distance and approximate elevation are the primary exploratory goals.
     # V17 keeps the strong mini-loop shape penalty, but makes ordinary retracing
@@ -4778,8 +4970,9 @@ def cheap_waypoint_score(
         + repeat_ratio * CHEAP_REPEAT_SCORE_WEIGHT
         + effective_repeated_nodes * CHEAP_REPEATED_NODE_WEIGHT
         + effective_immediate_reversals * CHEAP_IMMEDIATE_REVERSAL_WEIGHT
-        + connector_ratio * CONNECTOR_CHEAP_SCORE_WEIGHT
+        + connector_ratio * connector_score_weight
         + shape_penalty
+        + subloop_penalty
     )
 
     return score, {
@@ -4805,6 +4998,9 @@ def cheap_waypoint_score(
         "max_radial_meters": max_radial_meters,
         "max_radial_ratio": shape_metrics["max_radial_ratio"],
         "shape_penalty": shape_metrics["shape_penalty"],
+        "small_subloops": subloop_metrics["count"],
+        "small_subloop_distance_meters": subloop_metrics["distance_meters"],
+        "small_subloop_penalty": subloop_penalty,
     }
 
 
@@ -4828,7 +5024,8 @@ def generate_waypoint_loop(
       Rescore only the best diverse finalists using the authoritative
       continuous 5 m DEM profile + ~55 m smoothing.
     """
-    S = make_simple_routing_graph(G)
+    connector_multiplier = connector_path_multiplier_for_target(target_distance_meters)
+    S = make_simple_routing_graph(G, connector_multiplier=connector_multiplier)
     bridge_edges = routing_bridge_edge_keys(S)
 
     start_lat = float(G.nodes[start_node]["y"])
@@ -4873,6 +5070,7 @@ def generate_waypoint_loop(
             if v in reachable_nodes:
                 trail_nodes.add(v)
 
+    radial_by_node = {}
     for node in trail_nodes:
         if node == start_node or node not in S:
             continue
@@ -4883,12 +5081,19 @@ def generate_waypoint_loop(
             float(G.nodes[node]["y"]),
             float(G.nodes[node]["x"]),
         )
+        radial_by_node[node] = radial
 
         if (
             radial >= profile["min_anchor_distance_m"]
             and radial <= max_radial_distance
         ):
             candidates.append(node)
+
+    far_anchor_min_m = float(profile.get("far_anchor_min_ratio", 0.0)) * target_distance_meters
+    far_candidates = [
+        node for node in candidates
+        if radial_by_node.get(node, 0.0) >= far_anchor_min_m
+    ]
 
     max_total_anchors = max(profile["anchor_counts"])
     max_optional_anchors = max(0, max_total_anchors - len(required_groups))
@@ -4964,9 +5169,38 @@ def generate_waypoint_loop(
         available = [node for node in candidates if node not in required_anchors]
         random.shuffle(available)
         optional_anchors = []
+
+        # V18 outward bias: when the network actually has a reachable trail far
+        # enough away, make at least one anchor use it. This prevents a 12-15 mi
+        # request from solving everything with tightly clustered local anchors.
+        required_already_far = any(
+            radial_by_node.get(node, 0.0) >= far_anchor_min_m
+            for node in required_anchors
+        )
+        if optional_count > 0 and far_candidates and not required_already_far:
+            far_pool = [node for node in far_candidates if node not in required_anchors]
+            random.shuffle(far_pool)
+            for candidate in far_pool:
+                spacing_bad = False
+                for existing in required_anchors:
+                    separation = haversine_meters(
+                        float(G.nodes[candidate]["y"]),
+                        float(G.nodes[candidate]["x"]),
+                        float(G.nodes[existing]["y"]),
+                        float(G.nodes[existing]["x"]),
+                    )
+                    if separation < profile["min_anchor_separation_m"]:
+                        spacing_bad = True
+                        break
+                if not spacing_bad:
+                    optional_anchors.append(candidate)
+                    break
+
         for candidate in available:
             if len(optional_anchors) >= optional_count:
                 break
+            if candidate in optional_anchors:
+                continue
             # Keep optional anchors geographically separated. Required points are
             # hard constraints and are never rejected for being close together.
             spacing_bad = False
@@ -5000,7 +5234,7 @@ def generate_waypoint_loop(
             anchors.reverse()
 
         route = [start_node]
-        used_edges = set()
+        edge_use_counts = {}
         current = start_node
         failed = False
 
@@ -5010,7 +5244,7 @@ def generate_waypoint_loop(
                     S,
                     current,
                     destination,
-                    used_edges,
+                    edge_use_counts,
                     leg_cache=leg_cache,
                     cache_stats=leg_cache_stats,
                     bridge_edges=bridge_edges,
@@ -5020,12 +5254,8 @@ def generate_waypoint_loop(
                 break
 
             for i in range(len(leg) - 1):
-                used_edges.add(
-                    undirected_edge_key(
-                        leg[i],
-                        leg[i + 1],
-                    )
-                )
+                edge_key = undirected_edge_key(leg[i], leg[i + 1])
+                edge_use_counts[edge_key] = edge_use_counts.get(edge_key, 0) + 1
 
             route.extend(leg[1:])
             current = destination
