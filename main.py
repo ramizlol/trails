@@ -83,7 +83,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-10-v21-clean-ui"
+APP_VERSION = "2026-08-10-v22-map-80vh"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -6820,7 +6820,8 @@ button:disabled {
 
 
 #map {
-    height: 650px;
+    height: 80vh;
+    min-height: 650px;
     width: 100%;
 }
 
@@ -6903,8 +6904,8 @@ button:disabled {
     }
 
     #map {
-        height: 60vh;
-        min-height: 480px;
+        height: 80vh;
+        min-height: 520px;
     }
 }
 </style>
