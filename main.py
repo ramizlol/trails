@@ -84,7 +84,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-10-v34-exact-green-replacement"
+APP_VERSION = "2026-08-10-v35-direct-green-splice"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -6986,7 +6986,7 @@ def _sample_section_coords(coords, max_samples=28):
     ]
 
 
-def penalize_replaced_section_edges(G, section_coords, multiplier=100000.0):
+def penalize_replaced_section_edges(G, section_coords, multiplier=100000.0, exempt_physical_keys=None):
     """Make the old orange corridor effectively unavailable during replacement.
 
     We retain the edges instead of deleting them so a cut made in the middle of
@@ -6994,6 +6994,7 @@ def penalize_replaced_section_edges(G, section_coords, multiplier=100000.0):
     will not silently fall back to the old section when another connected path
     exists.
     """
+    exempt_physical_keys = set(exempt_physical_keys or [])
     matches = set()
     for point in _sample_section_coords(section_coords):
         match = _nearest_natural_edge_to_selected_point(
@@ -7011,7 +7012,8 @@ def penalize_replaced_section_edges(G, section_coords, multiplier=100000.0):
     H = G.copy()
     touched = 0
     for u, v, key, data in H.edges(keys=True, data=True):
-        if undirected_edge_key(u, v) not in matches:
+        physical_key = undirected_edge_key(u, v)
+        if physical_key not in matches or physical_key in exempt_physical_keys:
             continue
         base = float(data.get("routing_cost", edge_routing_cost(data)) or 0.0)
         length = float(data.get("length", 0.0) or 0.0)
@@ -7069,98 +7071,121 @@ def _exact_directed_edge_choice(G, required, enter, leave):
     return key, data, coords
 
 
-def shortest_path_forcing_selected_edges_exact(G, S, start_node, end_node, required_edges):
-    """Connect cut points while preserving every selected green edge exactly.
+def _selected_overlay_geometry_for_orientation(G, required, enter, leave):
+    """Return the browser-highlighted gray/green geometry oriented enter -> leave.
 
-    Shortest paths are used only to fill gaps *between* the user's selected
-    trail pieces.  The selected pieces themselves are appended using their
-    exact MultiDiGraph geometry, so the finished red route cannot substitute a
-    nearby/parallel trail for something that was highlighted green.
-    Returns ``(node_path, coordinate_path)``.
+    The gray overlay is generated directly from the master trail graph, so the
+    geometry sent back by the browser is the exact visual trail piece the user
+    selected.  Using it here prevents the replacement from silently drawing a
+    parallel/simplified edge that merely shares the same graph endpoints.
+    """
+    raw = required.get("selected_geometry") or []
+    coords = []
+    for point in raw:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        coords.append({"lat": float(point[0]), "lon": float(point[1])})
+
+    if len(coords) < 2:
+        exact = _exact_directed_edge_choice(G, required, enter, leave)
+        if exact is None:
+            return []
+        _, _, edge_coords_lonlat = exact
+        return [
+            {"lat": float(lat), "lon": float(lon)}
+            for lon, lat in edge_coords_lonlat
+        ]
+
+    enter_lat = float(G.nodes[enter]["y"])
+    enter_lon = float(G.nodes[enter]["x"])
+    first_d = haversine_meters(enter_lat, enter_lon, coords[0]["lat"], coords[0]["lon"])
+    last_d = haversine_meters(enter_lat, enter_lon, coords[-1]["lat"], coords[-1]["lon"])
+    if last_d < first_d:
+        coords.reverse()
+    return coords
+
+
+def shortest_path_forcing_selected_edges_exact(G, S, start_node, end_node, required_edges):
+    """Build a deterministic replacement through the selected green corridor.
+
+    V34 used a global orientation/cost search.  Although it technically forced
+    selected edges, it could choose surprising approaches/orientations and make
+    the visible result look almost identical to the original route.  V35 treats
+    the clicked green pieces as an ordered corridor:
+
+      cut start -> green 1 -> green 2 -> ... -> green N -> cut end
+
+    Every green geometry is appended verbatim.  Shortest-path routing is used
+    only for the small gaps between those exact pieces and for the two endpoint
+    connections.  This matches the visual editing model in the browser.
     """
     if not required_edges:
         nodes = nx.shortest_path(S, start_node, end_node, weight="routing_cost")
         return nodes, route_coordinates(G, nodes)
 
-    # endpoint -> (cost, node path, coordinate path)
-    states = {
-        start_node: (
-            0.0,
-            [start_node],
-            [{"lat": float(G.nodes[start_node]["y"]), "lon": float(G.nodes[start_node]["x"])}],
-        )
-    }
+    current = start_node
+    node_path = [start_node]
+    coord_path = [
+        {"lat": float(G.nodes[start_node]["y"]), "lon": float(G.nodes[start_node]["x"])}
+    ]
 
     for required in required_edges:
         u = required["u"]
         v = required["v"]
-        orientations = []
+        candidates = []
+
         for enter, leave in ((u, v), (v, u)):
             if not S.has_edge(enter, leave):
                 continue
             exact = _exact_directed_edge_choice(G, required, enter, leave)
-            if exact is not None:
-                orientations.append((enter, leave, exact))
-        if not orientations:
+            if exact is None:
+                continue
+            try:
+                leg_nodes = nx.shortest_path(S, current, enter, weight="routing_cost")
+                leg_cost = (
+                    nx.path_weight(S, leg_nodes, weight="routing_cost")
+                    if len(leg_nodes) > 1 else 0.0
+                )
+            except (nx.NetworkXNoPath, nx.NodeNotFound):
+                continue
+
+            # Strongly prefer actual endpoint continuity.  If two consecutively
+            # selected gray trail pieces share a graph node, this makes that
+            # zero-gap connection win instead of taking an unrelated detour.
+            continuity_bonus = 0.0 if current == enter else 0.001
+            candidates.append((float(leg_cost) + continuity_bonus, enter, leave, leg_nodes))
+
+        if not candidates:
             raise nx.NetworkXNoPath("Selected replacement trail edge is not traversable.")
 
-        next_states = {}
-        for previous_end, (base_cost, base_nodes, base_coords) in states.items():
-            for enter, leave, exact in orientations:
-                key, data, edge_coords_lonlat = exact
-                try:
-                    leg_nodes = nx.shortest_path(S, previous_end, enter, weight="routing_cost")
-                    leg_cost = nx.path_weight(S, leg_nodes, weight="routing_cost") if len(leg_nodes) > 1 else 0.0
-                except (nx.NetworkXNoPath, nx.NodeNotFound):
-                    continue
+        candidates.sort(key=lambda item: item[0])
+        _, enter, leave, leg_nodes = candidates[0]
 
-                forced_cost = float(data.get("routing_cost", edge_routing_cost(data)) or 0.0)
-                total_cost = float(base_cost) + float(leg_cost) + forced_cost
-
-                node_path = list(base_nodes)
-                node_path.extend(leg_nodes[1:])
-                if not node_path or node_path[-1] != enter:
-                    node_path.append(enter)
-                if node_path[-1] != leave:
-                    node_path.append(leave)
-
-                coord_path = [dict(point) for point in base_coords]
-                if len(leg_nodes) > 1:
-                    _append_route_coords(coord_path, route_coordinates(G, leg_nodes)[1:])
-                exact_coords = [
-                    {"lat": float(lat), "lon": float(lon)}
-                    for lon, lat in edge_coords_lonlat
-                ]
-                _append_route_coords(coord_path, exact_coords)
-
-                existing = next_states.get(leave)
-                if existing is None or total_cost < existing[0]:
-                    next_states[leave] = (total_cost, node_path, coord_path)
-
-        if not next_states:
-            raise nx.NetworkXNoPath("Selected replacement trail pieces cannot be connected in order.")
-        states = next_states
-
-    best = None
-    for previous_end, (base_cost, base_nodes, base_coords) in states.items():
-        try:
-            leg_nodes = nx.shortest_path(S, previous_end, end_node, weight="routing_cost")
-            leg_cost = nx.path_weight(S, leg_nodes, weight="routing_cost") if len(leg_nodes) > 1 else 0.0
-        except (nx.NetworkXNoPath, nx.NodeNotFound):
-            continue
-
-        total_cost = float(base_cost) + float(leg_cost)
-        node_path = list(base_nodes) + list(leg_nodes[1:])
-        coord_path = [dict(point) for point in base_coords]
         if len(leg_nodes) > 1:
+            node_path.extend(leg_nodes[1:])
             _append_route_coords(coord_path, route_coordinates(G, leg_nodes)[1:])
-        if best is None or total_cost < best[0]:
-            best = (total_cost, node_path, coord_path)
 
-    if best is None:
+        selected_coords = _selected_overlay_geometry_for_orientation(G, required, enter, leave)
+        if len(selected_coords) < 2:
+            raise nx.NetworkXNoPath("Could not preserve a selected green trail geometry.")
+        _append_route_coords(coord_path, selected_coords)
+
+        if not node_path or node_path[-1] != enter:
+            node_path.append(enter)
+        if node_path[-1] != leave:
+            node_path.append(leave)
+        current = leave
+
+    try:
+        leg_nodes = nx.shortest_path(S, current, end_node, weight="routing_cost")
+    except (nx.NetworkXNoPath, nx.NodeNotFound):
         raise nx.NetworkXNoPath("Replacement corridor cannot reconnect to the route.")
-    return best[1], best[2]
 
+    if len(leg_nodes) > 1:
+        node_path.extend(leg_nodes[1:])
+        _append_route_coords(coord_path, route_coordinates(G, leg_nodes)[1:])
+
+    return node_path, coord_path
 
 def classify_route_geometry_against_graph(G, coords):
     """Estimate trail/connector/retrace stats for a stitched edited geometry.
@@ -7440,6 +7465,12 @@ def replace_route_section(request: RouteSectionReplacementRequest):
                     status_code=400,
                     detail=f"Replacement trail segment {index + 1} is not available in the routing graph or is blocked by an avoid setting.",
                 )
+            match = dict(match)
+            match["selected_geometry"] = [
+                [float(point[0]), float(point[1])]
+                for point in (selected.geometry or [])
+                if isinstance(point, (list, tuple)) and len(point) >= 2
+            ]
             required_edges.append(match)
             resolved_segments.append({
                 "index": index,
@@ -7450,21 +7481,30 @@ def replace_route_section(request: RouteSectionReplacementRequest):
                 "edge_v": int(match["v"]),
             })
 
-        # Make the orange section effectively unavailable. The selected green
-        # edges themselves remain traversable if they overlap an endpoint.
+        # Make the old orange corridor effectively unavailable, but NEVER
+        # penalize one of the green trail pieces the user explicitly selected.
+        # The older code could accidentally penalize a nearby green segment when
+        # the orange and green corridors ran close together.
+        selected_physical_keys = {
+            item["physical_key"] for item in required_edges if item.get("physical_key") is not None
+        }
         G, penalized_edge_count = penalize_replaced_section_edges(
-            G, route[cut_a:cut_b + 1]
+            G,
+            route[cut_a:cut_b + 1],
+            exempt_physical_keys=selected_physical_keys,
         )
 
-        # Re-resolve the required edges after the orange penalty copy so the
-        # node references line up with the graph used for pathfinding.
+        # Re-resolve against the penalized graph, but carry the browser's exact
+        # highlighted geometry forward. This is what gets spliced into the route.
         forced_edges = []
-        for selected in request.replacement_segments:
+        for selected, original_match in zip(request.replacement_segments, required_edges):
             match = _nearest_natural_edge_to_selected_point(
                 G, float(selected.lat), float(selected.lon)
             )
             if match is None:
                 raise HTTPException(status_code=400, detail="A selected green trail disappeared after applying route constraints.")
+            match = dict(match)
+            match["selected_geometry"] = list(original_match.get("selected_geometry") or [])
             forced_edges.append(match)
 
         connector_multiplier = connector_path_multiplier_for_target(
@@ -7519,6 +7559,17 @@ def replace_route_section(request: RouteSectionReplacementRequest):
                     stitched[-1] = dict(point)
                     continue
             stitched.append(dict(point))
+
+        # A replacement operation must visibly change the selected route. If the
+        # stitched geometry is still effectively identical, fail loudly instead
+        # of telling the browser that the edit succeeded.
+        old_signature = _coordinate_route_signature(route)
+        new_signature = _coordinate_route_signature(stitched)
+        if old_signature == new_signature:
+            raise HTTPException(
+                status_code=409,
+                detail="The selected green corridor produced the same route. Select trail pieces that leave the orange section before reconnecting.",
+            )
 
         option = build_stitched_route_option(G, stitched, request, new_path_nodes)
         option["replacement_distance_miles"] = round(
@@ -8617,7 +8668,7 @@ input[type="range"] {
     <div class="section-content">
         <div id="section-replacement-panel" class="tool-block section-replacement-panel">
             <div class="tool-heading">Replace a route section</div>
-            <div class="small">Click Start selection, click the red route once where the old section begins, then click the gray trail pieces you want to use in order. When your green selection reaches the red route again, click Replace section. The app finds that rejoin automatically and replaces the old section using the exact green trail pieces you selected.</div>
+            <div class="small">Click Start selection, click the red route once where the old section begins, then click the gray trail pieces you want to use in order. When the green corridor reaches the red route again, click Replace section. The orange section is removed and the highlighted green trail geometry is spliced into the route exactly.</div>
             <div class="replacement-legend">
                 <span><i class="legend-line keep"></i> kept route</span>
                 <span><i class="legend-line remove"></i> remove</span>
@@ -9452,7 +9503,7 @@ async function applyRouteSectionReplacement() {
         drawRouteOptions(lastGeneratedRoute, editedIndex, false);
         selectRouteOption(editedIndex, false);
         document.getElementById("routeReplacementStatus").textContent =
-            "Section replaced. The red route now follows the exact green trail pieces you selected, with only the minimum connections needed between them.";
+            "Section replaced. The red route now contains the highlighted green trail pieces exactly; only small connecting gaps are routed automatically.";
     } catch (error) {
         // Keep the selection live so the user can add another green piece and
         // press Replace section again instead of restarting the whole edit.
