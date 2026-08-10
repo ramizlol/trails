@@ -1,9 +1,11 @@
 from fastapi import FastAPI, HTTPException, UploadFile, File, Query
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
+from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel
 
 import math
 import os
+import json
 import random
 import time
 import threading
@@ -22,6 +24,7 @@ from sklearn.neighbors import BallTree
 
 
 app = FastAPI()
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
 # ============================================================
@@ -65,7 +68,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-09-v11-offline-master"
+APP_VERSION = "2026-08-09-v12-start-workspace-overlay-cache"
 MASTER_NETWORK_SCHEMA = "trail-only-v11-offline-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -91,6 +94,21 @@ SELECTIVE_CONNECTOR_MAX_GAP_M = 7000.0
 SELECTIVE_CONNECTOR_ATTACH_MAX_M = 90.0
 SELECTIVE_CONNECTOR_CACHE = {}
 MAX_SELECTIVE_CONNECTOR_CACHE = 16
+
+# V12 separates the expensive routing-area preparation from distance/elevation
+# targets. A workspace is keyed only by the requested start coordinate and
+# contains the TIFF-wide trail graph plus the small selective connector set.
+# Changing distance/gain reuses this workspace and only creates a cheap in-memory
+# radius subgraph for the actual route search.
+MAX_CACHED_WORKSPACES = 3
+WORKSPACE_CACHE = {}
+WORKSPACE_CACHE_LOCK = threading.Lock()
+
+# The gray TIFF-wide trail overlay is serialized once per server process and
+# served as compact, gzip-compressed JSON. The browser fetches it once and keeps
+# it while distance/elevation targets change.
+MASTER_TRAIL_OVERLAY_JSON = None
+MASTER_TRAIL_OVERLAY_LOCK = threading.Lock()
 CONNECTOR_FILTER = '["highway"~"footway|pedestrian|cycleway|bridleway|residential|living_street|service|unclassified|tertiary|secondary|primary|road"]'
 
 
@@ -111,6 +129,7 @@ class TrailNetworkRequest(BaseModel):
     start_lat: float
     start_lon: float
     target_distance_miles: float
+    force_reload: bool = False
 
 
 # ============================================================
@@ -2085,74 +2104,320 @@ def add_reachable_dem_edge_elevations(G, start_lat, start_lon):
     return H, 0
 
 
-def download_trail_graph(lat, lon, radius_meters):
-    """
-    V11 local-graph wrapper.
-
-    The master graph is loaded from the offline repository file. Long route
-    requests may still add only a handful of reduced connector paths; the full
-    urban street graph is never retained.
-    """
-    cache_key = (
+def workspace_cache_key(lat, lon):
+    return (
         round(float(lat), 5),
         round(float(lon), 5),
-        int(radius_meters),
-        ELEVATION_SAMPLE_SPACING_M,
         os.path.basename(DEM_PATH),
-        "selective-v11-offline",
+        "start-workspace-v12",
     )
 
-    if cache_key in GRAPH_CACHE:
-        cached = GRAPH_CACHE[cache_key]
-        return (
-            cached["graph"],
-            cached["filtered_edges_removed"],
-            True,
-            cached["unique_elevation_samples"],
+
+def workspace_max_radius_meters(lat, lon):
+    """Radius from the requested start that fully covers the TIFF footprint."""
+    left, bottom, right, top = get_dem_bounds_wgs84()
+    corners = [
+        (bottom, left),
+        (bottom, right),
+        (top, left),
+        (top, right),
+    ]
+    farthest = max(
+        haversine_meters(float(lat), float(lon), float(clat), float(clon))
+        for clat, clon in corners
+    )
+    return float(farthest + 150.0)
+
+
+def physical_trail_segment_count(G):
+    seen = set()
+    for u, v, key, data in G.edges(keys=True, data=True):
+        if str(data.get("route_class", "trail")) != "trail":
+            continue
+        pk = (
+            min(int(u), int(v)),
+            max(int(u), int(v)),
+            round(float(data.get("length", 0) or 0), 1),
+        )
+        seen.add(pk)
+    return len(seen)
+
+
+def finalize_workspace_graph(G, start_node, start_lat, start_lon):
+    """
+    Prepare routing metadata once for a start-specific workspace.
+
+    Natural-trail elevation heuristics are already baked into the offline
+    master. Connector heuristics remain cheap here; authoritative route gain is
+    still measured from the full 5 m DEM profile for finalists.
+    """
+    for u, v, key, data in G.edges(keys=True, data=True):
+        data["ascent_m"] = float(data.get("ascent_m", 0) or 0)
+        data["descent_m"] = float(data.get("descent_m", 0) or 0)
+        data["elevation_sample_count"] = int(
+            float(data.get("elevation_sample_count", 0) or 0)
+        )
+        data["routing_cost"] = float(edge_routing_cost(data))
+
+    radial = {}
+    for node, data in G.nodes(data=True):
+        try:
+            radial[node] = haversine_meters(
+                float(start_lat),
+                float(start_lon),
+                float(data["y"]),
+                float(data["x"]),
+            )
+        except Exception:
+            radial[node] = float("inf")
+
+    radial[start_node] = 0.0
+
+    try:
+        reachable = set(
+            nx.node_connected_component(
+                G.to_undirected(as_view=True),
+                start_node,
+            )
+        )
+    except Exception:
+        reachable = {start_node}
+
+    routeable_edges = sum(
+        1
+        for u, v in G.edges()
+        if u in reachable and v in reachable
+    )
+
+    G.graph["workspace_node_radial_m"] = radial
+    G.graph["routeable_component_nodes"] = len(reachable)
+    G.graph["routeable_component_edges"] = routeable_edges
+    G.graph["offline_master_elevation_used"] = True
+    return G
+
+
+def get_start_workspace(lat, lon, force_rebuild=False):
+    """
+    Build/load the expensive routing workspace keyed ONLY by start coordinate.
+
+    Distance and elevation are intentionally absent from the key. The workspace
+    contains the entire offline TIFF trail graph plus the small selective
+    connector set, so target changes never trigger OSM/connector preparation.
+    """
+    if not point_inside_dem(lat, lon):
+        left, bottom, right, top = get_dem_bounds_wgs84()
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Start coordinate is outside TIFF coverage: "
+                f"west={left:.6f}, east={right:.6f}, "
+                f"south={bottom:.6f}, north={top:.6f}."
+            ),
         )
 
-    master_G, master_info = get_master_trail_graph()
+    key = workspace_cache_key(lat, lon)
 
-    G = extract_local_master_subgraph(
-        master_G,
-        lat,
-        lon,
-        radius_meters,
+    if not force_rebuild and key in WORKSPACE_CACHE:
+        return WORKSPACE_CACHE[key], True
+
+    with WORKSPACE_CACHE_LOCK:
+        if not force_rebuild and key in WORKSPACE_CACHE:
+            return WORKSPACE_CACHE[key], True
+
+        started = time.perf_counter()
+        master_G, master_info = get_master_trail_graph()
+
+        max_radius_m = workspace_max_radius_meters(lat, lon)
+
+        # add_selective_connectors only considers target systems out to ~55% of
+        # its radius. Doubling the TIFF-covering radius makes every trail system
+        # in the TIFF eligible during this one start-specific preparation pass.
+        connector_radius_m = max(
+            SELECTIVE_CONNECTORS_MIN_RADIUS_M,
+            max_radius_m * 2.0,
+        )
+
+        G, connector_stats = add_selective_connectors(
+            master_G,
+            float(lat),
+            float(lon),
+            connector_radius_m,
+        )
+
+        # Insert/split the exact requested start only once per workspace.
+        G, start_node, start_info = insert_exact_routing_point(
+            G,
+            float(lat),
+            float(lon),
+        )
+
+        G = finalize_workspace_graph(
+            G,
+            start_node,
+            float(lat),
+            float(lon),
+        )
+
+        build_seconds = time.perf_counter() - started
+
+        G.graph["selective_connector_stats"] = connector_stats
+        G.graph["workspace_start_node"] = start_node
+        G.graph["workspace_start_info"] = dict(start_info)
+        G.graph["workspace_start_lat"] = float(lat)
+        G.graph["workspace_start_lon"] = float(lon)
+        G.graph["workspace_max_radius_m"] = float(max_radius_m)
+        G.graph["workspace_connector_radius_m"] = float(connector_radius_m)
+        G.graph["workspace_build_seconds"] = float(build_seconds)
+        G.graph["workspace_master_file"] = master_info.get(
+            "saved_graph",
+            os.path.basename(MASTER_GRAPH_PATH),
+        )
+
+        workspace = {
+            "graph": G,
+            "start_node": start_node,
+            "start_info": dict(start_info),
+            "max_radius_m": float(max_radius_m),
+            "connector_radius_m": float(connector_radius_m),
+            "build_seconds": float(build_seconds),
+            "filtered_edges_removed": master_info["filtered_edges_removed"],
+            "master_info": master_info,
+        }
+
+        if force_rebuild:
+            WORKSPACE_CACHE.pop(key, None)
+
+        while len(WORKSPACE_CACHE) >= MAX_CACHED_WORKSPACES:
+            oldest = next(iter(WORKSPACE_CACHE))
+            WORKSPACE_CACHE.pop(oldest, None)
+
+        WORKSPACE_CACHE[key] = workspace
+        return workspace, False
+
+
+def extract_route_graph_from_workspace(workspace, radius_meters):
+    """
+    Cheap target-specific graph extraction from an already prepared workspace.
+
+    This is a true radial filter around the requested start. No OSM request,
+    connector download, master-graph parsing, DEM edge annotation, or gray-map
+    serialization happens here.
+    """
+    G = workspace["graph"]
+    start_node = workspace["start_node"]
+    requested_radius = max(100.0, float(radius_meters))
+    max_radius = float(workspace["max_radius_m"])
+
+    if requested_radius >= max_radius:
+        H = G
+    else:
+        radial = G.graph.get("workspace_node_radial_m", {})
+        # Small buffer keeps edges whose endpoints sit just outside the nominal
+        # radius from being needlessly severed by coordinate rounding.
+        cutoff = requested_radius + 35.0
+        nodes = [
+            node
+            for node, distance in radial.items()
+            if float(distance) <= cutoff
+        ]
+        if start_node not in nodes:
+            nodes.append(start_node)
+        H = G.subgraph(nodes).copy()
+
+    if start_node not in H or H.number_of_edges() == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No routeable trail network exists inside this distance radius.",
+        )
+
+    H.graph["workspace_start_node"] = start_node
+    H.graph["workspace_start_info"] = dict(workspace["start_info"])
+    H.graph["workspace_start_lat"] = float(G.graph.get("workspace_start_lat"))
+    H.graph["workspace_start_lon"] = float(G.graph.get("workspace_start_lon"))
+    H.graph["workspace_max_radius_m"] = max_radius
+    H.graph["search_radius_m"] = requested_radius
+    H.graph["workspace_build_seconds"] = float(workspace["build_seconds"])
+    H.graph["workspace_connector_radius_m"] = float(workspace["connector_radius_m"])
+    H.graph["selective_connector_stats"] = G.graph.get(
+        "selective_connector_stats",
+        {},
     )
 
-    G, connector_stats = add_selective_connectors(
-        G,
-        lat,
-        lon,
-        radius_meters,
+    try:
+        reachable = set(
+            nx.node_connected_component(
+                H.to_undirected(as_view=True),
+                start_node,
+            )
+        )
+        H.graph["routeable_component_nodes"] = len(reachable)
+        H.graph["routeable_component_edges"] = sum(
+            1 for u, v in H.edges() if u in reachable and v in reachable
+        )
+    except Exception:
+        H.graph["routeable_component_nodes"] = 1
+        H.graph["routeable_component_edges"] = 0
+
+    return H
+
+
+def download_trail_graph(lat, lon, radius_meters):
+    """
+    V12 compatibility wrapper used by route/GPX endpoints.
+
+    The expensive workspace is keyed only by start. Target distance changes
+    merely slice that in-memory workspace by radius.
+    """
+    workspace, workspace_from_cache = get_start_workspace(
+        float(lat),
+        float(lon),
+        force_rebuild=False,
     )
 
-    # Only the component actually routeable from the requested start receives
-    # DEM edge annotations. Other disconnected trails stay visible in gray but
-    # do not create a giant 5 m elevation-sampling workload.
-    G, unique_elevation_samples = add_reachable_dem_edge_elevations(
-        G,
-        lat,
-        lon,
+    G = extract_route_graph_from_workspace(
+        workspace,
+        float(radius_meters),
     )
-    G.graph["selective_connector_stats"] = connector_stats
 
-    if len(GRAPH_CACHE) >= MAX_CACHED_GRAPHS:
-        oldest = next(iter(GRAPH_CACHE))
-        GRAPH_CACHE.pop(oldest)
-
-    GRAPH_CACHE[cache_key] = {
-        "graph": G,
-        "filtered_edges_removed": master_info["filtered_edges_removed"],
-        "unique_elevation_samples": unique_elevation_samples,
-    }
-
+    G.graph["workspace_from_cache"] = bool(workspace_from_cache)
     return (
         G,
-        master_info["filtered_edges_removed"],
-        False,
-        unique_elevation_samples,
+        int(workspace["filtered_edges_removed"]),
+        bool(workspace_from_cache),
+        0,
     )
+
+
+def get_master_trail_overlay_json():
+    """Serialize the TIFF-wide gray trail overlay exactly once per process."""
+    global MASTER_TRAIL_OVERLAY_JSON
+
+    if MASTER_TRAIL_OVERLAY_JSON is not None:
+        return MASTER_TRAIL_OVERLAY_JSON
+
+    with MASTER_TRAIL_OVERLAY_LOCK:
+        if MASTER_TRAIL_OVERLAY_JSON is not None:
+            return MASTER_TRAIL_OVERLAY_JSON
+
+        master_G, master_info = get_master_trail_graph()
+        segments = graph_debug_segments(master_G)
+        payload = {
+            "allowed_trails": segments,
+            "allowed_trail_segments": len(segments),
+            "master_network_nodes": master_info["nodes"],
+            "master_network_edges": master_info["edges"],
+            "master_graph_file": master_info.get(
+                "saved_graph",
+                os.path.basename(MASTER_GRAPH_PATH),
+            ),
+            "master_tiff": os.path.basename(DEM_PATH),
+            "version": APP_VERSION,
+        }
+        MASTER_TRAIL_OVERLAY_JSON = json.dumps(
+            payload,
+            separators=(",", ":"),
+        )
+        return MASTER_TRAIL_OVERLAY_JSON
 
 # ============================================================
 # SIMPLE ROUTING GRAPH
@@ -4012,11 +4277,15 @@ async def test_gpx_against_generator(file: UploadFile = File(...)):
             limits,
         )
 
-        generator_G, generator_start_node, generator_start_info = insert_exact_routing_point(
-            G,
-            start_lat,
-            start_lon,
-        )
+        generator_G = G
+        generator_start_node = G.graph.get("workspace_start_node")
+        generator_start_info = G.graph.get("workspace_start_info") or {}
+        if generator_start_node is None or generator_start_node not in generator_G:
+            generator_G, generator_start_node, generator_start_info = insert_exact_routing_point(
+                G,
+                start_lat,
+                start_lon,
+            )
 
         generator = {
             "success": False,
@@ -4293,42 +4562,65 @@ async def analyze_gpx(
 # TRAIL NETWORK ENDPOINT
 # ============================================================
 
+@app.get("/trail-overlay")
+def trail_overlay():
+    """
+    TIFF-wide natural-trail visualization, independent of route targets.
+
+    The JSON string is created once and GZipMiddleware compresses it in transit.
+    The browser fetches this endpoint once per page session instead of receiving
+    gray trail geometry before every route search.
+    """
+    return Response(
+        content=get_master_trail_overlay_json(),
+        media_type="application/json",
+        headers={
+            "Cache-Control": "public, max-age=3600",
+        },
+    )
+
+
 @app.post("/trail-network")
 def trail_network(request: TrailNetworkRequest):
     try:
         profile = get_route_profile(request.target_distance_miles)
 
-        (
-            G,
-            filtered_edges_removed,
-            graph_from_cache,
-            unique_elevation_samples,
-        ) = download_trail_graph(
+        workspace, workspace_from_cache = get_start_workspace(
             request.start_lat,
             request.start_lon,
+            force_rebuild=bool(request.force_reload),
+        )
+
+        # This cheap slice is only for diagnostics. It does not rebuild the
+        # workspace and does not serialize any gray-map geometry.
+        G = extract_route_graph_from_workspace(
+            workspace,
             profile["search_radius_m"],
         )
 
-        G, start_node, start_info = insert_exact_routing_point(
-            G,
-            request.start_lat,
-            request.start_lon,
-        )
+        start_node = workspace["start_node"]
+        start_info = workspace["start_info"]
+        workspace_G = workspace["graph"]
 
-        snapped_lat = float(G.nodes[start_node]["y"])
-        snapped_lon = float(G.nodes[start_node]["x"])
+        snapped_lat = float(workspace_G.nodes[start_node]["y"])
+        snapped_lon = float(workspace_G.nodes[start_node]["x"])
         snap_distance = float(start_info["routing_offset_m"])
 
-        segments = graph_debug_segments(G)
         local_trail_edges, local_connector_edges = graph_route_class_counts(G)
-        connector_stats = G.graph.get("selective_connector_stats", {}) or {}
-        _, master_info = get_master_trail_graph()
+        connector_stats = workspace_G.graph.get("selective_connector_stats", {}) or {}
+        master_info = workspace["master_info"]
 
         return {
-            "allowed_trails": segments,
-            "allowed_trail_segments": len(segments),
+            # Gray geometry intentionally lives at /trail-overlay now.
+            "allowed_trail_segments": physical_trail_segment_count(G),
             "network_nodes": G.number_of_nodes(),
             "network_edges": G.number_of_edges(),
+            "workspace_nodes": workspace_G.number_of_nodes(),
+            "workspace_edges": workspace_G.number_of_edges(),
+            "workspace_max_radius_m": round(float(workspace["max_radius_m"]), 1),
+            "workspace_connector_radius_m": round(float(workspace["connector_radius_m"]), 1),
+            "workspace_build_seconds": round(float(workspace["build_seconds"]), 3),
+            "workspace_from_cache": bool(workspace_from_cache),
             "master_network_nodes": master_info["nodes"],
             "master_network_edges": master_info["edges"],
             "master_physical_segments": master_info["physical_segments"],
@@ -4347,7 +4639,7 @@ def trail_network(request: TrailNetworkRequest):
             "master_loaded_from_disk": master_info["loaded_from_disk"],
             "master_elevation_precomputed": master_info.get("elevation_precomputed", False),
             "master_graph_file": master_info.get("saved_graph", os.path.basename(MASTER_GRAPH_PATH)),
-            "request_edge_dem_samples": int(unique_elevation_samples),
+            "request_edge_dem_samples": 0,
             "master_tiff": os.path.basename(DEM_PATH),
             "search_radius_m": profile["search_radius_m"],
             "route_profile": profile["name"],
@@ -4364,9 +4656,9 @@ def trail_network(request: TrailNetworkRequest):
             "exact_start_inserted": bool(start_info["exact_inserted"]),
             "start_trail_offset_m": float(start_info["trail_offset_m"]),
             "start_source_edge": start_info.get("source_edge"),
-            "filtered_edges_removed": filtered_edges_removed,
-            "graph_from_cache": graph_from_cache,
-            "elevation_samples": unique_elevation_samples,
+            "filtered_edges_removed": int(workspace["filtered_edges_removed"]),
+            "graph_from_cache": bool(workspace_from_cache),
+            "elevation_samples": 0,
         }
 
     except HTTPException:
@@ -4497,11 +4789,14 @@ def generate_route(request: RouteRequest):
             and abs(request.start_lon - request.end_lon) < 0.0001
         )
 
-        G, start_node, start_info = insert_exact_routing_point(
-            G,
-            request.start_lat,
-            request.start_lon,
-        )
+        start_node = G.graph.get("workspace_start_node")
+        start_info = G.graph.get("workspace_start_info") or {}
+        if start_node is None or start_node not in G:
+            G, start_node, start_info = insert_exact_routing_point(
+                G,
+                request.start_lat,
+                request.start_lon,
+            )
 
         if same_point:
             end_node = start_node
@@ -4881,7 +5176,7 @@ button:disabled {
 <div id="controls">
 
 <h2>Trail Running Creator</h2>
-<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-v10-fast-multi-route</div>
+<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-v12-start-workspace-overlay-cache</div>
 
 <div class="input-row">
     <div class="input-group">
@@ -4919,12 +5214,12 @@ button:disabled {
 
 <button id="generateButton">Generate Trail Route</button>
 <button id="downloadGpxButton" disabled>Download GPX for COROS</button>
-<button id="networkButton">Reload Allowed Trails</button>
+<button id="networkButton">Load / Refresh Start Area</button>
 
 <div class="network-control">
     <label>
         <input id="showNetwork" type="checkbox" checked>
-        Show allowed trail network
+        Show TIFF-wide trail network
     </label>
 </div>
 
@@ -4957,7 +5252,7 @@ button:disabled {
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
 <script>
-const map = L.map("map").setView(
+const map = L.map("map", {preferCanvas: true}).setView(
     [33.586055, -112.083341],
     15
 );
@@ -4979,6 +5274,10 @@ let lastGeneratedRoute = null;
 let requestedStartMarker = null;
 let snappedStartMarker = null;
 let snapLine = null;
+let loadedWorkspaceStartKey = null;
+let lastWorkspaceResult = null;
+let masterTrailOverlayLoaded = false;
+let masterTrailOverlayPromise = null;
 
 const generateButton = document.getElementById("generateButton");
 const downloadGpxButton = document.getElementById("downloadGpxButton");
@@ -5221,12 +5520,77 @@ async function readJsonResponse(response) {
 }
 
 
+function getWorkspaceStartKey(data) {
+    const lat = Number(data.start_lat);
+    const lon = Number(data.start_lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+        return "";
+    }
+    return lat.toFixed(5) + "," + lon.toFixed(5);
+}
+
+
+async function loadMasterTrailOverlayOnce() {
+    if (masterTrailOverlayLoaded) {
+        return;
+    }
+
+    if (masterTrailOverlayPromise) {
+        return masterTrailOverlayPromise;
+    }
+
+    masterTrailOverlayPromise = (async () => {
+        const response = await fetch("/trail-overlay");
+        const result = await readJsonResponse(response);
+
+        networkLayer.clearLayers();
+
+        if (result.allowed_trails && result.allowed_trails.length > 0) {
+            // One canvas-backed multi-polyline is much cheaper for Leaflet than
+            // creating thousands of individual line-layer objects.
+            L.polyline(
+                result.allowed_trails,
+                {
+                    weight: 3,
+                    opacity: 0.42,
+                    color: "#666666",
+                    interactive: false
+                }
+            ).addTo(networkLayer);
+        }
+
+        masterTrailOverlayLoaded = true;
+        updateNetworkVisibility();
+        return result;
+    })();
+
+    try {
+        return await masterTrailOverlayPromise;
+    } finally {
+        masterTrailOverlayPromise = null;
+    }
+}
+
+
 async function loadTrailNetwork(data) {
     const diagnostics = document.getElementById("diagnostics");
+    const startKey = getWorkspaceStartKey(data);
 
-    // Clear the previous gray network immediately so a failed request can never
-    // leave stale trail lines on the map and make them look like fresh data.
-    networkLayer.clearLayers();
+    // Start the gray-overlay fetch in parallel. It is visualization only and
+    // must never block routing-area preparation or route search.
+    loadMasterTrailOverlayOnce().catch(error => {
+        console.warn("Trail overlay load failed:", error);
+    });
+
+    // V12: the expensive workspace depends only on start. Distance/elevation
+    // changes reuse it and never call this endpoint again from normal Generate.
+    if (
+        startKey &&
+        loadedWorkspaceStartKey === startKey &&
+        lastWorkspaceResult
+    ) {
+        return lastWorkspaceResult;
+    }
 
     const response = await fetch(
         "/trail-network",
@@ -5238,25 +5602,16 @@ async function loadTrailNetwork(data) {
             body: JSON.stringify({
                 start_lat: data.start_lat,
                 start_lon: data.start_lon,
-                target_distance_miles: data.target_distance_miles
+                target_distance_miles: data.target_distance_miles,
+                force_reload: false
             })
         }
     );
 
     const result = await readJsonResponse(response);
 
-    for (const segment of result.allowed_trails) {
-        L.polyline(
-            segment,
-            {
-                weight: 3,
-                opacity: 0.45,
-                color: "#666666"
-            }
-        ).addTo(networkLayer);
-    }
-
-    updateNetworkVisibility();
+    loadedWorkspaceStartKey = startKey;
+    lastWorkspaceResult = result;
 
     if (requestedStartMarker) {
         map.removeLayer(requestedStartMarker);
@@ -5326,7 +5681,10 @@ async function loadTrailNetwork(data) {
     }
 
     diagnostics.innerHTML =
-        "<b>Allowed trail network:</b> " +
+        "<b>Routing area ready for this start:</b> YES<br>" +
+        "<b>Distance/elevation changes reload trails:</b> NO<br>" +
+        "<b>Gray overlay:</b> TIFF-wide · loaded once in browser<br>" +
+        "<b>Current radius trail segments:</b> " +
         result.allowed_trail_segments +
         " physical segments<br>" +
         "<b>Master TIFF trail network:</b> " +
@@ -5344,15 +5702,16 @@ async function loadTrailNetwork(data) {
         "<b>Trail elevation precomputed:</b> " +
         (result.master_elevation_precomputed ? "YES" : "NO") +
         "<br>" +
-        "<b>Request-time trail edge DEM samples:</b> " +
-        result.request_edge_dem_samples +
+        "<b>Workspace from cache:</b> " +
+        (result.workspace_from_cache ? "YES" : "NO") +
         "<br>" +
-        "<b>Graph nodes:</b> " +
-        result.network_nodes +
-        "<br>" +
-        "<b>Graph edges:</b> " +
-        result.network_edges +
-        "<br>" +
+        "<b>Workspace build:</b> " +
+        result.workspace_build_seconds +
+        " s<br>" +
+        "<b>Workspace graph:</b> " +
+        result.workspace_nodes + " nodes / " + result.workspace_edges + " edges<br>" +
+        "<b>Current search graph:</b> " +
+        result.network_nodes + " nodes / " + result.network_edges + " edges<br>" +
         "<b>Trail components:</b> " +
         result.trail_components_before +
         " → " +
@@ -5373,8 +5732,11 @@ async function loadTrailNetwork(data) {
         "<b>Requested point → trail:</b> " +
         result.start_trail_offset_m +
         " m<br>" +
-        "<b>Search radius:</b> " +
+        "<b>Current route search radius:</b> " +
         result.search_radius_m +
+        " m<br>" +
+        "<b>Workspace TIFF-covering radius:</b> " +
+        result.workspace_max_radius_m +
         " m<br>" +
         "<b>Profile:</b> " +
         result.route_profile +
@@ -5388,9 +5750,17 @@ async function loadTrailNetwork(data) {
 async function reloadNetwork() {
     const data = getInputData();
     const diagnostics = document.getElementById("diagnostics");
+    const startKey = getWorkspaceStartKey(data);
 
     networkButton.disabled = true;
-    diagnostics.innerHTML = '<span class="warning">Loading offline trail network...</span>';
+
+    if (loadedWorkspaceStartKey === startKey && lastWorkspaceResult) {
+        diagnostics.innerHTML = '<span class="success">Routing area is already loaded for this start. Distance/elevation changes reuse it.</span>';
+        networkButton.disabled = false;
+        return;
+    }
+
+    diagnostics.innerHTML = '<span class="warning">Preparing routing area for this start...</span>';
 
     try {
         await loadTrailNetwork(data);
@@ -5414,7 +5784,13 @@ async function generateRoute() {
     clearGeneratedRouteLines();
 
     try {
-        await loadTrailNetwork(data);
+        const workspaceKey = getWorkspaceStartKey(data);
+        const needsWorkspace = loadedWorkspaceStartKey !== workspaceKey || !lastWorkspaceResult;
+
+        if (needsWorkspace) {
+            results.innerHTML = '<span class="warning">Preparing routing area for this start...</span>';
+            await loadTrailNetwork(data);
+        }
 
         results.innerHTML = '<span class="warning">Searching route alternatives...</span>';
 
@@ -5485,7 +5861,7 @@ async function generateRoute() {
             '<b>Start snap distance:</b> ' + result.snap_distance_m + ' m<br>' +
             '<b>Exact start inserted:</b> ' + (result.exact_start_inserted ? 'YES' : 'NO') + '<br>' +
             '<b>Requested point → trail:</b> ' + result.start_trail_offset_m + ' m<br><br>' +
-            '<b>Graph cached:</b> ' + result.graph_from_cache + '<br>' +
+            '<b>Start workspace cached:</b> ' + result.graph_from_cache + '<br>' +
             '<b>Elevation samples:</b> ' + result.unique_elevation_samples + '<br>' +
             '<b>Elevation sample spacing:</b> ~' + result.elevation_sample_spacing_m + ' m<br>' +
             '<b>Elevation smoothing:</b> ~' + result.elevation_smoothing_distance_m + ' m (' + result.elevation_smoothing_window_points + ' points)<br>' +
@@ -5737,7 +6113,7 @@ function clearGpx() {
 }
 
 
-// Load the default allowed network when the page opens.
+// Load the TIFF-wide gray overlay and prepare the default start workspace once.
 reloadNetwork();
 </script>
 
