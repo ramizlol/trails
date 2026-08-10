@@ -84,7 +84,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-10-v28-edit-filters-history"
+APP_VERSION = "2026-08-10-v29-section-replacement-editor"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -233,14 +233,34 @@ class RouteRequest(BaseModel):
     target_distance_miles: float
     target_gain_ft: float
     pass_points: list[RequiredPassPoint] = Field(default_factory=list)
-    # Direct route-edit handles are kept separate in the UI but use the same
-    # required-zone routing machinery on the backend.
+    # Kept for backwards compatibility with v28 requests. The v29 browser no
+    # longer uses ambiguous drag-to-reroute handles; it uses explicit section
+    # replacement instead.
     route_edit_points: list[RequiredPassPoint] = Field(default_factory=list)
     avoid_areas: list[AvoidArea] = Field(default_factory=list)
     avoid_segments: list[TrailSegmentPoint] = Field(default_factory=list)
     prefer_segments: list[TrailSegmentPoint] = Field(default_factory=list)
     route_diversity: float = DEFAULT_ROUTE_DIVERSITY
     search_seed: int | None = None
+
+
+class RouteCoordinatePoint(BaseModel):
+    lat: float
+    lon: float
+
+
+class RouteSectionReplacementRequest(BaseModel):
+    start_lat: float
+    start_lon: float
+    target_distance_miles: float
+    target_gain_ft: float
+    current_route: list[RouteCoordinatePoint]
+    cut_start_index: int
+    cut_end_index: int
+    replacement_segments: list[TrailSegmentPoint] = Field(default_factory=list)
+    avoid_areas: list[AvoidArea] = Field(default_factory=list)
+    avoid_segments: list[TrailSegmentPoint] = Field(default_factory=list)
+    prefer_segments: list[TrailSegmentPoint] = Field(default_factory=list)
 
 
 class TrailNetworkRequest(BaseModel):
@@ -6937,6 +6957,425 @@ def build_gpx_export_points(coords):
     ]
 
 # ============================================================
+# V29 EXPLICIT ROUTE-SECTION REPLACEMENT
+# ============================================================
+
+def _coordinate_route_signature(coords):
+    payload = "|".join(
+        f"{float(point['lat']):.6f},{float(point['lon']):.6f}"
+        for point in coords
+    )
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _sample_section_coords(coords, max_samples=28):
+    coords = list(coords or [])
+    if len(coords) <= 2:
+        return coords
+    # Skip the exact cut endpoints so the replacement can still leave/join the
+    # original route cleanly even when a cut lies in the middle of one OSM edge.
+    interior = coords[1:-1]
+    if len(interior) <= max_samples:
+        return interior
+    return [
+        interior[int(round(i * (len(interior) - 1) / max(1, max_samples - 1)))]
+        for i in range(max_samples)
+    ]
+
+
+def penalize_replaced_section_edges(G, section_coords, multiplier=45.0):
+    """Strongly discourage the old orange corridor during section replacement.
+
+    It is a penalty rather than deletion so the cut endpoints can still use a
+    few meters of their original edge when that is the only topologically valid
+    way to enter/leave the replacement.
+    """
+    matches = set()
+    for point in _sample_section_coords(section_coords):
+        match = _nearest_natural_edge_to_selected_point(
+            G,
+            float(point["lat"]),
+            float(point["lon"]),
+            max_distance_m=max(TRAIL_SEGMENT_SELECTION_MAX_DISTANCE_M, 55.0),
+        )
+        if match is not None:
+            matches.add(match["physical_key"])
+
+    if not matches:
+        return G, 0
+
+    H = G.copy()
+    touched = 0
+    for u, v, key, data in H.edges(keys=True, data=True):
+        if undirected_edge_key(u, v) not in matches:
+            continue
+        base = float(data.get("routing_cost", edge_routing_cost(data)) or 0.0)
+        length = float(data.get("length", 0.0) or 0.0)
+        data["routing_cost"] = max(base, length, 0.01) * float(multiplier)
+        data["replaced_section_penalty"] = True
+        touched += 1
+    return H, touched
+
+
+def classify_route_geometry_against_graph(G, coords):
+    """Estimate trail/connector/retrace stats for a stitched edited geometry.
+
+    Each displayed geometry segment is associated with its nearest routing edge.
+    Consecutive pieces on the same physical OSM edge are merged into one run so
+    a single traversal is not mistakenly counted as retracing.
+    """
+    if len(coords) < 2:
+        return {
+            "connector_distance_meters": 0.0,
+            "repeated_distance_meters": 0.0,
+            "repeated_edges": 0,
+            "preferred_hit_count": 0,
+            "preferred_distance_meters": 0.0,
+        }
+
+    mids_lon = []
+    mids_lat = []
+    lengths = []
+    for a, b in zip(coords[:-1], coords[1:]):
+        lat1, lon1 = float(a["lat"]), float(a["lon"])
+        lat2, lon2 = float(b["lat"]), float(b["lon"])
+        length = haversine_meters(lat1, lon1, lat2, lon2)
+        if length <= 0.02:
+            continue
+        mids_lat.append((lat1 + lat2) / 2.0)
+        mids_lon.append((lon1 + lon2) / 2.0)
+        lengths.append(length)
+
+    if not lengths:
+        return {
+            "connector_distance_meters": 0.0,
+            "repeated_distance_meters": 0.0,
+            "repeated_edges": 0,
+            "preferred_hit_count": 0,
+            "preferred_distance_meters": 0.0,
+        }
+
+    try:
+        projected = ox.projection.project_graph(G)
+        transformer = Transformer.from_crs(
+            "EPSG:4326", projected.graph["crs"], always_xy=True
+        )
+        xs, ys = transformer.transform(mids_lon, mids_lat)
+        raw_edges = ox.distance.nearest_edges(
+            projected,
+            X=np.asarray(xs, dtype=float),
+            Y=np.asarray(ys, dtype=float),
+        )
+
+        if hasattr(raw_edges, "tolist"):
+            raw_edges = raw_edges.tolist()
+        if isinstance(raw_edges, tuple) and len(raw_edges) >= 3 and all(
+            np.isscalar(value) for value in raw_edges[:3]
+        ):
+            edge_ids = [tuple(raw_edges[:3])]
+        else:
+            edge_ids = []
+            for item in list(raw_edges):
+                if isinstance(item, np.ndarray):
+                    item = item.tolist()
+                if isinstance(item, (list, tuple)) and len(item) >= 3:
+                    edge_ids.append((item[0], item[1], item[2]))
+
+        if len(edge_ids) != len(lengths):
+            raise ValueError("nearest-edge result length mismatch")
+    except Exception:
+        # Editing should still succeed if diagnostic classification fails.
+        return {
+            "connector_distance_meters": 0.0,
+            "repeated_distance_meters": 0.0,
+            "repeated_edges": 0,
+            "preferred_hit_count": 0,
+            "preferred_distance_meters": 0.0,
+        }
+
+    runs = []
+    connector_distance = 0.0
+    preferred_distance = 0.0
+    preferred_keys = set()
+
+    for edge_id, segment_length in zip(edge_ids, lengths):
+        u, v, key = edge_id
+        data = projected.get_edge_data(u, v, key) or {}
+        physical = undirected_edge_key(u, v)
+        route_class = str(data.get("route_class", "trail"))
+        preferred = bool(data.get("preferred_segment", False))
+
+        if route_class == "connector":
+            connector_distance += segment_length
+        if preferred:
+            preferred_distance += segment_length
+            preferred_keys.add(physical)
+
+        if runs and runs[-1]["physical"] == physical:
+            runs[-1]["length"] += segment_length
+        else:
+            runs.append({"physical": physical, "length": float(segment_length)})
+
+    use_counts = {}
+    repeated_distance = 0.0
+    repeated_edges = 0
+    for run in runs:
+        physical = run["physical"]
+        count = use_counts.get(physical, 0)
+        if count >= 1:
+            repeated_distance += run["length"]
+            repeated_edges += 1
+        use_counts[physical] = count + 1
+
+    return {
+        "connector_distance_meters": float(connector_distance),
+        "repeated_distance_meters": float(repeated_distance),
+        "repeated_edges": int(repeated_edges),
+        "preferred_hit_count": len(preferred_keys),
+        "preferred_distance_meters": float(preferred_distance),
+    }
+
+
+def build_stitched_route_option(G, coords, request, replacement_route_nodes):
+    geometry = route_geometry_metrics(coords)
+    total_m = float(geometry["distance_meters"])
+    gain_m = float(geometry["gain_meters"])
+    classification = classify_route_geometry_against_graph(G, coords)
+
+    repeated_m = float(classification["repeated_distance_meters"])
+    connector_m = float(classification["connector_distance_meters"])
+    retrace_percent = 100.0 * repeated_m / max(total_m, 1.0)
+    connector_percent = 100.0 * connector_m / max(total_m, 1.0)
+    trail_percent = max(0.0, 100.0 - connector_percent)
+    distance_miles = total_m / METERS_PER_MILE
+    gain_ft = gain_m * FEET_PER_METER
+    descent_ft = float(geometry.get("descent_meters", 0.0)) * FEET_PER_METER
+    max_reach_m = route_max_radial_meters_from_coords(coords)
+    footprint_m2 = route_convex_hull_area_m2(coords)
+
+    distance_ratio = abs(total_m - request.target_distance_miles * METERS_PER_MILE) / max(
+        request.target_distance_miles * METERS_PER_MILE, 1.0
+    )
+    target_gain_m = request.target_gain_ft / FEET_PER_METER
+    if target_gain_m > 0:
+        gain_ratio = abs(gain_m - target_gain_m) / target_gain_m
+    else:
+        gain_ratio = gain_m / 30.48
+    route_score_value = (
+        distance_ratio * 190.0
+        + gain_ratio * 240.0
+        + (repeated_m / max(total_m, 1.0)) * LONG_REPEAT_SCORE_WEIGHT
+        + (connector_m / max(total_m, 1.0)) * connector_score_weight_for_target(
+            request.target_distance_miles * METERS_PER_MILE,
+            cheap=False,
+        )
+    )
+
+    return {
+        "index": 0,
+        "name": "Edited route",
+        "route_signature": _coordinate_route_signature(coords),
+        "actual_distance_miles": round(distance_miles, 2),
+        "distance_error_miles": round(abs(distance_miles - request.target_distance_miles), 2),
+        "actual_gain_ft": round(gain_ft),
+        "actual_descent_ft": round(descent_ft),
+        "elevation_error_ft": round(abs(gain_ft - request.target_gain_ft)),
+        "route": coords,
+        "gpx_export_points": build_gpx_export_points(coords),
+        "elevation_profile": geometry.get("elevation_profile", []),
+        "route_nodes": len(replacement_route_nodes),
+        "route_geometry_points": len(coords),
+        "repeated_edges": int(classification["repeated_edges"]),
+        "repeated_distance_miles": round(repeated_m / METERS_PER_MILE, 2),
+        "repeated_nodes": 0,
+        "immediate_reversals": 0,
+        "connector_distance_miles": round(connector_m / METERS_PER_MILE, 2),
+        "retrace_percent": round(retrace_percent, 1),
+        "connector_percent": round(connector_percent, 1),
+        "trail_percent": round(trail_percent, 1),
+        "preferred_distance_miles": round(
+            classification["preferred_distance_meters"] / METERS_PER_MILE, 2
+        ),
+        "preferred_hit_count": int(classification["preferred_hit_count"]),
+        "independent_loops": 0,
+        "extra_subloops": 0,
+        "branch_points": 0,
+        "max_reach_miles": round(max_reach_m / METERS_PER_MILE, 2),
+        "footprint_sq_miles": round(footprint_m2 / (METERS_PER_MILE ** 2), 2),
+        "shape_penalty": 0.0,
+        "route_score": round(route_score_value, 2),
+        "partial_edge_used": False,
+        "partial_added_distance_miles": 0.0,
+        "partial_outward_distance_meters": 0.0,
+        "required_pass_points": [],
+        "is_edited": True,
+        "edit_type": "section-replacement",
+    }
+
+
+@app.post("/replace-route-section")
+def replace_route_section(request: RouteSectionReplacementRequest):
+    try:
+        route = [
+            {"lat": float(point.lat), "lon": float(point.lon)}
+            for point in request.current_route
+        ]
+        if len(route) < 4:
+            raise HTTPException(status_code=400, detail="The selected route is too short to edit.")
+        if not request.replacement_segments:
+            raise HTTPException(
+                status_code=400,
+                detail="Select at least one green replacement trail segment before applying the edit.",
+            )
+
+        cut_a = int(request.cut_start_index)
+        cut_b = int(request.cut_end_index)
+        if cut_a > cut_b:
+            cut_a, cut_b = cut_b, cut_a
+        if cut_a < 0 or cut_b >= len(route) or cut_b - cut_a < 2:
+            raise HTTPException(
+                status_code=400,
+                detail="Choose two separated points on the red route for the section to replace.",
+            )
+
+        # Use the full cached TIFF workspace for deliberate edits. A user may
+        # choose a replacement corridor outside the normal target-radius slice.
+        workspace, _ = get_start_workspace(
+            float(request.start_lat),
+            float(request.start_lon),
+            force_rebuild=False,
+        )
+        G = workspace["graph"].copy()
+        workspace_start_node = workspace["start_node"]
+
+        G, _, _ = apply_trail_segment_controls(
+            G,
+            request.avoid_segments,
+            request.prefer_segments,
+            start_node=workspace_start_node,
+        )
+        G, _ = apply_avoid_areas_to_graph(
+            G,
+            request.avoid_areas,
+            start_node=workspace_start_node,
+            start_lat=request.start_lat,
+            start_lon=request.start_lon,
+        )
+
+        cut_start = route[cut_a]
+        cut_end = route[cut_b]
+        G, cut_start_node, cut_start_info = insert_exact_routing_point(
+            G, cut_start["lat"], cut_start["lon"]
+        )
+        G, cut_end_node, cut_end_info = insert_exact_routing_point(
+            G, cut_end["lat"], cut_end["lon"]
+        )
+
+        if float(cut_start_info.get("routing_offset_m", 9999)) > 20 or float(
+            cut_end_info.get("routing_offset_m", 9999)
+        ) > 20:
+            raise HTTPException(
+                status_code=400,
+                detail="Could not anchor the selected orange section cleanly to the trail graph. Zoom in and choose the cut points again.",
+            )
+
+        replacement_nodes = []
+        resolved_segments = []
+        for index, selected in enumerate(request.replacement_segments):
+            match = _nearest_natural_edge_to_selected_point(
+                G, float(selected.lat), float(selected.lon)
+            )
+            if match is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Replacement trail segment {index + 1} is not available in the routing graph or is blocked by an avoid setting.",
+                )
+            G, node, info = insert_exact_routing_point(
+                G, match["routing_lat"], match["routing_lon"]
+            )
+            replacement_nodes.append(node)
+            resolved_segments.append({
+                "index": index,
+                "lat": float(match["routing_lat"]),
+                "lon": float(match["routing_lon"]),
+                "snap_distance_m": round(float(match["distance_m"]), 2),
+            })
+
+        # Strongly discourage the old orange section after all temporary split
+        # points exist so the cost penalty also reaches the split edge pieces.
+        G, penalized_edge_count = penalize_replaced_section_edges(
+            G, route[cut_a:cut_b + 1]
+        )
+
+        connector_multiplier = connector_path_multiplier_for_target(
+            request.target_distance_miles * METERS_PER_MILE
+        )
+        S = make_simple_routing_graph(G, connector_multiplier=connector_multiplier)
+        destinations = list(replacement_nodes) + [cut_end_node]
+        new_path_nodes = [cut_start_node]
+        current = cut_start_node
+        try:
+            for destination in destinations:
+                leg = nx.shortest_path(S, current, destination, weight="routing_cost")
+                new_path_nodes.extend(leg[1:])
+                current = destination
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            raise HTTPException(
+                status_code=400,
+                detail="The highlighted replacement trails cannot be connected in the order you selected them. Undo the last green segment or choose a connected corridor.",
+            )
+
+        replacement_coords = route_coordinates(G, new_path_nodes)
+        if len(replacement_coords) < 2:
+            raise HTTPException(status_code=400, detail="The replacement corridor produced an empty path.")
+
+        # Preserve everything outside the orange section exactly. The new graph
+        # path only replaces route[cut_a:cut_b].
+        replacement_coords[0] = dict(cut_start)
+        replacement_coords[-1] = dict(cut_end)
+        stitched = [dict(point) for point in route[:cut_a + 1]]
+        for point in replacement_coords[1:]:
+            if stitched:
+                last = stitched[-1]
+                if haversine_meters(
+                    float(last["lat"]), float(last["lon"]),
+                    float(point["lat"]), float(point["lon"]),
+                ) <= 0.08:
+                    stitched[-1] = dict(point)
+                    continue
+            stitched.append(dict(point))
+        for point in route[cut_b + 1:]:
+            if stitched:
+                last = stitched[-1]
+                if haversine_meters(
+                    float(last["lat"]), float(last["lon"]),
+                    float(point["lat"]), float(point["lon"]),
+                ) <= 0.08:
+                    stitched[-1] = dict(point)
+                    continue
+            stitched.append(dict(point))
+
+        option = build_stitched_route_option(G, stitched, request, new_path_nodes)
+        option["replacement_distance_miles"] = round(
+            route_geometry_metrics(replacement_coords)["distance_meters"] / METERS_PER_MILE, 2
+        )
+        option["replaced_route_points"] = int(cut_b - cut_a + 1)
+
+        return {
+            "option": option,
+            "cut_start_index": cut_a,
+            "cut_end_index": cut_b,
+            "resolved_replacement_segments": resolved_segments,
+            "penalized_old_section_edges": int(penalized_edge_count),
+            "version": APP_VERSION,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Section replacement failed: {exc}")
+
+
+# ============================================================
 # GENERATE ROUTE
 # ============================================================
 
@@ -7839,6 +8278,39 @@ input[type="range"] {
     color: #991b1b;
 }
 
+.section-replacement-panel { border-color: #dbe5df; background: #fbfdfb; }
+.replacement-legend {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px 12px;
+    margin: 9px 0;
+    font-size: 10px;
+    color: #475569;
+}
+.replacement-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.legend-line { display: inline-block; width: 20px; height: 0; border-top: 4px solid; border-radius: 9px; }
+.legend-line.keep { border-color: #d60000; }
+.legend-line.remove { border-color: #f97316; }
+.legend-line.replacement { border-color: #16a34a; }
+.replacement-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+    margin-top: 8px;
+}
+.replacement-actions #applyReplacementButton { grid-column: span 2; background: #166534; }
+.replacement-status { margin-top: 7px; line-height: 1.35; }
+.replacement-summary {
+    margin-top: 7px;
+    padding: 7px 8px;
+    border-radius: 7px;
+    background: #f1f5f9;
+    font-size: 10px;
+    color: #334155;
+    min-height: 0;
+}
+.replacement-summary:empty { display: none; }
+
 #qualityFilterStatus { margin-top: 3px; }
 #routeEditStatus { margin-top: 5px; }
 
@@ -7978,14 +8450,30 @@ input[type="range"] {
 <details class="control-section">
     <summary>Modify route</summary>
     <div class="section-content">
-        <div id="direct-edit-panel" class="tool-block">
-            <div class="tool-heading">Direct route editing</div>
-            <div class="small">Choose Edit route, click the selected red route, then drag the edit handle onto the trail corridor you want. The route is regenerated through that corridor when you release it.</div>
-            <div class="segment-button-row">
-                <button id="editRouteButton" type="button" disabled>Edit selected route</button>
-                <button id="clearRouteEditsButton" type="button" class="secondary-button" disabled>Clear edit points</button>
+        <div id="section-replacement-panel" class="tool-block section-replacement-panel">
+            <div class="tool-heading">Replace a route section</div>
+            <div class="small">Choose exactly what part of the red route to remove, then click the trail segments you want to use instead. The old section turns orange and your replacement selections turn green.</div>
+            <div class="replacement-legend">
+                <span><i class="legend-line keep"></i> kept route</span>
+                <span><i class="legend-line remove"></i> replace</span>
+                <span><i class="legend-line replacement"></i> new trail</span>
             </div>
-            <div id="routeEditStatus" class="small"></div>
+            <button id="replaceSectionButton" type="button" disabled>Replace route section</button>
+            <div id="routeReplacementStatus" class="small replacement-status">Select a route first.</div>
+            <div id="replacementSelectionSummary" class="replacement-summary"></div>
+            <div class="replacement-actions">
+                <button id="undoReplacementSegmentButton" type="button" class="secondary-button" disabled>Undo green segment</button>
+                <button id="applyReplacementButton" type="button" disabled>Apply replacement</button>
+                <button id="cancelReplacementButton" type="button" class="secondary-button" disabled>Cancel</button>
+            </div>
+        </div>
+
+        <!-- Legacy v28 edit-handle elements stay hidden so older browser code
+             paths remain harmless during the transition to section replacement. -->
+        <div style="display:none">
+            <button id="editRouteButton" type="button" disabled>Edit selected route</button>
+            <button id="clearRouteEditsButton" type="button" disabled>Clear edit points</button>
+            <div id="routeEditStatus"></div>
             <div id="routeEditRows"></div>
         </div>
 
@@ -8096,6 +8584,17 @@ let routeEditMode = false;
 let routeEditPoints = [];
 let routeEditLayers = [];
 let nextRouteEditId = 1;
+
+// V29 explicit section replacement state. This is intentionally separate from
+// planner settings/history because it is a temporary edit selection until Apply.
+let routeReplacementMode = false;
+let routeReplacementStage = "idle"; // idle | cut-start | cut-end | replacement
+let replacementBaseRouteIndex = null;
+let replacementCutStartIndex = null;
+let replacementCutEndIndex = null;
+let replacementTrailSegments = [];
+let replacementLayers = [];
+
 let elevationHoverMarker = null;
 let elevationRenderState = null;
 let currentSearchSeed = Math.floor(Date.now() % 2147483647);
@@ -8124,6 +8623,10 @@ const routeDiversityInput = document.getElementById("routeDiversity");
 const diversityValue = document.getElementById("diversityValue");
 const editRouteButton = document.getElementById("editRouteButton");
 const clearRouteEditsButton = document.getElementById("clearRouteEditsButton");
+const replaceSectionButton = document.getElementById("replaceSectionButton");
+const applyReplacementButton = document.getElementById("applyReplacementButton");
+const undoReplacementSegmentButton = document.getElementById("undoReplacementSegmentButton");
+const cancelReplacementButton = document.getElementById("cancelReplacementButton");
 const undoButton = document.getElementById("undoButton");
 const redoButton = document.getElementById("redoButton");
 const enableQualityFilters = document.getElementById("enableQualityFilters");
@@ -8145,6 +8648,10 @@ avoidTrailSegmentButton.addEventListener("click", () => beginTrailSegmentPlaceme
 preferTrailSegmentButton.addEventListener("click", () => beginTrailSegmentPlacement("prefer"));
 editRouteButton.addEventListener("click", beginRouteEditMode);
 clearRouteEditsButton.addEventListener("click", clearRouteEditPoints);
+replaceSectionButton.addEventListener("click", beginRouteSectionReplacement);
+applyReplacementButton.addEventListener("click", applyRouteSectionReplacement);
+undoReplacementSegmentButton.addEventListener("click", undoReplacementTrailSegment);
+cancelReplacementButton.addEventListener("click", () => cancelRouteSectionReplacement(true));
 undoButton.addEventListener("click", undoPlannerChange);
 redoButton.addEventListener("click", redoPlannerChange);
 routeDiversityInput.addEventListener("input", () => {
@@ -8405,6 +8912,329 @@ function refreshQualityFilterView(redrawMap = true) {
 }
 
 
+function nearestRouteCoordinateIndex(option, latlng) {
+    const route = (option && option.route) || [];
+    if (route.length < 3) return null;
+    const click = map.latLngToLayerPoint(latlng);
+    let bestIndex = null;
+    let bestDistance = Infinity;
+    // Do not use the duplicated first/last loop point as a cut anchor. Keeping
+    // edits away from the route seam makes the kept red geometry unambiguous.
+    const first = route.length > 4 ? 1 : 0;
+    const last = route.length > 4 ? route.length - 2 : route.length - 1;
+    for (let i = first; i <= last; i++) {
+        const point = route[i];
+        const layerPoint = map.latLngToLayerPoint(
+            L.latLng(Number(point.lat), Number(point.lon))
+        );
+        const distance = Math.hypot(click.x - layerPoint.x, click.y - layerPoint.y);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            bestIndex = i;
+        }
+    }
+    return bestIndex;
+}
+
+
+function clearRouteReplacementLayers() {
+    for (const layer of replacementLayers) {
+        if (layer && map.hasLayer(layer)) map.removeLayer(layer);
+    }
+    replacementLayers = [];
+}
+
+
+function updateRouteReplacementControls() {
+    const status = document.getElementById("routeReplacementStatus");
+    const summary = document.getElementById("replacementSelectionSummary");
+    const selected = getSelectedRouteOption();
+
+    replaceSectionButton.disabled = !selected;
+    cancelReplacementButton.disabled = routeReplacementStage === "idle";
+    undoReplacementSegmentButton.disabled = replacementTrailSegments.length === 0;
+    applyReplacementButton.disabled = !(
+        routeReplacementStage === "replacement" &&
+        replacementCutStartIndex !== null &&
+        replacementCutEndIndex !== null &&
+        replacementTrailSegments.length > 0
+    );
+
+    if (routeReplacementStage === "idle") {
+        replaceSectionButton.textContent = "Replace route section";
+        if (status && selected) status.textContent = "Choose a section of the selected red route to replace.";
+        if (summary) summary.innerHTML = "";
+        return;
+    }
+
+    if (routeReplacementStage === "cut-start") {
+        replaceSectionButton.textContent = "Selecting section...";
+        status.textContent = "1/3 · Click the red route where the section you want to replace STARTS.";
+        summary.innerHTML = "";
+        return;
+    }
+
+    if (routeReplacementStage === "cut-end") {
+        replaceSectionButton.textContent = "Selecting section...";
+        status.textContent = "2/3 · Click the red route where the section you want to replace ENDS.";
+        summary.innerHTML = `<b>Start selected.</b> Now choose the other end of the orange section.`;
+        return;
+    }
+
+    replaceSectionButton.textContent = "Selecting replacement trails...";
+    status.textContent = replacementTrailSegments.length
+        ? "3/3 · Keep clicking gray trail segments to build the green replacement, then Apply. Segments are connected in the order clicked."
+        : "3/3 · Click the gray trail segment(s) you want to use instead. Your selections will turn green.";
+    summary.innerHTML =
+        `<b>Orange section:</b> route points ${replacementCutStartIndex + 1}–${replacementCutEndIndex + 1}<br>` +
+        `<b>Green trail selections:</b> ${replacementTrailSegments.length}` +
+        (replacementTrailSegments.length ? ` · order ${replacementTrailSegments.map((_, i) => i + 1).join(" → ")}` : "");
+}
+
+
+function drawRouteReplacementLayers() {
+    clearRouteReplacementLayers();
+    if (routeReplacementStage === "idle" || replacementBaseRouteIndex === null) return;
+    if (!lastGeneratedRoute || !lastGeneratedRoute.route_options) return;
+    const option = lastGeneratedRoute.route_options[replacementBaseRouteIndex];
+    if (!option || !(option.route || []).length) return;
+
+    if (replacementCutStartIndex !== null) {
+        const p = option.route[replacementCutStartIndex];
+        const marker = L.circleMarker([Number(p.lat), Number(p.lon)], {
+            radius: 7,
+            weight: 3,
+            color: "#f97316",
+            fillColor: "#fff7ed",
+            fillOpacity: 1,
+            interactive: false
+        }).addTo(map).bindTooltip("Replacement start");
+        replacementLayers.push(marker);
+    }
+
+    if (replacementCutStartIndex !== null && replacementCutEndIndex !== null) {
+        const section = option.route
+            .slice(replacementCutStartIndex, replacementCutEndIndex + 1)
+            .map(point => [Number(point.lat), Number(point.lon)]);
+        if (section.length >= 2) {
+            const orange = L.polyline(section, {
+                color: "#f97316",
+                weight: 10,
+                opacity: 0.95,
+                lineCap: "round",
+                interactive: false
+            }).addTo(map).bindTooltip("Section to replace");
+            replacementLayers.push(orange);
+        }
+        const p = option.route[replacementCutEndIndex];
+        const marker = L.circleMarker([Number(p.lat), Number(p.lon)], {
+            radius: 7,
+            weight: 3,
+            color: "#f97316",
+            fillColor: "#fff7ed",
+            fillOpacity: 1,
+            interactive: false
+        }).addTo(map).bindTooltip("Replacement end");
+        replacementLayers.push(marker);
+    }
+
+    replacementTrailSegments.forEach((item, index) => {
+        const green = L.polyline(item.geometry, {
+            color: "#16a34a",
+            weight: 9,
+            opacity: 0.95,
+            lineCap: "round",
+            interactive: false
+        }).addTo(map).bindTooltip(`Replacement trail ${index + 1}`);
+        replacementLayers.push(green);
+    });
+}
+
+
+function cancelRouteSectionReplacement(showMessage = false) {
+    routeReplacementMode = false;
+    routeReplacementStage = "idle";
+    replacementBaseRouteIndex = null;
+    replacementCutStartIndex = null;
+    replacementCutEndIndex = null;
+    replacementTrailSegments = [];
+    clearRouteReplacementLayers();
+    updateRouteReplacementControls();
+    if (showMessage) {
+        document.getElementById("routeReplacementStatus").textContent =
+            "Replacement selection cleared. The current route was not changed.";
+    }
+}
+
+
+function beginRouteSectionReplacement() {
+    const selected = getSelectedRouteOption();
+    if (!selected) return;
+    clearPlacementModes();
+    cancelRouteSectionReplacement(false);
+    routeReplacementMode = true;
+    routeReplacementStage = "cut-start";
+    replacementBaseRouteIndex = selectedRouteOptionIndex;
+    updateRouteReplacementControls();
+    drawRouteReplacementLayers();
+}
+
+
+function handleRouteReplacementRouteClick(latlng, routeIndex) {
+    if (!routeReplacementMode || routeIndex !== replacementBaseRouteIndex) return;
+    const option = lastGeneratedRoute?.route_options?.[routeIndex];
+    if (!option) return;
+    const index = nearestRouteCoordinateIndex(option, latlng);
+    if (index === null) return;
+
+    if (routeReplacementStage === "cut-start") {
+        replacementCutStartIndex = index;
+        routeReplacementStage = "cut-end";
+        updateRouteReplacementControls();
+        drawRouteReplacementLayers();
+        return;
+    }
+
+    if (routeReplacementStage === "cut-end") {
+        if (Math.abs(index - replacementCutStartIndex) < 2) {
+            document.getElementById("routeReplacementStatus").textContent =
+                "Choose an end point farther along the red route so there is a real section to replace.";
+            return;
+        }
+        replacementCutEndIndex = index;
+        if (replacementCutStartIndex > replacementCutEndIndex) {
+            const temp = replacementCutStartIndex;
+            replacementCutStartIndex = replacementCutEndIndex;
+            replacementCutEndIndex = temp;
+        }
+        routeReplacementStage = "replacement";
+        updateRouteReplacementControls();
+        drawRouteReplacementLayers();
+    }
+}
+
+
+function addReplacementTrailSegment(latlng) {
+    if (!routeReplacementMode || routeReplacementStage !== "replacement") return;
+    const nearest = findNearestOverlayTrailSegment(latlng);
+    if (!nearest || nearest.distancePx > 22) {
+        document.getElementById("routeReplacementStatus").textContent =
+            "No gray trail was close enough. Zoom in and click directly on the trail you want to use.";
+        return;
+    }
+
+    const signature = trailGeometrySignature(nearest.geometry);
+    const duplicate = replacementTrailSegments.some(item =>
+        trailGeometrySignature(item.geometry) === signature
+    );
+    if (duplicate) {
+        document.getElementById("routeReplacementStatus").textContent =
+            "That green trail segment is already in this replacement.";
+        return;
+    }
+
+    replacementTrailSegments.push({
+        lat: Number(nearest.lat.toFixed(7)),
+        lon: Number(nearest.lon.toFixed(7)),
+        geometry: nearest.geometry
+    });
+    updateRouteReplacementControls();
+    drawRouteReplacementLayers();
+}
+
+
+function undoReplacementTrailSegment() {
+    if (!replacementTrailSegments.length) return;
+    replacementTrailSegments.pop();
+    updateRouteReplacementControls();
+    drawRouteReplacementLayers();
+}
+
+
+async function applyRouteSectionReplacement() {
+    if (
+        replacementBaseRouteIndex === null ||
+        replacementCutStartIndex === null ||
+        replacementCutEndIndex === null ||
+        !replacementTrailSegments.length ||
+        !lastGeneratedRoute
+    ) return;
+
+    const baseOption = lastGeneratedRoute.route_options[replacementBaseRouteIndex];
+    if (!baseOption) return;
+    const status = document.getElementById("routeReplacementStatus");
+    const input = getInputData();
+    const payload = {
+        start_lat: input.start_lat,
+        start_lon: input.start_lon,
+        target_distance_miles: input.target_distance_miles,
+        target_gain_ft: input.target_gain_ft,
+        current_route: baseOption.route,
+        cut_start_index: replacementCutStartIndex,
+        cut_end_index: replacementCutEndIndex,
+        replacement_segments: replacementTrailSegments.map(item => ({
+            lat: Number(item.lat),
+            lon: Number(item.lon)
+        })),
+        avoid_areas: input.avoid_areas,
+        avoid_segments: input.avoid_segments,
+        prefer_segments: input.prefer_segments
+    };
+
+    applyReplacementButton.disabled = true;
+    replaceSectionButton.disabled = true;
+    generateButton.disabled = true;
+    findMoreButton.disabled = true;
+    status.textContent = "Connecting the green trail selections and replacing only the orange section...";
+
+    try {
+        const response = await fetch("/replace-route-section", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(payload)
+        });
+        const result = await readJsonResponse(response);
+        const edited = result.option;
+        if (!edited || !(edited.route || []).length) {
+            throw new Error("The server did not return an edited route.");
+        }
+        edited.is_edited = true;
+        edited.edit_type = "section-replacement";
+
+        const signature = browserRouteSignature(edited);
+        let newIndex = lastGeneratedRoute.route_options.findIndex(
+            option => browserRouteSignature(option) === signature
+        );
+        if (newIndex < 0) {
+            lastGeneratedRoute.route_options.push(edited);
+            reindexRouteOptions(lastGeneratedRoute.route_options);
+            newIndex = lastGeneratedRoute.route_options.length - 1;
+        }
+        lastGeneratedRoute.route_options_count = lastGeneratedRoute.route_options.length;
+
+        cancelRouteSectionReplacement(false);
+        renderRouteResults("Route section replaced");
+        if (routePassesQualityFilters(lastGeneratedRoute.route_options[newIndex])) {
+            drawRouteOptions(lastGeneratedRoute, newIndex, false);
+            selectRouteOption(newIndex, false);
+        } else {
+            drawRouteOptions(lastGeneratedRoute, selectedRouteOptionIndex, false);
+            document.getElementById("routeReplacementStatus").textContent =
+                "Replacement succeeded, but your active quality filters hide the edited route. Turn the filters off to see it.";
+        }
+    } catch (error) {
+        status.textContent = "Replacement error: " + error.message;
+        updateRouteReplacementControls();
+        drawRouteReplacementLayers();
+    } finally {
+        generateButton.disabled = false;
+        findMoreButton.disabled = !lastGeneratedRoute;
+        replaceSectionButton.disabled = !getSelectedRouteOption();
+        if (routeReplacementStage !== "idle") updateRouteReplacementControls();
+    }
+}
+
+
 function beginRouteEditMode() {
     if (!getSelectedRouteOption()) return;
     clearPlacementModes();
@@ -8566,6 +9396,9 @@ function resetTrailSegmentPlacementButtons() {
 
 
 function clearPlacementModes() {
+    if (routeReplacementStage !== "idle") {
+        cancelRouteSectionReplacement(false);
+    }
     startPointPlacementMode = false;
     passPointPlacementMode = false;
     avoidAreaPlacementMode = false;
@@ -8796,6 +9629,11 @@ function addClickedTrailSegment(kind, latlng) {
 
 
 function handleMapPlacementClick(event) {
+    if (routeReplacementMode && routeReplacementStage === "replacement") {
+        addReplacementTrailSegment(event.latlng);
+        return;
+    }
+
     if (trailSegmentPlacementMode) {
         const kind = trailSegmentPlacementMode;
         addClickedTrailSegment(kind, event.latlng);
@@ -9386,6 +10224,9 @@ function renderSelectedRouteDetails(option) {
 
 function selectRouteOption(index, fitMap = true) {
     if (!lastGeneratedRoute || !lastGeneratedRoute.route_options) return;
+    if (routeReplacementMode && replacementBaseRouteIndex !== null && index !== replacementBaseRouteIndex) {
+        cancelRouteSectionReplacement(false);
+    }
     const options = lastGeneratedRoute.route_options;
     if (index < 0 || index >= options.length) return;
     if (!routePassesQualityFilters(options[index])) return;
@@ -9413,6 +10254,7 @@ function selectRouteOption(index, fitMap = true) {
     renderElevationProfile(selected);
     downloadGpxButton.disabled = false;
     editRouteButton.disabled = false;
+    replaceSectionButton.disabled = false;
 
     if (fitMap && routeLine) {
         map.fitBounds(routeLine.getBounds(), {padding: [30, 30]});
@@ -9436,6 +10278,14 @@ function drawRouteOptions(result, selectedIndex = 0, fitMap = true) {
         }).addTo(map);
         line.on("click", event => {
             L.DomEvent.stopPropagation(event);
+            if (routeReplacementMode && index === selectedRouteOptionIndex) {
+                if (routeReplacementStage === "replacement") {
+                    addReplacementTrailSegment(event.latlng);
+                } else {
+                    handleRouteReplacementRouteClick(event.latlng, index);
+                }
+                return;
+            }
             if (routeEditMode && index === selectedRouteOptionIndex) {
                 addRouteEditPointFromRoute(event.latlng);
                 return;
@@ -9462,11 +10312,13 @@ function drawRouteOptions(result, selectedIndex = 0, fitMap = true) {
         routeLine = null;
         downloadGpxButton.disabled = true;
         editRouteButton.disabled = true;
+        replaceSectionButton.disabled = true;
         renderElevationProfile(null);
         const details = document.getElementById("selectedRouteDetails");
         if (details) details.innerHTML = '<span class="warning">No route choices meet the active quality filters.</span>';
     }
     drawRouteEditLayers();
+    drawRouteReplacementLayers();
 }
 
 
@@ -9882,6 +10734,7 @@ async function requestRouteBatch(data) {
 
 async function generateRoute() {
     const results = document.getElementById("results");
+    cancelRouteSectionReplacement(false);
     currentSearchSeed = Math.floor((Date.now() + Math.random() * 1000000) % 2147483647);
     findMoreBatch = 0;
     const data = getInputData();
