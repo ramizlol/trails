@@ -18,7 +18,7 @@ import numpy as np
 import osmnx as ox
 import rasterio
 from pyproj import Transformer
-from shapely.geometry import LineString
+from shapely.geometry import LineString, MultiPoint
 from rasterio.warp import transform as rio_transform, transform_bounds as rio_transform_bounds
 from sklearn.neighbors import BallTree
 
@@ -68,7 +68,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-09-v12-start-workspace-overlay-cache"
+APP_VERSION = "2026-08-09-v13-big-loop-preference"
 MASTER_NETWORK_SCHEMA = "trail-only-v11-offline-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -2504,6 +2504,205 @@ def count_immediate_reversals(route_nodes):
     return count
 
 
+
+def route_topology_metrics(route_nodes):
+    """
+    Describe the topology created by the physical edges actually used by a route.
+
+    A clean single loop has cycle_rank == 1 and normally no branch points.
+    Figure-eights / compound loops create additional independent cycles and/or
+    branch points. Repeated physical edges are handled separately by the normal
+    repetition penalty.
+    """
+    unique_edges = set()
+    degrees = {}
+
+    for i in range(len(route_nodes) - 1):
+        u = route_nodes[i]
+        v = route_nodes[i + 1]
+        key = undirected_edge_key(u, v)
+        if key in unique_edges:
+            continue
+        unique_edges.add(key)
+        degrees[u] = degrees.get(u, 0) + 1
+        degrees[v] = degrees.get(v, 0) + 1
+
+    if not unique_edges:
+        return {
+            "cycle_rank": 0,
+            "extra_cycles": 0,
+            "branch_points": 0,
+            "branch_excess": 0,
+            "route_topology_nodes": 0,
+            "route_topology_edges": 0,
+        }
+
+    # The used-edge graph comes from one continuous walk, so it is connected.
+    # Cyclomatic number E - V + 1 therefore equals the number of independent
+    # cycles. A clean simple loop is exactly one cycle.
+    edge_count = len(unique_edges)
+    node_count = len(degrees)
+    cycle_rank = max(0, edge_count - node_count + 1)
+    branch_points = sum(1 for degree in degrees.values() if degree > 2)
+    branch_excess = sum(max(0, degree - 2) for degree in degrees.values())
+
+    return {
+        "cycle_rank": int(cycle_rank),
+        "extra_cycles": int(max(0, cycle_rank - 1)),
+        "branch_points": int(branch_points),
+        "branch_excess": int(branch_excess),
+        "route_topology_nodes": int(node_count),
+        "route_topology_edges": int(edge_count),
+    }
+
+
+def route_max_radial_meters_from_nodes(G, route_nodes):
+    if not route_nodes:
+        return 0.0
+
+    start = route_nodes[0]
+    if start not in G:
+        return 0.0
+
+    start_lat = float(G.nodes[start]["y"])
+    start_lon = float(G.nodes[start]["x"])
+    farthest = 0.0
+
+    for node in set(route_nodes):
+        if node not in G:
+            continue
+        radial = haversine_meters(
+            start_lat,
+            start_lon,
+            float(G.nodes[node]["y"]),
+            float(G.nodes[node]["x"]),
+        )
+        farthest = max(farthest, radial)
+
+    return float(farthest)
+
+
+def route_max_radial_meters_from_coords(coords):
+    if not coords:
+        return 0.0
+
+    start_lat = float(coords[0]["lat"])
+    start_lon = float(coords[0]["lon"])
+    farthest = 0.0
+
+    for point in coords:
+        radial = haversine_meters(
+            start_lat,
+            start_lon,
+            float(point["lat"]),
+            float(point["lon"]),
+        )
+        farthest = max(farthest, radial)
+
+    return float(farthest)
+
+
+def route_convex_hull_area_m2(coords):
+    """Approximate route footprint in local meters using a convex hull."""
+    if len(coords) < 3:
+        return 0.0
+
+    lat0 = float(coords[0]["lat"])
+    lon0 = float(coords[0]["lon"])
+    cos_lat = max(0.01, math.cos(math.radians(lat0)))
+
+    points_xy = []
+    for point in coords:
+        lat = float(point["lat"])
+        lon = float(point["lon"])
+        x = (lon - lon0) * 111320.0 * cos_lat
+        y = (lat - lat0) * 110540.0
+        points_xy.append((x, y))
+
+    try:
+        return float(MultiPoint(points_xy).convex_hull.area)
+    except Exception:
+        return 0.0
+
+
+def big_loop_shape_penalty(
+    target_distance_meters,
+    topology,
+    max_radial_meters,
+    footprint_area_m2=None,
+    cheap=False,
+):
+    """
+    Soft preference for one geographically large loop.
+
+    It never makes compound loops illegal. It simply makes a clean, broad loop
+    win when distance/elevation quality is otherwise comparable.
+    """
+    target_miles = target_distance_meters / METERS_PER_MILE
+    if target_miles < 4.0:
+        return 0.0, {
+            "max_radial_ratio": 0.0,
+            "footprint_ratio": 0.0,
+            "shape_penalty": 0.0,
+        }
+
+    radial_ratio = max_radial_meters / max(target_distance_meters, 1.0)
+    extra_cycles = int(topology.get("extra_cycles", 0))
+    branch_excess = int(topology.get("branch_excess", 0))
+
+    if target_miles < 8.0:
+        target_radial_ratio = 0.27
+        cycle_weight = 12.0 if cheap else 18.0
+        branch_weight = 2.5 if cheap else 4.0
+        spread_weight = 14.0 if cheap else 22.0
+        footprint_target = 0.016
+        footprint_weight = 0.0 if cheap else 10.0
+    elif target_miles < 15.0:
+        target_radial_ratio = 0.30
+        cycle_weight = 28.0 if cheap else 40.0
+        branch_weight = 5.0 if cheap else 7.0
+        spread_weight = 30.0 if cheap else 48.0
+        footprint_target = 0.020
+        footprint_weight = 0.0 if cheap else 22.0
+    else:
+        target_radial_ratio = 0.31
+        cycle_weight = 34.0 if cheap else 48.0
+        branch_weight = 6.0 if cheap else 8.0
+        spread_weight = 36.0 if cheap else 58.0
+        footprint_target = 0.022
+        footprint_weight = 0.0 if cheap else 28.0
+
+    spread_shortfall = max(0.0, target_radial_ratio - radial_ratio) / max(
+        target_radial_ratio,
+        0.001,
+    )
+
+    footprint_ratio = 0.0
+    footprint_shortfall = 0.0
+    if footprint_area_m2 is not None:
+        footprint_ratio = float(footprint_area_m2) / max(
+            target_distance_meters * target_distance_meters,
+            1.0,
+        )
+        footprint_shortfall = max(0.0, footprint_target - footprint_ratio) / max(
+            footprint_target,
+            0.001,
+        )
+
+    penalty = (
+        extra_cycles * cycle_weight
+        + branch_excess * branch_weight
+        + spread_shortfall * spread_weight
+        + footprint_shortfall * footprint_weight
+    )
+
+    return float(penalty), {
+        "max_radial_ratio": float(radial_ratio),
+        "footprint_ratio": float(footprint_ratio),
+        "shape_penalty": float(penalty),
+    }
+
+
 # ============================================================
 # ROUTE SCORE / CONTINUOUS ELEVATION
 # ============================================================
@@ -2578,6 +2777,17 @@ def score_route_coordinates(
     connector_distance = connector_distance_meters(G, route_nodes)
     connector_ratio = connector_distance / max(total_distance, 1.0)
 
+    topology = route_topology_metrics(route_nodes)
+    max_radial_meters = route_max_radial_meters_from_coords(coords)
+    footprint_area_m2 = route_convex_hull_area_m2(coords)
+    shape_penalty, shape_metrics = big_loop_shape_penalty(
+        target_distance_meters,
+        topology,
+        max_radial_meters,
+        footprint_area_m2=footprint_area_m2,
+        cheap=False,
+    )
+
     if target_distance_meters < 4 * METERS_PER_MILE:
         repeat_weight = 50.0
         node_weight = 6.0
@@ -2592,6 +2802,7 @@ def score_route_coordinates(
         + repeated_nodes * node_weight
         + immediate_reversals * 12.0
         + connector_ratio * CONNECTOR_FINAL_SCORE_WEIGHT
+        + shape_penalty
     )
 
     return (
@@ -2610,6 +2821,15 @@ def score_route_coordinates(
             "connector_distance_meters": connector_distance,
             "connector_ratio": connector_ratio,
             "trail_fraction": max(0.0, 1.0 - connector_ratio),
+            "cycle_rank": topology["cycle_rank"],
+            "extra_cycles": topology["extra_cycles"],
+            "branch_points": topology["branch_points"],
+            "branch_excess": topology["branch_excess"],
+            "max_radial_meters": max_radial_meters,
+            "max_radial_ratio": shape_metrics["max_radial_ratio"],
+            "footprint_area_m2": footprint_area_m2,
+            "footprint_ratio": shape_metrics["footprint_ratio"],
+            "shape_penalty": shape_metrics["shape_penalty"],
             "score": score,
             "route_coordinates": coords,
             "route_elevation_sample_count": geometry["dem_sample_points"],
@@ -2743,6 +2963,12 @@ def build_route_option_payload(
         "immediate_reversals": metrics["immediate_reversals"],
         "connector_distance_miles": round(metrics.get("connector_distance_meters", 0.0) / METERS_PER_MILE, 2),
         "trail_percent": round(metrics.get("trail_fraction", 1.0) * 100.0, 1),
+        "independent_loops": int(metrics.get("cycle_rank", 0)),
+        "extra_subloops": int(metrics.get("extra_cycles", 0)),
+        "branch_points": int(metrics.get("branch_points", 0)),
+        "max_reach_miles": round(metrics.get("max_radial_meters", 0.0) / METERS_PER_MILE, 2),
+        "footprint_sq_miles": round(metrics.get("footprint_area_m2", 0.0) / (METERS_PER_MILE ** 2), 2),
+        "shape_penalty": round(metrics.get("shape_penalty", 0.0), 2),
         "route_score": round(metrics["score"], 2),
         "partial_edge_used": bool(metrics.get("partial_edge_used", False)),
         "partial_added_distance_miles": round(metrics.get("partial_added_distance_meters", 0.0) / METERS_PER_MILE, 3),
@@ -3418,8 +3644,20 @@ def cheap_waypoint_score(
     connector_distance = connector_distance_meters(G, route_nodes)
     connector_ratio = connector_distance / max(total_distance, 1.0)
 
+    topology = route_topology_metrics(route_nodes)
+    max_radial_meters = route_max_radial_meters_from_nodes(G, route_nodes)
+    shape_penalty, shape_metrics = big_loop_shape_penalty(
+        target_distance_meters,
+        topology,
+        max_radial_meters,
+        footprint_area_m2=None,
+        cheap=True,
+    )
+
     # Distance and approximate elevation are the primary exploratory goals.
-    # Repetition remains a meaningful but secondary penalty.
+    # Repetition remains a meaningful but secondary penalty. V13 also gives
+    # clean, broad single-loop candidates a soft advantage so they survive
+    # into the small set of expensive DEM finalists.
     score = (
         distance_ratio * 190.0
         + gain_ratio * 150.0
@@ -3427,6 +3665,7 @@ def cheap_waypoint_score(
         + repeated_nodes * 12.0
         + immediate_reversals * 10.0
         + connector_ratio * CONNECTOR_CHEAP_SCORE_WEIGHT
+        + shape_penalty
     )
 
     return score, {
@@ -3438,6 +3677,13 @@ def cheap_waypoint_score(
         "immediate_reversals": immediate_reversals,
         "connector_distance_meters": connector_distance,
         "connector_ratio": connector_ratio,
+        "cycle_rank": topology["cycle_rank"],
+        "extra_cycles": topology["extra_cycles"],
+        "branch_points": topology["branch_points"],
+        "branch_excess": topology["branch_excess"],
+        "max_radial_meters": max_radial_meters,
+        "max_radial_ratio": shape_metrics["max_radial_ratio"],
+        "shape_penalty": shape_metrics["shape_penalty"],
     }
 
 
@@ -3638,7 +3884,9 @@ def generate_waypoint_loop(
         distance_bucket = int(cheap_metrics["total_distance_meters"] / 100.0)
         gain_bucket = int(cheap_metrics["approximate_gain_meters"] / 15.0)
         repeat_bucket = int(cheap_metrics["repeated_distance_meters"] / 100.0)
-        bucket = (distance_bucket, gain_bucket, repeat_bucket)
+        cycle_bucket = int(cheap_metrics.get("extra_cycles", 0))
+        radial_bucket = int(cheap_metrics.get("max_radial_meters", 0.0) / 500.0)
+        bucket = (distance_bucket, gain_bucket, repeat_bucket, cycle_bucket, radial_bucket)
 
         if bucket in seen_buckets and len(finalists) >= accurate_finalists // 2:
             continue
@@ -5413,6 +5661,11 @@ function renderSelectedRouteDetails(option) {
         "<b>Connector:</b> " + option.connector_distance_miles + " mi<br>" +
         "<b>Repeated trail:</b> " + option.repeated_distance_miles + " mi · " +
         "<b>Score:</b> " + option.route_score + "<br>" +
+        "<b>Max reach from start:</b> " + (option.max_reach_miles ?? 0) + " mi · " +
+        "<b>Independent loops:</b> " + (option.independent_loops ?? 0) + " · " +
+        "<b>Extra subloops:</b> " + (option.extra_subloops ?? 0) + "<br>" +
+        "<b>Route footprint:</b> " + (option.footprint_sq_miles ?? 0) + " sq mi · " +
+        "<b>Big-loop penalty:</b> " + (option.shape_penalty ?? 0) + "<br>" +
         "<b>Partial-edge tuning:</b> " + (option.partial_edge_used ? "YES" : "NO");
 }
 
@@ -5829,6 +6082,12 @@ async function generateRoute() {
                 immediate_reversals: result.immediate_reversals,
                 connector_distance_miles: result.connector_distance_miles,
                 trail_percent: result.trail_percent,
+                independent_loops: result.independent_loops,
+                extra_subloops: result.extra_subloops,
+                branch_points: result.branch_points,
+                max_reach_miles: result.max_reach_miles,
+                footprint_sq_miles: result.footprint_sq_miles,
+                shape_penalty: result.shape_penalty,
                 route_score: result.route_score,
                 partial_edge_used: result.partial_edge_used,
                 partial_added_distance_miles: result.partial_added_distance_miles,
