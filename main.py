@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 import math
 import os
 import json
+import hashlib
 import random
 import time
 import threading
@@ -83,7 +84,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-10-v26-click-start"
+APP_VERSION = "2026-08-10-v27-route-controls"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -170,6 +171,18 @@ PASS_POINT_CANDIDATES_PER_ZONE = 18
 DEFAULT_AVOID_RADIUS_MILES = 0.25
 MAX_AVOID_AREAS = 5
 
+# V27 point-selected trail controls. Clicking a trail in the browser stores a
+# point on that physical trail segment; each route request resolves that point
+# against the current request-local graph. Avoided segments are hard exclusions.
+# Preferred segments are only a soft routing/scoring preference.
+MAX_AVOID_SEGMENTS = 12
+MAX_PREFERRED_SEGMENTS = 12
+TRAIL_SEGMENT_SELECTION_MAX_DISTANCE_M = 45.0
+PREFERRED_SEGMENT_ROUTING_COST_MULTIPLIER = 0.35
+PREFERRED_SEGMENT_FINAL_REWARD = 18.0
+PREFERRED_SEGMENT_CHEAP_REWARD = 12.0
+DEFAULT_ROUTE_DIVERSITY = 50.0
+
 
 # V15 separates the start workspace from distance/elevation
 # targets. A workspace is keyed only by the requested start coordinate and
@@ -204,6 +217,14 @@ class AvoidArea(BaseModel):
     radius_miles: float = DEFAULT_AVOID_RADIUS_MILES
 
 
+class TrailSegmentPoint(BaseModel):
+    # Point projected onto the trail segment chosen in the browser. Using a
+    # point instead of persistent OSM node IDs keeps the selection valid when
+    # the request graph temporarily splits an edge at the exact start/pass point.
+    lat: float
+    lon: float
+
+
 class RouteRequest(BaseModel):
     start_lat: float
     start_lon: float
@@ -213,6 +234,10 @@ class RouteRequest(BaseModel):
     target_gain_ft: float
     pass_points: list[RequiredPassPoint] = Field(default_factory=list)
     avoid_areas: list[AvoidArea] = Field(default_factory=list)
+    avoid_segments: list[TrailSegmentPoint] = Field(default_factory=list)
+    prefer_segments: list[TrailSegmentPoint] = Field(default_factory=list)
+    route_diversity: float = DEFAULT_ROUTE_DIVERSITY
+    search_seed: int | None = None
 
 
 class TrailNetworkRequest(BaseModel):
@@ -999,6 +1024,180 @@ def apply_avoid_areas_to_graph(G, avoid_areas, start_node=None, start_lat=None, 
         raise HTTPException(status_code=400, detail="The avoid areas remove all usable routing trails in this search area.")
 
     return H, normalized
+
+
+# ============================================================
+# V27 CLICKED TRAIL-SEGMENT CONTROLS
+# ============================================================
+
+def _normalize_segment_points(points, max_count, label):
+    points = list(points or [])
+    if len(points) > max_count:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A maximum of {max_count} {label} trail segments is supported.",
+        )
+    normalized = []
+    for index, point in enumerate(points):
+        lat = float(point.lat)
+        lon = float(point.lon)
+        if not math.isfinite(lat) or not math.isfinite(lon):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{label.title()} trail segment {index + 1} has invalid coordinates.",
+            )
+        normalized.append({"index": index, "lat": lat, "lon": lon})
+    return normalized
+
+
+def _nearest_natural_edge_to_selected_point(G, lat, lon, max_distance_m=TRAIL_SEGMENT_SELECTION_MAX_DISTANCE_M):
+    """Resolve a browser-selected trail point against the current request graph."""
+    best = None
+    seen = set()
+    for u, v, key, data in G.edges(keys=True, data=True):
+        if str(data.get("route_class", "trail")) != "trail":
+            continue
+        physical = undirected_edge_key(u, v)
+        # Reverse-direction copies normally share the same physical geometry.
+        if physical in seen:
+            continue
+        seen.add(physical)
+        coords = oriented_edge_coords(G, u, v, data)
+        if len(coords) < 2:
+            continue
+        nearest = nearest_position_on_polyline(coords, float(lon), float(lat))
+        if nearest is None:
+            continue
+        distance_m = float(nearest["distance_m"])
+        if best is None or distance_m < best["distance_m"]:
+            best = {
+                "u": u,
+                "v": v,
+                "key": key,
+                "physical_key": physical,
+                "distance_m": distance_m,
+                "routing_lat": float(nearest["projected_lat"]),
+                "routing_lon": float(nearest["projected_lon"]),
+            }
+    if best is None or best["distance_m"] > float(max_distance_m):
+        return None
+    return best
+
+
+def apply_trail_segment_controls(G, avoid_segments, prefer_segments, start_node=None):
+    """
+    Resolve clicked trail points against this request graph.
+
+    Avoid selections delete the selected physical edge in both directions.
+    Preferred selections remain fully optional: they receive a lower routing
+    cost and a modest scoring reward, but no candidate is required to use them.
+    """
+    avoid_points = _normalize_segment_points(avoid_segments, MAX_AVOID_SEGMENTS, "avoided")
+    prefer_points = _normalize_segment_points(prefer_segments, MAX_PREFERRED_SEGMENTS, "preferred")
+    if not avoid_points and not prefer_points:
+        return G, [], []
+
+    resolved_avoid = []
+    resolved_prefer = []
+    avoid_keys = set()
+    prefer_keys = set()
+
+    # Resolve against the unchanged graph first so one avoided segment does not
+    # cause a later clicked point to snap to a different neighboring trail.
+    for point in avoid_points:
+        match = _nearest_natural_edge_to_selected_point(G, point["lat"], point["lon"])
+        if match is None:
+            continue
+        avoid_keys.add(match["physical_key"])
+        resolved_avoid.append({
+            "lat": point["lat"],
+            "lon": point["lon"],
+            "routing_lat": match["routing_lat"],
+            "routing_lon": match["routing_lon"],
+            "distance_m": round(match["distance_m"], 2),
+        })
+
+    for point in prefer_points:
+        match = _nearest_natural_edge_to_selected_point(G, point["lat"], point["lon"])
+        if match is None:
+            continue
+        # Avoid always wins if the same physical segment is in both lists.
+        if match["physical_key"] not in avoid_keys:
+            prefer_keys.add(match["physical_key"])
+        resolved_prefer.append({
+            "lat": point["lat"],
+            "lon": point["lon"],
+            "routing_lat": match["routing_lat"],
+            "routing_lon": match["routing_lon"],
+            "distance_m": round(match["distance_m"], 2),
+        })
+
+    if not avoid_keys and not prefer_keys:
+        return G, resolved_avoid, resolved_prefer
+
+    H = G.copy()
+    removals = []
+    for u, v, key, data in list(H.edges(keys=True, data=True)):
+        physical = undirected_edge_key(u, v)
+        if physical in avoid_keys:
+            removals.append((u, v, key))
+            continue
+        if physical in prefer_keys:
+            data["preferred_segment"] = True
+            base_cost = float(data.get("routing_cost", edge_routing_cost(data)))
+            data["routing_cost"] = max(
+                0.01,
+                base_cost * PREFERRED_SEGMENT_ROUTING_COST_MULTIPLIER,
+            )
+
+    for u, v, key in removals:
+        if H.has_edge(u, v, key):
+            H.remove_edge(u, v, key)
+
+    protected = {start_node} if start_node is not None else set()
+    dead_nodes = [node for node in H.nodes if H.degree(node) == 0 and node not in protected]
+    if dead_nodes:
+        H.remove_nodes_from(dead_nodes)
+
+    if start_node is not None:
+        if start_node not in H or H.degree(start_node) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="The avoided trail segments block all usable trails from the selected start.",
+            )
+        component = set(nx.node_connected_component(H.to_undirected(as_view=True), start_node))
+        H = H.subgraph(component).copy()
+
+    if H.number_of_edges() == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="The avoided trail segments remove all usable routing trails in this search area.",
+        )
+
+    return H, resolved_avoid, resolved_prefer
+
+
+def preferred_segment_metrics(G, route_nodes):
+    """Return traversed preferred mileage and number of distinct preferred edges hit."""
+    total = 0.0
+    hits = set()
+    for i in range(len(route_nodes) - 1):
+        u = route_nodes[i]
+        v = route_nodes[i + 1]
+        edge = get_shortest_edge(G, u, v)
+        if edge is None or not bool(edge.get("preferred_segment", False)):
+            continue
+        total += float(edge.get("length", 0) or 0)
+        hits.add(undirected_edge_key(u, v))
+    return float(total), len(hits)
+
+
+def normalized_route_diversity(value):
+    try:
+        value = float(value)
+    except Exception:
+        value = DEFAULT_ROUTE_DIVERSITY
+    return max(0.0, min(100.0, value))
 
 
 # ============================================================
@@ -3596,7 +3795,15 @@ def make_simple_routing_graph(G, connector_multiplier=None):
         else:
             routing_cost = float(data.get("routing_cost", edge_routing_cost(data)))
         if not S.has_edge(u, v) or routing_cost < float(S[u][v].get("routing_cost", float("inf"))):
-            S.add_edge(u, v, length=length, ascent_m=ascent, route_class=route_class, routing_cost=routing_cost)
+            S.add_edge(
+                u,
+                v,
+                length=length,
+                ascent_m=ascent,
+                route_class=route_class,
+                routing_cost=routing_cost,
+                preferred_segment=bool(data.get("preferred_segment", False)),
+            )
     return S
 
 
@@ -4124,9 +4331,12 @@ def build_elevation_profile(dense_lonlat, smoothed_elevations, max_points=240):
         elevation = smoothed_elevations[i]
         if elevation is None:
             continue
+        lon, lat = dense_lonlat[i]
         profile.append({
             "distance_miles": round(cumulative_m[i] / METERS_PER_MILE, 3),
             "elevation_ft": round(float(elevation) * FEET_PER_METER, 1),
+            "lat": round(float(lat), 7),
+            "lon": round(float(lon), 7),
         })
     return profile
 
@@ -4217,6 +4427,12 @@ def score_route_coordinates(
     effective_immediate_reversals = reversal_breakdown["effective_immediate_reversals"]
     connector_distance = connector_distance_meters(G, route_nodes)
     connector_ratio = connector_distance / max(total_distance, 1.0)
+    preferred_distance, preferred_hit_count = preferred_segment_metrics(G, route_nodes)
+    preferred_ratio = preferred_distance / max(total_distance, 1.0)
+    preference_reward = (
+        preferred_hit_count * PREFERRED_SEGMENT_FINAL_REWARD
+        + min(0.20, preferred_ratio) * 60.0
+    )
 
     topology = route_topology_metrics(route_nodes)
     max_radial_meters = route_max_radial_meters_from_coords(coords)
@@ -4257,6 +4473,7 @@ def score_route_coordinates(
         + connector_ratio * connector_score_weight
         + shape_penalty
         + subloop_penalty
+        - preference_reward
     )
 
     return (
@@ -4282,6 +4499,9 @@ def score_route_coordinates(
             "connector_distance_meters": connector_distance,
             "connector_ratio": connector_ratio,
             "trail_fraction": max(0.0, 1.0 - connector_ratio),
+            "preferred_distance_meters": preferred_distance,
+            "preferred_hit_count": preferred_hit_count,
+            "preference_reward": preference_reward,
             "cycle_rank": topology["cycle_rank"],
             "extra_cycles": topology["extra_cycles"],
             "branch_points": topology["branch_points"],
@@ -4358,26 +4578,53 @@ def select_diverse_accurate_candidates(
     scored_candidates,
     max_routes=MAX_ROUTE_OPTIONS,
     max_shared_fraction=MAX_ROUTE_SHARED_FRACTION,
+    route_diversity=DEFAULT_ROUTE_DIVERSITY,
 ):
     """
-    Pick the best accurately scored routes while rejecting near-duplicates.
-    scored_candidates contains (score, route_nodes, metrics).
+    Select up to max_routes without throwing good solutions away.
+
+    V27 turns diversity into a user-controlled ordering/selection preference.
+    At 0, the best scores dominate. At 100, overlap with already-selected
+    routes carries a strong penalty, so the visible alternatives spread across
+    different trail corridors. Candidates are not hard-rejected by similarity.
     """
     ordered = sorted(scored_candidates, key=lambda item: item[0])
-    selected = []
+    if not ordered:
+        return []
 
-    for candidate in ordered:
-        _, route_nodes, _ = candidate
-        if any(
-            route_shared_fraction(G, route_nodes, existing[1]) > max_shared_fraction
-            for existing in selected
-        ):
-            continue
-        selected.append(candidate)
-        if len(selected) >= max_routes:
-            break
+    diversity = normalized_route_diversity(route_diversity) / 100.0
+    if diversity <= 0.001:
+        return ordered[:max_routes]
+
+    selected = [ordered.pop(0)]
+    # Raw route scores commonly live in the tens/hundreds. This overlap penalty
+    # is intentionally substantial at the high end but remains soft.
+    overlap_weight = 180.0 * diversity
+
+    while ordered and len(selected) < max_routes:
+        best_index = 0
+        best_effective = float("inf")
+        for index, candidate in enumerate(ordered):
+            score, route_nodes, _ = candidate
+            max_overlap = max(
+                route_shared_fraction(G, route_nodes, existing[1])
+                for existing in selected
+            )
+            effective = float(score) + overlap_weight * max_overlap
+            if effective < best_effective:
+                best_effective = effective
+                best_index = index
+        selected.append(ordered.pop(best_index))
 
     return selected
+
+
+def route_signature(route_nodes):
+    """Stable short signature used by the browser to de-duplicate Find More batches."""
+    forward = ",".join(str(node) for node in route_nodes)
+    reverse = ",".join(str(node) for node in reversed(route_nodes))
+    canonical = min(forward, reverse)
+    return hashlib.sha1(canonical.encode("utf-8")).hexdigest()[:16]
 
 
 def copy_internal_route_options(candidates):
@@ -4409,10 +4656,15 @@ def build_route_option_payload(
     actual_gain_ft = metrics["actual_gain_meters"] * FEET_PER_METER
     actual_descent_ft = metrics.get("actual_descent_meters", 0.0) * FEET_PER_METER
     repeated_distance_miles = metrics["repeated_distance_meters"] / METERS_PER_MILE
+    connector_distance_miles = metrics.get("connector_distance_meters", 0.0) / METERS_PER_MILE
+    retrace_percent = 100.0 * metrics.get("repeated_distance_meters", 0.0) / max(metrics.get("total_distance_meters", 0.0), 1.0)
+    connector_percent = 100.0 * metrics.get("connector_distance_meters", 0.0) / max(metrics.get("total_distance_meters", 0.0), 1.0)
+    preferred_distance_miles = metrics.get("preferred_distance_meters", 0.0) / METERS_PER_MILE
 
     return {
         "index": int(option_index),
         "name": f"Route {int(option_index) + 1}",
+        "route_signature": route_signature(route_nodes),
         "actual_distance_miles": round(route_distance_miles, 2),
         "distance_error_miles": round(abs(route_distance_miles - request.target_distance_miles), 2),
         "actual_gain_ft": round(actual_gain_ft),
@@ -4427,8 +4679,12 @@ def build_route_option_payload(
         "repeated_distance_miles": round(repeated_distance_miles, 2),
         "repeated_nodes": metrics["repeated_nodes"],
         "immediate_reversals": metrics["immediate_reversals"],
-        "connector_distance_miles": round(metrics.get("connector_distance_meters", 0.0) / METERS_PER_MILE, 2),
+        "connector_distance_miles": round(connector_distance_miles, 2),
+        "retrace_percent": round(retrace_percent, 1),
+        "connector_percent": round(connector_percent, 1),
         "trail_percent": round(metrics.get("trail_fraction", 1.0) * 100.0, 1),
+        "preferred_distance_miles": round(preferred_distance_miles, 2),
+        "preferred_hit_count": int(metrics.get("preferred_hit_count", 0)),
         "independent_loops": int(metrics.get("cycle_rank", 0)),
         "extra_subloops": int(metrics.get("extra_cycles", 0)),
         "branch_points": int(metrics.get("branch_points", 0)),
@@ -4637,6 +4893,7 @@ def beam_search_short_loop(
     target_gain_meters,
     limits,
     profile,
+    route_diversity=DEFAULT_ROUTE_DIVERSITY,
 ):
     """Budgeted multi-objective closed-loop search with partial-edge tuning."""
     S = make_simple_routing_graph(G)
@@ -4679,6 +4936,7 @@ def beam_search_short_loop(
         "used_edges": frozenset(),
         "repeat_distance": 0.0,
         "connector_distance": 0.0,
+        "preferred_distance": 0.0,
         "reversals": 0,
     }]
 
@@ -4701,14 +4959,19 @@ def beam_search_short_loop(
         )
         repeat_ratio = state["repeat_distance"] / max(state["distance"], 1.0)
         connector_ratio = state.get("connector_distance", 0.0) / max(state["distance"], 1.0)
+        preferred_ratio = state.get("preferred_distance", 0.0) / max(state["distance"], 1.0)
         reversal_penalty = state["reversals"] * 0.02
         connector_penalty = connector_ratio * 1.5
+        preference_bonus = min(0.25, preferred_ratio) * 1.2
+        # A tiny seeded jitter gives Find More a genuinely different short-loop
+        # beam without overpowering the route-quality objectives.
+        exploration_jitter = random.random() * 0.025
 
         return {
-            "balanced": distance_error * 3.0 + density_error * 0.85 + repeat_ratio * 0.25 + reversal_penalty + connector_penalty,
-            "gain": density_error * 2.5 + distance_error * 1.0 + repeat_ratio * 0.20 + reversal_penalty + connector_penalty,
-            "distance": distance_error * 5.0 + density_error * 0.15 + repeat_ratio * 0.15 + reversal_penalty + connector_penalty,
-            "flat": gain_density * 8.0 + distance_error * 2.0 + repeat_ratio * 0.15 + reversal_penalty + connector_penalty,
+            "balanced": distance_error * 3.0 + density_error * 0.85 + repeat_ratio * 0.25 + reversal_penalty + connector_penalty - preference_bonus + exploration_jitter,
+            "gain": density_error * 2.5 + distance_error * 1.0 + repeat_ratio * 0.20 + reversal_penalty + connector_penalty - preference_bonus + exploration_jitter,
+            "distance": distance_error * 5.0 + density_error * 0.15 + repeat_ratio * 0.15 + reversal_penalty + connector_penalty - preference_bonus + exploration_jitter,
+            "flat": gain_density * 8.0 + distance_error * 2.0 + repeat_ratio * 0.15 + reversal_penalty + connector_penalty - preference_bonus + exploration_jitter,
         }
 
     for depth in range(max_steps):
@@ -4760,6 +5023,9 @@ def beam_search_short_loop(
                 new_connector_distance = state.get("connector_distance", 0.0) + (
                     edge_length if str(edge.get("route_class", "trail")) == "connector" else 0.0
                 )
+                new_preferred_distance = state.get("preferred_distance", 0.0) + (
+                    edge_length if bool(edge.get("preferred_segment", False)) else 0.0
+                )
 
                 if neighbor == start_node:
                     # A partial out-and-back can add at most 0.75 mi. Therefore a
@@ -4785,6 +5051,7 @@ def beam_search_short_loop(
                             repeat_ratio = repeat_distance / max(new_distance, 1.0)
                             gain_density = new_gain / max(new_distance, 1.0)
                             connector_ratio = new_connector_distance / max(new_distance, 1.0)
+                            preferred_ratio = new_preferred_distance / max(new_distance, 1.0)
 
                             closed_candidates.append({
                                 "route": list(new_route),
@@ -4795,7 +5062,8 @@ def beam_search_short_loop(
                                 "repeat_ratio": repeat_ratio,
                                 "gain_density": gain_density,
                                 "connector_ratio": connector_ratio,
-                                "cheap_balanced": distance_ratio * 3.0 + gain_ratio * 1.2 + repeat_ratio * 0.25 + connector_ratio * 1.5,
+                                "preferred_ratio": preferred_ratio,
+                                "cheap_balanced": distance_ratio * 3.0 + gain_ratio * 1.2 + repeat_ratio * 0.25 + connector_ratio * 1.5 - min(0.20, preferred_ratio) * 0.8,
                             })
 
                             # Keep candidate storage bounded but diverse.
@@ -4829,6 +5097,7 @@ def beam_search_short_loop(
                         "used_edges": frozenset(used_edges),
                         "repeat_distance": repeat_distance,
                         "connector_distance": new_connector_distance,
+                        "preferred_distance": new_preferred_distance,
                         "reversals": reversals,
                     }
                     priorities = state_priorities(new_state, new_distance)
@@ -4849,6 +5118,8 @@ def beam_search_short_loop(
                     "gain": new_gain,
                     "used_edges": frozenset(used_edges),
                     "repeat_distance": repeat_distance,
+                    "connector_distance": new_connector_distance,
+                    "preferred_distance": new_preferred_distance,
                     "reversals": reversals,
                 }
                 priorities = state_priorities(new_state, min_final_distance)
@@ -4876,6 +5147,7 @@ def beam_search_short_loop(
                 int(state["gain"] / 6.0),
                 int(state["repeat_distance"] / 30.0),
                 int(state.get("connector_distance", 0.0) / 50.0),
+                int(state.get("preferred_distance", 0.0) / 50.0),
             )
             if bucket in seen_buckets:
                 continue
@@ -4979,7 +5251,7 @@ def beam_search_short_loop(
             G,
             valid_candidates,
             max_routes=MAX_ROUTE_OPTIONS,
-            max_shared_fraction=MAX_ROUTE_SHARED_FRACTION,
+            route_diversity=route_diversity,
         )
         if not diverse:
             diverse = sorted(valid_candidates, key=lambda item: item[0])[:MAX_ROUTE_OPTIONS]
@@ -5176,6 +5448,12 @@ def cheap_waypoint_score(
     effective_immediate_reversals = reversal_breakdown["effective_immediate_reversals"]
     connector_distance = connector_distance_meters(G, route_nodes)
     connector_ratio = connector_distance / max(total_distance, 1.0)
+    preferred_distance, preferred_hit_count = preferred_segment_metrics(G, route_nodes)
+    preferred_ratio = preferred_distance / max(total_distance, 1.0)
+    preference_reward = (
+        preferred_hit_count * PREFERRED_SEGMENT_CHEAP_REWARD
+        + min(0.20, preferred_ratio) * 35.0
+    )
 
     topology = route_topology_metrics(route_nodes)
     max_radial_meters = route_max_radial_meters_from_nodes(G, route_nodes)
@@ -5209,6 +5487,7 @@ def cheap_waypoint_score(
         + connector_ratio * connector_score_weight
         + shape_penalty
         + subloop_penalty
+        - preference_reward
     )
 
     return score, {
@@ -5227,6 +5506,9 @@ def cheap_waypoint_score(
         "optional_immediate_reversals": reversal_breakdown["optional_immediate_reversals"],
         "connector_distance_meters": connector_distance,
         "connector_ratio": connector_ratio,
+        "preferred_distance_meters": preferred_distance,
+        "preferred_hit_count": preferred_hit_count,
+        "preference_reward": preference_reward,
         "cycle_rank": topology["cycle_rank"],
         "extra_cycles": topology["extra_cycles"],
         "branch_points": topology["branch_points"],
@@ -5248,6 +5530,7 @@ def generate_waypoint_loop(
     profile,
     limits,
     required_pass_points=None,
+    route_diversity=DEFAULT_ROUTE_DIVERSITY,
 ):
     """
     Two-stage waypoint search for 4+ mile loops.
@@ -5339,7 +5622,12 @@ def generate_waypoint_loop(
             detail="Not enough trail junctions for this route and its required pass-through points.",
         )
 
-    accurate_finalists = int(profile.get("accurate_finalists", 40))
+    base_accurate_finalists = int(profile.get("accurate_finalists", 14))
+    diversity = normalized_route_diversity(route_diversity)
+    accurate_finalists = max(
+        base_accurate_finalists,
+        min(24, MAX_ROUTE_OPTIONS + int(round(10.0 * diversity / 100.0))),
+    )
     pool_multiplier = int(profile.get("candidate_pool_multiplier", 3))
     pool_limit = max(accurate_finalists, accurate_finalists * pool_multiplier)
 
@@ -5626,7 +5914,7 @@ def generate_waypoint_loop(
             G,
             valid_candidates,
             max_routes=MAX_ROUTE_OPTIONS,
-            max_shared_fraction=MAX_ROUTE_SHARED_FRACTION,
+            route_diversity=route_diversity,
         )
         if not diverse:
             diverse = sorted(valid_candidates, key=lambda item: item[0])[:MAX_ROUTE_OPTIONS]
@@ -6664,6 +6952,14 @@ def generate_route(request: RouteRequest):
                 detail="Elevation gain cannot be negative.",
             )
 
+        # Find More sends a new seed while keeping every other request setting
+        # unchanged. Waypoint sampling and the short-route beam jitter then
+        # explore a different batch of solutions.
+        if request.search_seed is not None:
+            random.seed(int(request.search_seed))
+
+        route_diversity = normalized_route_diversity(request.route_diversity)
+
         target_distance_meters = (
             request.target_distance_miles * METERS_PER_MILE
         )
@@ -6709,6 +7005,17 @@ def generate_route(request: RouteRequest):
         snapped_start_lat = float(G.nodes[start_node]["y"])
         snapped_start_lon = float(G.nodes[start_node]["x"])
         snap_distance_m = float(start_info["routing_offset_m"])
+
+        # V27: clicked trail-segment controls are resolved against this exact
+        # request graph. Avoided segments are removed; preferred segments get a
+        # soft path/scoring bonus. This happens before pass-through edge splits
+        # so preference attributes propagate into any temporary split pieces.
+        G, resolved_avoid_segments, resolved_prefer_segments = apply_trail_segment_controls(
+            G,
+            request.avoid_segments,
+            request.prefer_segments,
+            start_node=start_node,
+        )
 
         # V25: avoid areas are hard exclusions. Remove intersecting routing
         # edges before selecting the end node or inserting required pass-through
@@ -6756,6 +7063,7 @@ def generate_route(request: RouteRequest):
                     constrained_profile,
                     limits,
                     required_pass_points=required_pass_points,
+                    route_diversity=route_diversity,
                 )
                 profile = constrained_profile
                 route_type = "required pass-through trail loop"
@@ -6775,6 +7083,7 @@ def generate_route(request: RouteRequest):
                     target_gain_meters,
                     limits,
                     profile,
+                    route_diversity=route_diversity,
                 )
 
                 route_type = "true closed-loop trail beam search"
@@ -6792,6 +7101,7 @@ def generate_route(request: RouteRequest):
                     target_gain_meters,
                     profile,
                     limits,
+                    route_diversity=route_diversity,
                 )
 
                 route_type = "adaptive waypoint trail loop"
@@ -6957,6 +7267,10 @@ def generate_route(request: RouteRequest):
             "required_pass_points": metrics.get("required_pass_points", []),
             "required_pass_points_count": len(required_pass_points),
             "avoid_areas_count": len(resolved_avoid_areas),
+            "avoid_segments_count": len(resolved_avoid_segments),
+            "prefer_segments_count": len(resolved_prefer_segments),
+            "route_diversity": route_diversity,
+            "search_seed": request.search_seed,
             "version": APP_VERSION,
             "snapped_start_lat": snapped_start_lat,
             "snapped_start_lon": snapped_start_lon,
@@ -7154,7 +7468,9 @@ button:disabled {
 }
 
 #pass-point-panel,
-#avoid-area-panel {
+#avoid-area-panel,
+#segment-control-panel,
+#diversity-panel {
     border: 1px solid #ddd;
     border-radius: 6px;
     padding: 10px;
@@ -7163,7 +7479,8 @@ button:disabled {
 }
 
 .pass-point-row,
-.avoid-area-row {
+.avoid-area-row,
+.segment-row {
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
@@ -7179,8 +7496,49 @@ button:disabled {
 }
 
 .pass-point-remove,
-.avoid-area-remove {
+.avoid-area-remove,
+.segment-remove {
     background: #666;
+}
+
+.segment-button-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 8px;
+}
+
+.segment-button-row button {
+    flex: 1 1 130px;
+    margin-right: 0;
+}
+
+#avoidTrailSegmentButton {
+    background: #9a3412;
+}
+
+#preferTrailSegmentButton {
+    background: #166534;
+}
+
+.segment-row {
+    justify-content: space-between;
+    font-size: 12px;
+}
+
+.segment-row .segment-kind {
+    font-weight: bold;
+}
+
+.segment-row.avoid .segment-kind { color: #9a3412; }
+.segment-row.prefer .segment-kind { color: #166534; }
+
+#diversityValue {
+    font-weight: bold;
+}
+
+input[type="range"] {
+    width: 100%;
 }
 
 #passPointStatus,
@@ -7190,24 +7548,64 @@ button:disabled {
 
 .route-choice-grid {
     display: flex;
-    flex-wrap: wrap;
-    gap: 8px;
+    flex-direction: column;
+    gap: 7px;
     margin: 10px 0 12px 0;
 }
 
 .route-choice {
-    background: #f3f4f6;
+    width: 100%;
+    text-align: left;
+    background: #f8fafc;
     color: #111;
-    border: 1px solid #bbb;
+    border: 1px solid #cbd5e1;
     margin: 0;
-    padding: 8px 10px;
-    font-size: 13px;
+    padding: 9px 10px;
+    font-size: 12px;
+    line-height: 1.35;
+}
+
+.route-choice:hover {
+    background: #eef2ff;
 }
 
 .route-choice.selected {
     background: #b91c1c;
     color: white;
     border-color: #991b1b;
+}
+
+.route-card-title {
+    display: block;
+    font-size: 13px;
+    font-weight: 700;
+    margin-bottom: 2px;
+}
+
+.route-card-primary,
+.route-card-secondary {
+    display: block;
+}
+
+.route-card-secondary {
+    opacity: 0.82;
+    margin-top: 2px;
+}
+
+#findMoreButton {
+    background: #334155;
+}
+
+.trail-selection-line-avoid {
+    stroke-dasharray: 7 5;
+}
+
+.elevation-hover-tooltip {
+    background: rgba(17, 24, 39, 0.9);
+    color: white;
+    border: none;
+    box-shadow: none;
+    font-size: 11px;
 }
 
 #selectedRouteDetails {
@@ -7293,6 +7691,13 @@ button:disabled {
     </div>
 </div>
 
+<div id="diversity-panel">
+    <b>Route diversity</b><br>
+    <span class="small">Similar routes</span>
+    <input id="routeDiversity" type="range" min="0" max="100" step="5" value="50">
+    <div class="small">Current: <span id="diversityValue">50</span>/100 · higher = alternatives use more different trail corridors</div>
+</div>
+
 <div id="pass-point-panel">
     <b>Required pass-through points</b><br>
     <span class="small">Add a point, then click the map. The generated route must use a natural trail inside the tolerance circle. Points do not need to be exactly on a trail.</span><br>
@@ -7309,7 +7714,19 @@ button:disabled {
     <div id="avoidAreaRows"></div>
 </div>
 
+<div id="segment-control-panel">
+    <b>Trail segment controls</b><br>
+    <span class="small">Choose a mode, then click directly on a gray trail. Avoid removes that segment from routing. Prefer makes it more attractive but does not require it.</span>
+    <div class="segment-button-row">
+        <button id="avoidTrailSegmentButton" type="button">Avoid trail segment</button>
+        <button id="preferTrailSegmentButton" type="button">Prefer trail segment</button>
+    </div>
+    <div id="segmentStatus" class="small"></div>
+    <div id="segmentRows"></div>
+</div>
+
 <button id="generateButton">Generate Trail Route</button>
+<button id="findMoreButton" disabled>Find More Routes</button>
 <button id="downloadGpxButton" disabled>Download GPX for COROS</button>
 <button id="networkButton">Load / Refresh Start Area</button>
 
@@ -7359,6 +7776,7 @@ let loadedWorkspaceStartKey = null;
 let lastWorkspaceResult = null;
 let masterTrailOverlayLoaded = false;
 let masterTrailOverlayPromise = null;
+let masterTrailSegments = [];
 let startPointPlacementMode = true;
 let passPoints = [];
 let passPointLayers = [];
@@ -7368,23 +7786,44 @@ let avoidAreas = [];
 let avoidAreaLayers = [];
 let avoidAreaPlacementMode = false;
 let nextAvoidAreaId = 1;
+let avoidSegments = [];
+let preferSegments = [];
+let trailSegmentLayers = [];
+let trailSegmentPlacementMode = null; // "avoid" | "prefer" | null
+let nextTrailSegmentId = 1;
+let elevationHoverMarker = null;
+let elevationRenderState = null;
+let currentSearchSeed = Math.floor(Date.now() % 2147483647);
+let findMoreBatch = 0;
+let lastSearchConfigKey = null;
 
 const generateButton = document.getElementById("generateButton");
+const findMoreButton = document.getElementById("findMoreButton");
 const downloadGpxButton = document.getElementById("downloadGpxButton");
 const networkButton = document.getElementById("networkButton");
 const showNetworkCheckbox = document.getElementById("showNetwork");
 const chooseStartButton = document.getElementById("chooseStartButton");
 const addPassPointButton = document.getElementById("addPassPointButton");
 const addAvoidAreaButton = document.getElementById("addAvoidAreaButton");
+const avoidTrailSegmentButton = document.getElementById("avoidTrailSegmentButton");
+const preferTrailSegmentButton = document.getElementById("preferTrailSegmentButton");
+const routeDiversityInput = document.getElementById("routeDiversity");
+const diversityValue = document.getElementById("diversityValue");
 
 
 generateButton.addEventListener("click", generateRoute);
+findMoreButton.addEventListener("click", findMoreRoutes);
 downloadGpxButton.addEventListener("click", downloadGeneratedGpx);
 networkButton.addEventListener("click", reloadNetwork);
 showNetworkCheckbox.addEventListener("change", updateNetworkVisibility);
 chooseStartButton.addEventListener("click", beginStartPointPlacement);
 addPassPointButton.addEventListener("click", beginPassPointPlacement);
 addAvoidAreaButton.addEventListener("click", beginAvoidAreaPlacement);
+avoidTrailSegmentButton.addEventListener("click", () => beginTrailSegmentPlacement("avoid"));
+preferTrailSegmentButton.addEventListener("click", () => beginTrailSegmentPlacement("prefer"));
+routeDiversityInput.addEventListener("input", () => {
+    diversityValue.textContent = routeDiversityInput.value;
+});
 map.on("click", handleMapPlacementClick);
 window.addEventListener("resize", () => {
     map.invalidateSize();
@@ -7393,11 +7832,26 @@ window.addEventListener("resize", () => {
 });
 
 
-function beginStartPointPlacement() {
+function resetTrailSegmentPlacementButtons() {
+    avoidTrailSegmentButton.textContent = "Avoid trail segment";
+    preferTrailSegmentButton.textContent = "Prefer trail segment";
+}
+
+
+function clearPlacementModes() {
+    startPointPlacementMode = false;
     passPointPlacementMode = false;
     avoidAreaPlacementMode = false;
+    trailSegmentPlacementMode = null;
+    chooseStartButton.textContent = "Choose start on map";
     addPassPointButton.textContent = "Add pass-through point";
     addAvoidAreaButton.textContent = "Add avoid area";
+    resetTrailSegmentPlacementButtons();
+}
+
+
+function beginStartPointPlacement() {
+    clearPlacementModes();
     startPointPlacementMode = true;
     chooseStartButton.textContent = "Click map to place start...";
     document.getElementById("startPointStatus").textContent =
@@ -7406,21 +7860,217 @@ function beginStartPointPlacement() {
 
 
 function beginPassPointPlacement() {
-    startPointPlacementMode = false;
-    chooseStartButton.textContent = "Choose start on map";
-    avoidAreaPlacementMode = false;
-    addAvoidAreaButton.textContent = "Add avoid area";
+    clearPlacementModes();
     if (passPoints.length >= 5) {
         document.getElementById("passPointStatus").textContent = "Maximum of 5 pass-through points reached.";
         return;
     }
     passPointPlacementMode = true;
     addPassPointButton.textContent = "Click map to place point...";
-    document.getElementById("passPointStatus").textContent = "Click anywhere on the map. The route will use a nearby natural trail inside the tolerance circle.";
+    document.getElementById("passPointStatus").textContent =
+        "Click anywhere on the map. The route will use a nearby natural trail inside the tolerance circle.";
+}
+
+
+function beginAvoidAreaPlacement() {
+    clearPlacementModes();
+    if (avoidAreas.length >= 5) {
+        document.getElementById("avoidAreaStatus").textContent = "Maximum of 5 avoid areas reached.";
+        return;
+    }
+    avoidAreaPlacementMode = true;
+    addAvoidAreaButton.textContent = "Click map to place area...";
+    document.getElementById("avoidAreaStatus").textContent =
+        "Click the center of the area you want the generated route to avoid.";
+}
+
+
+function beginTrailSegmentPlacement(kind) {
+    clearPlacementModes();
+    const list = kind === "avoid" ? avoidSegments : preferSegments;
+    const maxCount = 12;
+    if (list.length >= maxCount) {
+        document.getElementById("segmentStatus").textContent =
+            `Maximum of ${maxCount} ${kind === "avoid" ? "avoided" : "preferred"} trail segments reached.`;
+        return;
+    }
+    trailSegmentPlacementMode = kind;
+    if (kind === "avoid") {
+        avoidTrailSegmentButton.textContent = "Click gray trail to avoid...";
+    } else {
+        preferTrailSegmentButton.textContent = "Click gray trail to prefer...";
+    }
+    document.getElementById("segmentStatus").textContent =
+        "Click directly on the gray trail segment you want to " + (kind === "avoid" ? "avoid." : "prefer.");
+}
+
+
+function invalidateAfterStartMove() {
+    loadedWorkspaceStartKey = null;
+    lastWorkspaceResult = null;
+    lastGeneratedRoute = null;
+    selectedRouteOptionIndex = 0;
+    findMoreBatch = 0;
+    downloadGpxButton.disabled = true;
+    findMoreButton.disabled = true;
+    clearGeneratedRouteLines();
+    if (snappedStartMarker) map.removeLayer(snappedStartMarker);
+    if (snapLine) map.removeLayer(snapLine);
+    snappedStartMarker = null;
+    snapLine = null;
+}
+
+
+function createRequestedStartMarker(lat, lon, popupText = "Selected start", openPopup = false) {
+    if (requestedStartMarker && map.hasLayer(requestedStartMarker)) {
+        map.removeLayer(requestedStartMarker);
+    }
+    requestedStartMarker = L.marker([lat, lon], {draggable: true})
+        .addTo(map)
+        .bindPopup(popupText);
+    requestedStartMarker.on("dragend", event => {
+        setStartPoint(event.target.getLatLng(), "Start moved. Generate a route or load the start area.");
+    });
+    if (openPopup) requestedStartMarker.openPopup();
+}
+
+
+function setStartPoint(latlng, statusText = "Start selected. Generate a route or load the start area.") {
+    const startLatInput = document.getElementById("start_lat");
+    const startLonInput = document.getElementById("start_lon");
+    const endLatInput = document.getElementById("end_lat");
+    const endLonInput = document.getElementById("end_lon");
+
+    const oldStartLat = Number(startLatInput.value);
+    const oldStartLon = Number(startLonInput.value);
+    const oldEndLat = Number(endLatInput.value);
+    const oldEndLon = Number(endLonInput.value);
+    const endWasFollowingStart =
+        Number.isFinite(oldStartLat) && Number.isFinite(oldStartLon) &&
+        Number.isFinite(oldEndLat) && Number.isFinite(oldEndLon) &&
+        Math.abs(oldEndLat - oldStartLat) < 0.000001 &&
+        Math.abs(oldEndLon - oldStartLon) < 0.000001;
+
+    const lat = Number(latlng.lat.toFixed(7));
+    const lon = Number(latlng.lng.toFixed(7));
+    startLatInput.value = lat;
+    startLonInput.value = lon;
+    if (endWasFollowingStart) {
+        endLatInput.value = lat;
+        endLonInput.value = lon;
+    }
+
+    invalidateAfterStartMove();
+    createRequestedStartMarker(lat, lon, "Selected start · drag to adjust", true);
+    clearPlacementModes();
+    document.getElementById("startPointStatus").textContent = statusText;
+    document.getElementById("results").innerHTML =
+        '<span class="success">Start selected from map. Drag the marker to fine-tune it.</span>';
+}
+
+
+function findNearestOverlayTrailSegment(latlng) {
+    if (!masterTrailSegments || masterTrailSegments.length === 0) return null;
+    const clickPoint = map.latLngToLayerPoint(latlng);
+    let best = null;
+
+    for (const segment of masterTrailSegments) {
+        if (!segment || segment.length < 2) continue;
+        for (let i = 0; i < segment.length - 1; i++) {
+            const aLL = L.latLng(Number(segment[i][0]), Number(segment[i][1]));
+            const bLL = L.latLng(Number(segment[i + 1][0]), Number(segment[i + 1][1]));
+            const a = map.latLngToLayerPoint(aLL);
+            const b = map.latLngToLayerPoint(bLL);
+            const dx = b.x - a.x;
+            const dy = b.y - a.y;
+            const denom = dx * dx + dy * dy;
+            let t = denom > 0 ? ((clickPoint.x - a.x) * dx + (clickPoint.y - a.y) * dy) / denom : 0;
+            t = Math.max(0, Math.min(1, t));
+            const px = a.x + t * dx;
+            const py = a.y + t * dy;
+            const distPx = Math.hypot(clickPoint.x - px, clickPoint.y - py);
+            if (!best || distPx < best.distancePx) {
+                best = {
+                    distancePx: distPx,
+                    lat: aLL.lat + (bLL.lat - aLL.lat) * t,
+                    lon: aLL.lng + (bLL.lng - aLL.lng) * t,
+                    geometry: segment.map(point => [Number(point[0]), Number(point[1])])
+                };
+            }
+        }
+    }
+    return best;
+}
+
+
+function trailGeometrySignature(geometry) {
+    if (!geometry || geometry.length < 2) return "";
+    const first = geometry[0];
+    const last = geometry[geometry.length - 1];
+    const a = `${Number(first[0]).toFixed(6)},${Number(first[1]).toFixed(6)}`;
+    const b = `${Number(last[0]).toFixed(6)},${Number(last[1]).toFixed(6)}`;
+    return a < b ? `${a}|${b}` : `${b}|${a}`;
+}
+
+
+function addClickedTrailSegment(kind, latlng) {
+    const nearest = findNearestOverlayTrailSegment(latlng);
+    if (!nearest || nearest.distancePx > 22) {
+        document.getElementById("segmentStatus").textContent =
+            "No gray trail was close enough to that click. Zoom in and click directly on the trail.";
+        return;
+    }
+
+    const list = kind === "avoid" ? avoidSegments : preferSegments;
+    const opposite = kind === "avoid" ? preferSegments : avoidSegments;
+    const chosenLatLng = L.latLng(nearest.lat, nearest.lon);
+    const geometryKey = trailGeometrySignature(nearest.geometry);
+    const duplicate = list.some(item =>
+        trailGeometrySignature(item.geometry) === geometryKey ||
+        map.distance(chosenLatLng, L.latLng(item.lat, item.lon)) < 3
+    );
+    if (duplicate) {
+        document.getElementById("segmentStatus").textContent = "That trail segment is already selected.";
+        return;
+    }
+
+    // If the same exact segment was previously selected in the opposite mode,
+    // remove it there so the intent is never ambiguous.
+    const filteredOpposite = opposite.filter(item =>
+        trailGeometrySignature(item.geometry) !== geometryKey &&
+        map.distance(chosenLatLng, L.latLng(item.lat, item.lon)) >= 3
+    );
+    if (kind === "avoid") {
+        preferSegments = filteredOpposite;
+    } else {
+        avoidSegments = filteredOpposite;
+    }
+
+    list.push({
+        id: nextTrailSegmentId++,
+        lat: Number(nearest.lat.toFixed(7)),
+        lon: Number(nearest.lon.toFixed(7)),
+        geometry: nearest.geometry
+    });
+
+    trailSegmentPlacementMode = null;
+    resetTrailSegmentPlacementButtons();
+    renderTrailSegmentRows();
+    drawTrailSegmentLayers();
+    document.getElementById("segmentStatus").textContent =
+        kind === "avoid"
+            ? "Trail segment marked to avoid."
+            : "Trail segment marked as preferred (soft preference only).";
 }
 
 
 function handleMapPlacementClick(event) {
+    if (trailSegmentPlacementMode) {
+        const kind = trailSegmentPlacementMode;
+        addClickedTrailSegment(kind, event.latlng);
+        return;
+    }
+
     if (passPointPlacementMode) {
         passPointPlacementMode = false;
         addPassPointButton.textContent = "Add pass-through point";
@@ -7432,7 +8082,8 @@ function handleMapPlacementClick(event) {
         });
         renderPassPointRows();
         drawPassPointLayers();
-        document.getElementById("passPointStatus").textContent = "Pass-through point added. Edit its coordinates/tolerance or remove it below.";
+        document.getElementById("passPointStatus").textContent =
+            "Pass-through point added. Drag its marker or edit the values below.";
         return;
     }
 
@@ -7447,84 +8098,74 @@ function handleMapPlacementClick(event) {
         });
         renderAvoidAreaRows();
         drawAvoidAreaLayers();
-        document.getElementById("avoidAreaStatus").textContent = "Avoid area added. Edit its center/radius or remove it below.";
+        document.getElementById("avoidAreaStatus").textContent =
+            "Avoid area added. Drag its marker or edit the center/radius below.";
         return;
     }
 
     if (startPointPlacementMode) {
-        const startLatInput = document.getElementById("start_lat");
-        const startLonInput = document.getElementById("start_lon");
-        const endLatInput = document.getElementById("end_lat");
-        const endLonInput = document.getElementById("end_lon");
-
-        const oldStartLat = Number(startLatInput.value);
-        const oldStartLon = Number(startLonInput.value);
-        const oldEndLat = Number(endLatInput.value);
-        const oldEndLon = Number(endLonInput.value);
-        const endWasFollowingStart =
-            Number.isFinite(oldStartLat) && Number.isFinite(oldStartLon) &&
-            Number.isFinite(oldEndLat) && Number.isFinite(oldEndLon) &&
-            Math.abs(oldEndLat - oldStartLat) < 0.000001 &&
-            Math.abs(oldEndLon - oldStartLon) < 0.000001;
-
-        const lat = Number(event.latlng.lat.toFixed(7));
-        const lon = Number(event.latlng.lng.toFixed(7));
-        startLatInput.value = lat;
-        startLonInput.value = lon;
-
-        // Keep the normal loop workflow convenient: when end was following
-        // start, move the finish to the newly selected start as well. A
-        // manually different end point is preserved.
-        if (endWasFollowingStart) {
-            endLatInput.value = lat;
-            endLonInput.value = lon;
-        }
-
-        loadedWorkspaceStartKey = null;
-        lastWorkspaceResult = null;
-        lastGeneratedRoute = null;
-        selectedRouteOptionIndex = 0;
-        downloadGpxButton.disabled = true;
-        clearGeneratedRouteLines();
-
-        if (requestedStartMarker) map.removeLayer(requestedStartMarker);
-        if (snappedStartMarker) map.removeLayer(snappedStartMarker);
-        if (snapLine) map.removeLayer(snapLine);
-        snappedStartMarker = null;
-        snapLine = null;
-
-        requestedStartMarker = L.circleMarker(
-            [lat, lon],
-            {
-                radius: 7,
-                weight: 2,
-                color: "#0066cc",
-                fillOpacity: 0.9
-            }
-        ).addTo(map).bindPopup("Selected start").openPopup();
-
-        startPointPlacementMode = false;
-        chooseStartButton.textContent = "Choose start on map";
-        document.getElementById("startPointStatus").textContent =
-            "Start selected. Generate a route or load the start area.";
-        document.getElementById("results").innerHTML =
-            '<span class="success">Start selected from map.</span>';
+        setStartPoint(event.latlng);
     }
 }
 
 
-function beginAvoidAreaPlacement() {
-    startPointPlacementMode = false;
-    chooseStartButton.textContent = "Choose start on map";
-    passPointPlacementMode = false;
-    addPassPointButton.textContent = "Add pass-through point";
-    if (avoidAreas.length >= 5) {
-        document.getElementById("avoidAreaStatus").textContent = "Maximum of 5 avoid areas reached.";
-        return;
+function renderTrailSegmentRows() {
+    const container = document.getElementById("segmentRows");
+    container.innerHTML = "";
+    const rows = [
+        ...avoidSegments.map(item => ({...item, kind: "avoid"})),
+        ...preferSegments.map(item => ({...item, kind: "prefer"}))
+    ];
+    rows.forEach((item, index) => {
+        const row = document.createElement("div");
+        row.className = `segment-row ${item.kind}`;
+        row.innerHTML = `
+            <span class="segment-kind">${item.kind === "avoid" ? "Avoid" : "Prefer"} segment · ${Number(item.lat).toFixed(5)}, ${Number(item.lon).toFixed(5)}</span>
+            <button type="button" class="segment-remove" data-segment-kind="${item.kind}" data-segment-id="${item.id}">Remove</button>
+        `;
+        container.appendChild(row);
+    });
+    container.querySelectorAll("button[data-segment-id]").forEach(button => {
+        button.addEventListener("click", () => {
+            const id = Number(button.dataset.segmentId);
+            if (button.dataset.segmentKind === "avoid") {
+                avoidSegments = avoidSegments.filter(item => item.id !== id);
+            } else {
+                preferSegments = preferSegments.filter(item => item.id !== id);
+            }
+            renderTrailSegmentRows();
+            drawTrailSegmentLayers();
+        });
+    });
+}
+
+
+function drawTrailSegmentLayers() {
+    for (const layer of trailSegmentLayers) {
+        if (map.hasLayer(layer)) map.removeLayer(layer);
     }
-    avoidAreaPlacementMode = true;
-    addAvoidAreaButton.textContent = "Click map to place area...";
-    document.getElementById("avoidAreaStatus").textContent = "Click the center of the area you want the generated route to avoid.";
+    trailSegmentLayers = [];
+
+    avoidSegments.forEach((item, index) => {
+        const line = L.polyline(item.geometry, {
+            color: "#ea580c",
+            weight: 7,
+            opacity: 0.9,
+            dashArray: "8 6",
+            interactive: false
+        }).addTo(map).bindTooltip(`Avoid trail segment ${index + 1}`);
+        trailSegmentLayers.push(line);
+    });
+
+    preferSegments.forEach((item, index) => {
+        const line = L.polyline(item.geometry, {
+            color: "#16a34a",
+            weight: 7,
+            opacity: 0.85,
+            interactive: false
+        }).addTo(map).bindTooltip(`Preferred trail segment ${index + 1}`);
+        trailSegmentLayers.push(line);
+    });
 }
 
 
@@ -7593,13 +8234,16 @@ function drawPassPointLayers() {
             fillColor: "#a855f7",
             fillOpacity: 0.08
         }).addTo(map);
-        const marker = L.circleMarker([lat, lon], {
-            radius: 7,
-            color: "#581c87",
-            weight: 2,
-            fillColor: "#a855f7",
-            fillOpacity: 0.95
-        }).bindTooltip(`Required point ${index + 1}`).addTo(map);
+        const marker = L.marker([lat, lon], {draggable: true})
+            .bindTooltip(`Required point ${index + 1} · drag to adjust`)
+            .addTo(map);
+        marker.on("dragend", event => {
+            const moved = event.target.getLatLng();
+            point.lat = Number(moved.lat.toFixed(7));
+            point.lon = Number(moved.lng.toFixed(7));
+            renderPassPointRows();
+            drawPassPointLayers();
+        });
         passPointLayers.push(circle, marker);
     });
 }
@@ -7671,13 +8315,16 @@ function drawAvoidAreaLayers() {
             fillColor: "#f97316",
             fillOpacity: 0.12
         }).addTo(map);
-        const marker = L.circleMarker([lat, lon], {
-            radius: 6,
-            color: "#7c2d12",
-            weight: 2,
-            fillColor: "#f97316",
-            fillOpacity: 0.95
-        }).bindTooltip(`Avoid area ${index + 1}`).addTo(map);
+        const marker = L.marker([lat, lon], {draggable: true})
+            .bindTooltip(`Avoid area ${index + 1} · drag to adjust`)
+            .addTo(map);
+        marker.on("dragend", event => {
+            const moved = event.target.getLatLng();
+            area.lat = Number(moved.lat.toFixed(7));
+            area.lon = Number(moved.lng.toFixed(7));
+            renderAvoidAreaRows();
+            drawAvoidAreaLayers();
+        });
         avoidAreaLayers.push(circle, marker);
     });
 }
@@ -7767,7 +8414,24 @@ function downloadGeneratedGpx() {
 }
 
 
+function clearElevationHover() {
+    if (elevationHoverMarker && map.hasLayer(elevationHoverMarker)) {
+        map.removeLayer(elevationHoverMarker);
+    }
+    elevationHoverMarker = null;
+    if (elevationRenderState) {
+        const line = document.getElementById("profileHoverLine");
+        const dot = document.getElementById("profileHoverDot");
+        const label = document.getElementById("profileHoverLabel");
+        if (line) line.setAttribute("visibility", "hidden");
+        if (dot) dot.setAttribute("visibility", "hidden");
+        if (label) label.setAttribute("visibility", "hidden");
+    }
+}
+
+
 function clearGeneratedRouteLines() {
+    clearElevationHover();
     for (const line of routeOptionLines) {
         if (map.hasLayer(line)) {
             map.removeLayer(line);
@@ -7782,19 +8446,103 @@ function clearGeneratedRouteLines() {
 }
 
 
+function nearestProfileIndexToLatLng(profile, latlng) {
+    let bestIndex = -1;
+    let bestDistance = Infinity;
+    for (let i = 0; i < profile.length; i++) {
+        const p = profile[i];
+        if (!Number.isFinite(Number(p.lat)) || !Number.isFinite(Number(p.lon))) continue;
+        const d = map.distance(latlng, L.latLng(Number(p.lat), Number(p.lon)));
+        if (d < bestDistance) {
+            bestDistance = d;
+            bestIndex = i;
+        }
+    }
+    return bestIndex;
+}
+
+
+function updateElevationHover(index, showMapMarker = true) {
+    if (!elevationRenderState) return;
+    const {profile, x, y, margin, plotH} = elevationRenderState;
+    if (index < 0 || index >= profile.length) return;
+    const p = profile[index];
+    const px = x(Number(p.distance_miles));
+    const py = y(Number(p.elevation_ft));
+    const hoverLine = document.getElementById("profileHoverLine");
+    const hoverDot = document.getElementById("profileHoverDot");
+    const hoverLabel = document.getElementById("profileHoverLabel");
+    if (hoverLine) {
+        hoverLine.setAttribute("x1", px);
+        hoverLine.setAttribute("x2", px);
+        hoverLine.setAttribute("y1", margin.top);
+        hoverLine.setAttribute("y2", margin.top + plotH);
+        hoverLine.setAttribute("visibility", "visible");
+    }
+    if (hoverDot) {
+        hoverDot.setAttribute("cx", px);
+        hoverDot.setAttribute("cy", py);
+        hoverDot.setAttribute("visibility", "visible");
+    }
+    if (hoverLabel) {
+        hoverLabel.setAttribute("x", Math.min(px + 8, elevationRenderState.width - 125));
+        hoverLabel.setAttribute("y", Math.max(14, py - 8));
+        hoverLabel.textContent = `${Number(p.distance_miles).toFixed(2)} mi · ${Math.round(Number(p.elevation_ft))} ft`;
+        hoverLabel.setAttribute("visibility", "visible");
+    }
+
+    if (showMapMarker && Number.isFinite(Number(p.lat)) && Number.isFinite(Number(p.lon))) {
+        const ll = [Number(p.lat), Number(p.lon)];
+        if (!elevationHoverMarker) {
+            elevationHoverMarker = L.circleMarker(ll, {
+                radius: 6,
+                weight: 2,
+                color: "#111827",
+                fillColor: "#ffffff",
+                fillOpacity: 1,
+                interactive: false
+            }).addTo(map);
+            elevationHoverMarker.bindTooltip("", {
+                direction: "top",
+                offset: [0, -6],
+                className: "elevation-hover-tooltip"
+            });
+        } else {
+            elevationHoverMarker.setLatLng(ll);
+        }
+        elevationHoverMarker.setTooltipContent(
+            `${Number(p.distance_miles).toFixed(2)} mi · ${Math.round(Number(p.elevation_ft))} ft`
+        );
+        elevationHoverMarker.openTooltip();
+        elevationHoverMarker.bringToFront();
+    }
+}
+
+
+function handleSelectedRouteMapHover(latlng) {
+    const selected = getSelectedRouteOption();
+    if (!selected) return;
+    const profile = selected.elevation_profile || [];
+    const index = nearestProfileIndexToLatLng(profile, latlng);
+    if (index >= 0) updateElevationHover(index, true);
+}
+
+
 function renderElevationProfile(option) {
     const svg = document.getElementById("elevationProfileSvg");
     const title = document.getElementById("elevation-profile-title");
     if (!svg || !title) return;
 
+    clearElevationHover();
     const profile = (option && option.elevation_profile) || [];
     if (!profile.length) {
         title.textContent = "Elevation profile · no profile available";
         svg.innerHTML = "";
+        elevationRenderState = null;
         return;
     }
 
-    title.textContent = `${option.name} elevation profile · ${option.actual_distance_miles} mi · ${option.actual_gain_ft} ft gain`;
+    title.textContent = `${option.name} elevation profile · ${option.actual_distance_miles} mi · ${option.actual_gain_ft} ft gain · hover profile or route`;
 
     const width = Math.max(320, svg.clientWidth || 900);
     const height = Math.max(100, svg.clientHeight || 150);
@@ -7836,6 +8584,10 @@ function renderElevationProfile(option) {
         <line x1="${margin.left}" y1="${y(midElevation)}" x2="${width - margin.right}" y2="${y(midElevation)}" stroke="#e5e5e5" stroke-width="1"/>
         <path d="${areaPath}" fill="#dbeafe" opacity="0.75"></path>
         <path d="${pathData}" fill="none" stroke="#b91c1c" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"></path>
+        <line id="profileHoverLine" visibility="hidden" stroke="#111827" stroke-width="1.3" stroke-dasharray="4 3"></line>
+        <circle id="profileHoverDot" visibility="hidden" r="4" fill="#111827" stroke="#ffffff" stroke-width="1.5"></circle>
+        <text id="profileHoverLabel" visibility="hidden" class="elevation-axis-label" font-weight="bold"></text>
+        <rect id="profileHoverCapture" x="${margin.left}" y="${margin.top}" width="${plotW}" height="${plotH}" fill="transparent" style="cursor:crosshair"></rect>
         <text x="${margin.left}" y="${height - 5}" class="elevation-axis-label">0 mi</text>
         <text x="${x(midDistance)}" y="${height - 5}" text-anchor="middle" class="elevation-axis-label">${midDistance.toFixed(1)} mi</text>
         <text x="${width - margin.right}" y="${height - 5}" text-anchor="end" class="elevation-axis-label">${maxDistance.toFixed(1)} mi</text>
@@ -7843,14 +8595,33 @@ function renderElevationProfile(option) {
         <text x="${margin.left - 6}" y="${y(midElevation) + 4}" text-anchor="end" class="elevation-axis-label">${Math.round(midElevation)} ft</text>
         <text x="${margin.left - 6}" y="${baseY}" text-anchor="end" class="elevation-axis-label">${Math.round(minElevation)} ft</text>
     `;
+
+    elevationRenderState = {profile, x, y, margin, plotW, plotH, width, height, maxDistance};
+    const capture = document.getElementById("profileHoverCapture");
+    if (capture) {
+        capture.addEventListener("mousemove", event => {
+            const rect = svg.getBoundingClientRect();
+            const viewX = ((event.clientX - rect.left) / Math.max(rect.width, 1)) * width;
+            const targetDistance = Math.max(0, Math.min(maxDistance, ((viewX - margin.left) / plotW) * maxDistance));
+            let bestIndex = 0;
+            let bestError = Infinity;
+            for (let i = 0; i < profile.length; i++) {
+                const error = Math.abs(Number(profile[i].distance_miles) - targetDistance);
+                if (error < bestError) {
+                    bestError = error;
+                    bestIndex = i;
+                }
+            }
+            updateElevationHover(bestIndex, true);
+        });
+        capture.addEventListener("mouseleave", clearElevationHover);
+    }
 }
 
 
 function renderSelectedRouteDetails(option) {
     const details = document.getElementById("selectedRouteDetails");
-    if (!details || !option) {
-        return;
-    }
+    if (!details || !option) return;
 
     details.innerHTML =
         "<b>Selected:</b> " + option.name + "<br>" +
@@ -7858,36 +8629,27 @@ function renderSelectedRouteDetails(option) {
         "(error " + option.distance_error_miles + " mi)<br>" +
         "<b>Elevation gain:</b> " + option.actual_gain_ft + " ft " +
         "(error " + option.elevation_error_ft + " ft)<br>" +
-        "<b>Descent:</b> " + option.actual_descent_ft + " ft<br>" +
         "<b>Trail:</b> " + option.trail_percent + "% · " +
-        "<b>Connector:</b> " + option.connector_distance_miles + " mi<br>" +
-        "<b>Repeated trail:</b> " + option.repeated_distance_miles + " mi · " +
-        "<b>Score:</b> " + option.route_score + "<br>" +
-        "<b>Max reach from start:</b> " + (option.max_reach_miles ?? 0) + " mi · " +
-        "<b>Independent loops:</b> " + (option.independent_loops ?? 0) + " · " +
-        "<b>Extra subloops:</b> " + (option.extra_subloops ?? 0) + "<br>" +
-        "<b>Route footprint:</b> " + (option.footprint_sq_miles ?? 0) + " sq mi · " +
-        "<b>Big-loop penalty:</b> " + (option.shape_penalty ?? 0) + "<br>" +
-        "<b>Partial-edge tuning:</b> " + (option.partial_edge_used ? "YES" : "NO") +
+        "<b>Retrace:</b> " + (option.retrace_percent ?? 0) + "% · " +
+        "<b>Connector:</b> " + (option.connector_percent ?? 0) + "%<br>" +
+        "<b>Max reach:</b> " + (option.max_reach_miles ?? 0) + " mi · " +
+        "<b>Preferred segments hit:</b> " + (option.preferred_hit_count ?? 0) + "<br>" +
+        "<b>Score:</b> " + option.route_score +
         ((option.required_pass_points || []).length > 0
             ? "<br><b>Required points:</b> " + option.required_pass_points.map((point, index) =>
-                `P${index + 1}: ${point.nearest_route_distance_m} m from marker / ${point.tolerance_m} m allowed`
+                `P${index + 1}: ${point.nearest_route_distance_m} m / ${point.tolerance_m} m allowed`
               ).join(" · ")
             : "");
 }
 
 
 function selectRouteOption(index, fitMap = true) {
-    if (!lastGeneratedRoute || !lastGeneratedRoute.route_options) {
-        return;
-    }
-
+    if (!lastGeneratedRoute || !lastGeneratedRoute.route_options) return;
     const options = lastGeneratedRoute.route_options;
-    if (index < 0 || index >= options.length) {
-        return;
-    }
+    if (index < 0 || index >= options.length) return;
 
     selectedRouteOptionIndex = index;
+    clearElevationHover();
 
     routeOptionLines.forEach((line, lineIndex) => {
         if (lineIndex === index) {
@@ -7895,7 +8657,7 @@ function selectRouteOption(index, fitMap = true) {
             line.bringToFront();
             routeLine = line;
         } else {
-            line.setStyle({weight: 4, opacity: 0.30, color: "#4455aa"});
+            line.setStyle({weight: 4, opacity: 0.24, color: "#4455aa"});
         }
     });
 
@@ -7914,22 +8676,36 @@ function selectRouteOption(index, fitMap = true) {
 }
 
 
-function drawRouteOptions(result) {
+function drawRouteOptions(result, selectedIndex = 0, fitMap = true) {
     clearGeneratedRouteLines();
     const options = result.route_options || [];
 
-    for (const option of options) {
+    options.forEach((option, index) => {
         const coordinates = option.route.map(point => [point.lat, point.lon]);
         const line = L.polyline(coordinates, {
             weight: 4,
-            opacity: 0.30,
-            color: "#4455aa"
+            opacity: 0.24,
+            color: "#4455aa",
+            interactive: true
         }).addTo(map);
+        line.on("click", event => {
+            L.DomEvent.stopPropagation(event);
+            selectRouteOption(index, false);
+        });
+        line.on("mousemove", event => {
+            if (index === selectedRouteOptionIndex) {
+                handleSelectedRouteMapHover(event.latlng);
+            }
+        });
+        line.on("mouseout", () => {
+            if (index === selectedRouteOptionIndex) clearElevationHover();
+        });
         routeOptionLines.push(line);
-    }
+    });
 
     if (options.length > 0) {
-        selectRouteOption(0, true);
+        const safeIndex = Math.max(0, Math.min(selectedIndex, options.length - 1));
+        selectRouteOption(safeIndex, fitMap);
     }
 }
 
@@ -7963,7 +8739,17 @@ function getInputData() {
             lat: Number(area.lat),
             lon: Number(area.lon),
             radius_miles: Number(area.radius_miles)
-        }))
+        })),
+        avoid_segments: avoidSegments.map(item => ({
+            lat: Number(item.lat),
+            lon: Number(item.lon)
+        })),
+        prefer_segments: preferSegments.map(item => ({
+            lat: Number(item.lat),
+            lon: Number(item.lon)
+        })),
+        route_diversity: Number(routeDiversityInput.value),
+        search_seed: currentSearchSeed
     };
 }
 
@@ -8016,11 +8802,13 @@ async function loadMasterTrailOverlayOnce() {
 
         networkLayer.clearLayers();
 
-        if (result.allowed_trails && result.allowed_trails.length > 0) {
+        masterTrailSegments = result.allowed_trails || [];
+
+        if (masterTrailSegments.length > 0) {
             // One canvas-backed multi-polyline is much cheaper for Leaflet than
             // creating thousands of individual line-layer objects.
             L.polyline(
-                result.allowed_trails,
+                masterTrailSegments,
                 {
                     weight: 3,
                     opacity: 0.42,
@@ -8095,20 +8883,12 @@ async function loadTrailNetwork(data) {
         map.removeLayer(snapLine);
     }
 
-    requestedStartMarker = L.circleMarker(
-        [
-            result.requested_start.lat,
-            result.requested_start.lon
-        ],
-        {
-            radius: 6,
-            weight: 2,
-            color: "#0066cc",
-            fillOpacity: 0.8
-        }
-    )
-    .addTo(map)
-    .bindPopup("Requested start");
+    createRequestedStartMarker(
+        Number(result.requested_start.lat),
+        Number(result.requested_start.lon),
+        "Requested start · drag to adjust",
+        false
+    );
 
     snappedStartMarker = L.circleMarker(
         [
@@ -8181,12 +8961,151 @@ async function reloadNetwork() {
 }
 
 
+function ensureRouteOptions(result) {
+    const options = result.route_options || [];
+    if (options.length === 0 && result.route && result.route.length >= 2) {
+        const distance = Number(result.actual_distance_miles || 0);
+        const repeatMiles = Number(result.repeated_distance_miles || 0);
+        const connectorMiles = Number(result.connector_distance_miles || 0);
+        result.route_options = [{
+            index: 0,
+            name: "Route 1",
+            route_signature: null,
+            actual_distance_miles: distance,
+            distance_error_miles: result.distance_error_miles,
+            actual_gain_ft: result.actual_gain_ft,
+            actual_descent_ft: result.actual_descent_ft,
+            elevation_error_ft: result.elevation_error_ft,
+            route: result.route,
+            gpx_export_points: result.gpx_export_points,
+            elevation_profile: result.elevation_profile || [],
+            repeated_edges: result.repeated_edges,
+            repeated_distance_miles: repeatMiles,
+            retrace_percent: distance > 0 ? Number((repeatMiles / distance * 100).toFixed(1)) : 0,
+            repeated_nodes: result.repeated_nodes,
+            immediate_reversals: result.immediate_reversals,
+            connector_distance_miles: connectorMiles,
+            connector_percent: distance > 0 ? Number((connectorMiles / distance * 100).toFixed(1)) : 0,
+            trail_percent: result.trail_percent,
+            independent_loops: result.independent_loops,
+            extra_subloops: result.extra_subloops,
+            branch_points: result.branch_points,
+            max_reach_miles: result.max_reach_miles,
+            footprint_sq_miles: result.footprint_sq_miles,
+            shape_penalty: result.shape_penalty,
+            route_score: result.route_score,
+            preferred_hit_count: 0,
+            preferred_distance_miles: 0,
+            partial_edge_used: result.partial_edge_used,
+            partial_added_distance_miles: result.partial_added_distance_miles,
+            partial_outward_distance_meters: result.partial_outward_distance_meters,
+            required_pass_points: result.required_pass_points || []
+        }];
+    }
+    reindexRouteOptions(result.route_options || []);
+    return result.route_options || [];
+}
+
+
+function reindexRouteOptions(options) {
+    options.forEach((option, index) => {
+        option.index = index;
+        option.name = `Route ${index + 1}`;
+        if (option.retrace_percent === undefined || option.retrace_percent === null) {
+            const d = Number(option.actual_distance_miles || 0);
+            option.retrace_percent = d > 0 ? Number((Number(option.repeated_distance_miles || 0) / d * 100).toFixed(1)) : 0;
+        }
+        if (option.connector_percent === undefined || option.connector_percent === null) {
+            const d = Number(option.actual_distance_miles || 0);
+            option.connector_percent = d > 0 ? Number((Number(option.connector_distance_miles || 0) / d * 100).toFixed(1)) : 0;
+        }
+    });
+}
+
+
+function browserRouteSignature(option) {
+    if (option.route_signature) return String(option.route_signature);
+    const route = option.route || [];
+    return route.map(point => `${Number(point.lat).toFixed(5)},${Number(point.lon).toFixed(5)}`).join("|");
+}
+
+
+function searchConfigKey(data) {
+    const clone = {...data};
+    delete clone.search_seed;
+    return JSON.stringify(clone);
+}
+
+
+function routeChoiceCardHtml(option, index) {
+    return `
+        <button type="button" class="route-choice" data-route-index="${index}">
+            <span class="route-card-title">${option.name}</span>
+            <span class="route-card-primary">${option.actual_distance_miles} mi · ${option.actual_gain_ft} ft gain</span>
+            <span class="route-card-secondary">Retrace ${option.retrace_percent ?? 0}% · Connector ${option.connector_percent ?? 0}% · Reach ${option.max_reach_miles ?? 0} mi · Trail ${option.trail_percent ?? 0}%</span>
+        </button>
+    `;
+}
+
+
+function renderRouteResults(statusMessage = "Route search complete") {
+    if (!lastGeneratedRoute) return;
+    const results = document.getElementById("results");
+    const options = lastGeneratedRoute.route_options || [];
+    const routeButtons = options.map(routeChoiceCardHtml).join("");
+
+    results.innerHTML =
+        `<span class="success"><b>${statusMessage}</b></span><br>` +
+        `<b>Route choices:</b> ${options.length}<br>` +
+        `<div class="route-choice-grid">${routeButtons}</div>` +
+        '<div id="selectedRouteDetails"></div><br>' +
+        `<b>Target:</b> ${lastGeneratedRoute.requested_distance_miles} mi · ${lastGeneratedRoute.requested_gain_ft} ft<br>` +
+        `<b>Diversity:</b> ${Math.round(Number(lastGeneratedRoute.route_diversity ?? routeDiversityInput.value))}/100<br>` +
+        (lastGeneratedRoute.required_pass_points_count
+            ? `<b>Required pass-through points:</b> ${lastGeneratedRoute.required_pass_points_count}<br>`
+            : "") +
+        (avoidSegments.length ? `<b>Avoided trail segments:</b> ${avoidSegments.length}<br>` : "") +
+        (preferSegments.length ? `<b>Preferred trail segments:</b> ${preferSegments.length}<br>` : "");
+
+    document.querySelectorAll(".route-choice").forEach(button => {
+        button.addEventListener("click", () => {
+            selectRouteOption(Number(button.dataset.routeIndex), true);
+        });
+    });
+
+    const selected = getSelectedRouteOption();
+    if (selected) {
+        renderSelectedRouteDetails(selected);
+        document.querySelectorAll(".route-choice").forEach(button => {
+            button.classList.toggle("selected", Number(button.dataset.routeIndex) === selectedRouteOptionIndex);
+        });
+    }
+}
+
+
+async function requestRouteBatch(data) {
+    const response = await fetch(
+        "/generate-route",
+        {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify(data)
+        }
+    );
+    return await readJsonResponse(response);
+}
+
+
 async function generateRoute() {
     const results = document.getElementById("results");
+    currentSearchSeed = Math.floor((Date.now() + Math.random() * 1000000) % 2147483647);
+    findMoreBatch = 0;
     const data = getInputData();
+    data.search_seed = currentSearchSeed;
 
     results.innerHTML = '<span class="warning">Loading allowed trails...</span>';
     generateButton.disabled = true;
+    findMoreButton.disabled = true;
     lastGeneratedRoute = null;
     selectedRouteOptionIndex = 0;
     downloadGpxButton.disabled = true;
@@ -8202,90 +9121,76 @@ async function generateRoute() {
         }
 
         results.innerHTML = '<span class="warning">Searching route alternatives...</span>';
-
-        const response = await fetch(
-            "/generate-route",
-            {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json"
-                },
-                body: JSON.stringify(data)
-            }
-        );
-
-        const result = await readJsonResponse(response);
-        const options = result.route_options || [];
+        const result = await requestRouteBatch(data);
+        ensureRouteOptions(result);
 
         if (!result.route || result.route.length < 2) {
             throw new Error("Server returned an empty route.");
         }
 
-        if (options.length === 0) {
-            result.route_options = [{
-                index: 0,
-                name: "Route 1",
-                actual_distance_miles: result.actual_distance_miles,
-                distance_error_miles: result.distance_error_miles,
-                actual_gain_ft: result.actual_gain_ft,
-                actual_descent_ft: result.actual_descent_ft,
-                elevation_error_ft: result.elevation_error_ft,
-                route: result.route,
-                gpx_export_points: result.gpx_export_points,
-                elevation_profile: result.elevation_profile || [],
-                repeated_edges: result.repeated_edges,
-                repeated_distance_miles: result.repeated_distance_miles,
-                repeated_nodes: result.repeated_nodes,
-                immediate_reversals: result.immediate_reversals,
-                connector_distance_miles: result.connector_distance_miles,
-                trail_percent: result.trail_percent,
-                independent_loops: result.independent_loops,
-                extra_subloops: result.extra_subloops,
-                branch_points: result.branch_points,
-                max_reach_miles: result.max_reach_miles,
-                footprint_sq_miles: result.footprint_sq_miles,
-                shape_penalty: result.shape_penalty,
-                route_score: result.route_score,
-                partial_edge_used: result.partial_edge_used,
-                partial_added_distance_miles: result.partial_added_distance_miles,
-                partial_outward_distance_meters: result.partial_outward_distance_meters,
-                required_pass_points: result.required_pass_points || []
-            }];
-        }
-
         lastGeneratedRoute = result;
-
-        const routeButtons = result.route_options.map((option, index) => {
-            return '<button type="button" class="route-choice" data-route-index="' + index + '">' +
-                option.name + ' · ' + option.actual_distance_miles + ' mi · ' + option.actual_gain_ft + ' ft' +
-                '</button>';
-        }).join("");
-
-        results.innerHTML =
-            '<span class="success"><b>Route search complete</b></span><br>' +
-            '<b>Found route choices:</b> ' + result.route_options.length + '<br>' +
-            '<div class="route-choice-grid">' + routeButtons + '</div>' +
-            '<div id="selectedRouteDetails"></div><br>' +
-            '<b>Distance target:</b> ' + result.requested_distance_miles + ' mi<br>' +
-            '<b>Elevation target:</b> ' + result.requested_gain_ft + ' ft<br>' +
-            (result.required_pass_points_count
-                ? '<b>Required pass-through points:</b> ' + result.required_pass_points_count + '<br>'
-                : '');
-
-        document.querySelectorAll(".route-choice").forEach(button => {
-            button.addEventListener("click", () => {
-                selectRouteOption(Number(button.dataset.routeIndex), true);
-            });
-        });
-
-        drawRouteOptions(result);
+        lastSearchConfigKey = searchConfigKey(data);
+        selectedRouteOptionIndex = 0;
+        renderRouteResults("Route search complete");
+        drawRouteOptions(lastGeneratedRoute, 0, true);
+        findMoreButton.disabled = false;
 
     } catch (error) {
-        results.innerHTML =
-            '<span class="error"><b>Error:</b> ' +
-            error.message +
-            '</span>';
+        results.innerHTML = '<span class="error"><b>Error:</b> ' + error.message + '</span>';
     } finally {
+        generateButton.disabled = false;
+    }
+}
+
+
+async function findMoreRoutes() {
+    const results = document.getElementById("results");
+    if (!lastGeneratedRoute || !(lastGeneratedRoute.route_options || []).length) return;
+
+    const data = getInputData();
+    const configKey = searchConfigKey(data);
+    if (lastSearchConfigKey && configKey !== lastSearchConfigKey) {
+        results.insertAdjacentHTML("afterbegin", '<span class="warning"><b>Settings changed.</b> Click Generate Trail Route first, then Find More.</span><br>');
+        return;
+    }
+
+    findMoreButton.disabled = true;
+    generateButton.disabled = true;
+    findMoreBatch += 1;
+    currentSearchSeed = Math.floor((Date.now() + findMoreBatch * 104729 + Math.random() * 1000000) % 2147483647);
+    data.search_seed = currentSearchSeed;
+    const priorSelected = selectedRouteOptionIndex;
+    const priorCount = lastGeneratedRoute.route_options.length;
+
+    try {
+        results.insertAdjacentHTML("afterbegin", '<span id="findMoreStatus" class="warning">Searching another route batch...</span><br>');
+        const result = await requestRouteBatch(data);
+        const incoming = ensureRouteOptions(result);
+        const existingSignatures = new Set(lastGeneratedRoute.route_options.map(browserRouteSignature));
+        let added = 0;
+
+        for (const option of incoming) {
+            const signature = browserRouteSignature(option);
+            if (existingSignatures.has(signature)) continue;
+            existingSignatures.add(signature);
+            lastGeneratedRoute.route_options.push(option);
+            added += 1;
+        }
+
+        reindexRouteOptions(lastGeneratedRoute.route_options);
+        lastGeneratedRoute.route_options_count = lastGeneratedRoute.route_options.length;
+        renderRouteResults(
+            added > 0
+                ? `Added ${added} new route${added === 1 ? "" : "s"} · ${lastGeneratedRoute.route_options.length} total`
+                : `No new distinct routes in this batch · ${priorCount} kept`
+        );
+        drawRouteOptions(lastGeneratedRoute, priorSelected, false);
+    } catch (error) {
+        const status = document.getElementById("findMoreStatus");
+        if (status) status.outerHTML = '<span class="error"><b>Find More error:</b> ' + error.message + '</span>';
+        else results.insertAdjacentHTML("afterbegin", '<span class="error"><b>Find More error:</b> ' + error.message + '</span><br>');
+    } finally {
+        findMoreButton.disabled = false;
         generateButton.disabled = false;
     }
 }
