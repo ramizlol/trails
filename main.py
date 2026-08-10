@@ -84,7 +84,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-10-v29-section-replacement-editor"
+APP_VERSION = "2026-08-10-v31-guided-section-replacement"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -7228,10 +7228,11 @@ def replace_route_section(request: RouteSectionReplacementRequest):
                 detail="Select at least one green replacement trail segment before applying the edit.",
             )
 
-        cut_a = int(request.cut_start_index)
-        cut_b = int(request.cut_end_index)
-        if cut_a > cut_b:
-            cut_a, cut_b = cut_b, cut_a
+        selected_start_index = int(request.cut_start_index)
+        selected_end_index = int(request.cut_end_index)
+        cut_a = min(selected_start_index, selected_end_index)
+        cut_b = max(selected_start_index, selected_end_index)
+        selection_reversed = selected_start_index > selected_end_index
         if cut_a < 0 or cut_b >= len(route) or cut_b - cut_a < 2:
             raise HTTPException(
                 status_code=400,
@@ -7262,13 +7263,13 @@ def replace_route_section(request: RouteSectionReplacementRequest):
             start_lon=request.start_lon,
         )
 
-        cut_start = route[cut_a]
-        cut_end = route[cut_b]
-        G, cut_start_node, cut_start_info = insert_exact_routing_point(
-            G, cut_start["lat"], cut_start["lon"]
+        selected_start = route[selected_start_index]
+        selected_end = route[selected_end_index]
+        G, selected_start_node, cut_start_info = insert_exact_routing_point(
+            G, selected_start["lat"], selected_start["lon"]
         )
-        G, cut_end_node, cut_end_info = insert_exact_routing_point(
-            G, cut_end["lat"], cut_end["lon"]
+        G, selected_end_node, cut_end_info = insert_exact_routing_point(
+            G, selected_end["lat"], selected_end["lon"]
         )
 
         if float(cut_start_info.get("routing_offset_m", 9999)) > 20 or float(
@@ -7311,9 +7312,9 @@ def replace_route_section(request: RouteSectionReplacementRequest):
             request.target_distance_miles * METERS_PER_MILE
         )
         S = make_simple_routing_graph(G, connector_multiplier=connector_multiplier)
-        destinations = list(replacement_nodes) + [cut_end_node]
-        new_path_nodes = [cut_start_node]
-        current = cut_start_node
+        destinations = list(replacement_nodes) + [selected_end_node]
+        new_path_nodes = [selected_start_node]
+        current = selected_start_node
         try:
             for destination in destinations:
                 leg = nx.shortest_path(S, current, destination, weight="routing_cost")
@@ -7331,8 +7332,18 @@ def replace_route_section(request: RouteSectionReplacementRequest):
 
         # Preserve everything outside the orange section exactly. The new graph
         # path only replaces route[cut_a:cut_b].
-        replacement_coords[0] = dict(cut_start)
-        replacement_coords[-1] = dict(cut_end)
+        replacement_coords[0] = dict(selected_start)
+        replacement_coords[-1] = dict(selected_end)
+
+        # The graph path follows the user's click order (start -> guide clicks ->
+        # rejoin). The stored route geometry is stitched in ascending route-index
+        # order, so reverse only the replacement geometry when the user happened
+        # to start from the higher-index side of the orange section.
+        if selection_reversed:
+            replacement_coords = list(reversed(replacement_coords))
+        replacement_coords[0] = dict(route[cut_a])
+        replacement_coords[-1] = dict(route[cut_b])
+
         stitched = [dict(point) for point in route[:cut_a + 1]]
         for point in replacement_coords[1:]:
             if stitched:
@@ -8452,7 +8463,7 @@ input[type="range"] {
     <div class="section-content">
         <div id="section-replacement-panel" class="tool-block section-replacement-panel">
             <div class="tool-heading">Replace a route section</div>
-            <div class="small">Choose exactly what part of the red route to remove, then click the trail segments you want to use instead. The old section turns orange and your replacement selections turn green.</div>
+            <div class="small">Click the red route where the replacement should start. Then click as many trail pieces as needed to guide the new path. When you reach the other side, click the red route again to choose where the replacement rejoins. The removed section turns orange and your guide trail selections turn green.</div>
             <div class="replacement-legend">
                 <span><i class="legend-line keep"></i> kept route</span>
                 <span><i class="legend-line remove"></i> replace</span>
@@ -8462,7 +8473,7 @@ input[type="range"] {
             <div id="routeReplacementStatus" class="small replacement-status">Select a route first.</div>
             <div id="replacementSelectionSummary" class="replacement-summary"></div>
             <div class="replacement-actions">
-                <button id="undoReplacementSegmentButton" type="button" class="secondary-button" disabled>Undo green segment</button>
+                <button id="undoReplacementSegmentButton" type="button" class="secondary-button" disabled>Undo last guide</button>
                 <button id="applyReplacementButton" type="button" disabled>Apply replacement</button>
                 <button id="cancelReplacementButton" type="button" class="secondary-button" disabled>Cancel</button>
             </div>
@@ -8588,7 +8599,7 @@ let nextRouteEditId = 1;
 // V29 explicit section replacement state. This is intentionally separate from
 // planner settings/history because it is a temporary edit selection until Apply.
 let routeReplacementMode = false;
-let routeReplacementStage = "idle"; // idle | cut-start | cut-end | replacement
+let routeReplacementStage = "idle"; // idle | cut-start | guide | ready
 let replacementBaseRouteIndex = null;
 let replacementCutStartIndex = null;
 let replacementCutEndIndex = null;
@@ -8954,7 +8965,7 @@ function updateRouteReplacementControls() {
     cancelReplacementButton.disabled = routeReplacementStage === "idle";
     undoReplacementSegmentButton.disabled = replacementTrailSegments.length === 0;
     applyReplacementButton.disabled = !(
-        routeReplacementStage === "replacement" &&
+        routeReplacementStage === "ready" &&
         replacementCutStartIndex !== null &&
         replacementCutEndIndex !== null &&
         replacementTrailSegments.length > 0
@@ -8962,33 +8973,40 @@ function updateRouteReplacementControls() {
 
     if (routeReplacementStage === "idle") {
         replaceSectionButton.textContent = "Replace route section";
-        if (status && selected) status.textContent = "Choose a section of the selected red route to replace.";
+        if (status && selected) {
+            status.textContent = "Start on the red route, guide the replacement with trail clicks, then finish on the red route.";
+        }
         if (summary) summary.innerHTML = "";
         return;
     }
 
     if (routeReplacementStage === "cut-start") {
-        replaceSectionButton.textContent = "Selecting section...";
-        status.textContent = "1/3 · Click the red route where the section you want to replace STARTS.";
+        replaceSectionButton.textContent = "Selecting replacement...";
+        status.textContent = "1/2 · Click the selected red route where the replacement should START.";
         summary.innerHTML = "";
         return;
     }
 
-    if (routeReplacementStage === "cut-end") {
-        replaceSectionButton.textContent = "Selecting section...";
-        status.textContent = "2/3 · Click the red route where the section you want to replace ENDS.";
-        summary.innerHTML = `<b>Start selected.</b> Now choose the other end of the orange section.`;
+    if (routeReplacementStage === "guide") {
+        replaceSectionButton.textContent = "Guiding replacement...";
+        status.textContent = replacementTrailSegments.length
+            ? "2/2 · Keep clicking gray trail pieces to guide the green replacement. When you reach the other side, click the selected red route where it should REJOIN."
+            : "2/2 · Now click the first gray trail piece you want the replacement to follow. Add as many guide clicks as needed, then finish by clicking the selected red route.";
+        summary.innerHTML =
+            `<b>Start:</b> selected on red route<br>` +
+            `<b>Guide clicks:</b> ${replacementTrailSegments.length}` +
+            (replacementTrailSegments.length ? ` · order ${replacementTrailSegments.map((_, i) => i + 1).join(" → ")}` : "") +
+            `<br><b>End:</b> click the red route when your guide reaches it`;
         return;
     }
 
-    replaceSectionButton.textContent = "Selecting replacement trails...";
-    status.textContent = replacementTrailSegments.length
-        ? "3/3 · Keep clicking gray trail segments to build the green replacement, then Apply. Segments are connected in the order clicked."
-        : "3/3 · Click the gray trail segment(s) you want to use instead. Your selections will turn green.";
+    replaceSectionButton.textContent = "Replacement ready";
+    status.textContent = "Replacement path is defined. Review orange = removed and green = guide corridor, then click Apply replacement.";
     summary.innerHTML =
-        `<b>Orange section:</b> route points ${replacementCutStartIndex + 1}–${replacementCutEndIndex + 1}<br>` +
-        `<b>Green trail selections:</b> ${replacementTrailSegments.length}` +
-        (replacementTrailSegments.length ? ` · order ${replacementTrailSegments.map((_, i) => i + 1).join(" → ")}` : "");
+        `<b>Orange section:</b> route points ${Math.min(replacementCutStartIndex, replacementCutEndIndex) + 1}–${Math.max(replacementCutStartIndex, replacementCutEndIndex) + 1}<br>` +
+        `<b>Green guide clicks:</b> ${replacementTrailSegments.length}` +
+        (replacementTrailSegments.length ? ` · order ${replacementTrailSegments.map((_, i) => i + 1).join(" → ")}` : "") +
+        `<br><b>End:</b> selected on red route`;
 }
 
 
@@ -9013,8 +9031,10 @@ function drawRouteReplacementLayers() {
     }
 
     if (replacementCutStartIndex !== null && replacementCutEndIndex !== null) {
+        const cutLow = Math.min(replacementCutStartIndex, replacementCutEndIndex);
+        const cutHigh = Math.max(replacementCutStartIndex, replacementCutEndIndex);
         const section = option.route
-            .slice(replacementCutStartIndex, replacementCutEndIndex + 1)
+            .slice(cutLow, cutHigh + 1)
             .map(point => [Number(point.lat), Number(point.lon)]);
         if (section.length >= 2) {
             const orange = L.polyline(section, {
@@ -9045,8 +9065,18 @@ function drawRouteReplacementLayers() {
             opacity: 0.95,
             lineCap: "round",
             interactive: false
-        }).addTo(map).bindTooltip(`Replacement trail ${index + 1}`);
+        }).addTo(map).bindTooltip(`Guide trail ${index + 1}`);
         replacementLayers.push(green);
+
+        const guideMarker = L.circleMarker([Number(item.lat), Number(item.lon)], {
+            radius: 6,
+            weight: 2,
+            color: "#166534",
+            fillColor: "#dcfce7",
+            fillOpacity: 1,
+            interactive: false
+        }).addTo(map).bindTooltip(`Guide point ${index + 1}`, {permanent: false});
+        replacementLayers.push(guideMarker);
     });
 }
 
@@ -9089,25 +9119,38 @@ function handleRouteReplacementRouteClick(latlng, routeIndex) {
 
     if (routeReplacementStage === "cut-start") {
         replacementCutStartIndex = index;
-        routeReplacementStage = "cut-end";
+        replacementCutEndIndex = null;
+        replacementTrailSegments = [];
+        routeReplacementStage = "guide";
         updateRouteReplacementControls();
         drawRouteReplacementLayers();
         return;
     }
 
-    if (routeReplacementStage === "cut-end") {
+    if (routeReplacementStage === "guide") {
+        if (!replacementTrailSegments.length) {
+            document.getElementById("routeReplacementStatus").textContent =
+                "Add at least one green trail guide before choosing where the replacement rejoins the red route.";
+            return;
+        }
         if (Math.abs(index - replacementCutStartIndex) < 2) {
             document.getElementById("routeReplacementStatus").textContent =
-                "Choose an end point farther along the red route so there is a real section to replace.";
+                "Choose a rejoin point farther along the red route so there is a real section to replace.";
             return;
         }
         replacementCutEndIndex = index;
-        if (replacementCutStartIndex > replacementCutEndIndex) {
-            const temp = replacementCutStartIndex;
-            replacementCutStartIndex = replacementCutEndIndex;
-            replacementCutEndIndex = temp;
-        }
-        routeReplacementStage = "replacement";
+        routeReplacementStage = "ready";
+        updateRouteReplacementControls();
+        drawRouteReplacementLayers();
+        return;
+    }
+
+    // When the replacement is already ready, clicking the selected red route
+    // simply moves the rejoin point. This makes the final connection easy to
+    // fine-tune without restarting the whole selection.
+    if (routeReplacementStage === "ready") {
+        if (Math.abs(index - replacementCutStartIndex) < 2) return;
+        replacementCutEndIndex = index;
         updateRouteReplacementControls();
         drawRouteReplacementLayers();
     }
@@ -9115,7 +9158,7 @@ function handleRouteReplacementRouteClick(latlng, routeIndex) {
 
 
 function addReplacementTrailSegment(latlng) {
-    if (!routeReplacementMode || routeReplacementStage !== "replacement") return;
+    if (!routeReplacementMode || routeReplacementStage !== "guide") return;
     const nearest = findNearestOverlayTrailSegment(latlng);
     if (!nearest || nearest.distancePx > 22) {
         document.getElementById("routeReplacementStatus").textContent =
@@ -9129,7 +9172,7 @@ function addReplacementTrailSegment(latlng) {
     );
     if (duplicate) {
         document.getElementById("routeReplacementStatus").textContent =
-            "That green trail segment is already in this replacement.";
+            "That trail piece is already one of your green guide clicks.";
         return;
     }
 
@@ -9146,6 +9189,10 @@ function addReplacementTrailSegment(latlng) {
 function undoReplacementTrailSegment() {
     if (!replacementTrailSegments.length) return;
     replacementTrailSegments.pop();
+    if (routeReplacementStage === "ready") {
+        replacementCutEndIndex = null;
+        routeReplacementStage = "guide";
+    }
     updateRouteReplacementControls();
     drawRouteReplacementLayers();
 }
@@ -9156,6 +9203,7 @@ async function applyRouteSectionReplacement() {
         replacementBaseRouteIndex === null ||
         replacementCutStartIndex === null ||
         replacementCutEndIndex === null ||
+        routeReplacementStage !== "ready" ||
         !replacementTrailSegments.length ||
         !lastGeneratedRoute
     ) return;
@@ -9185,7 +9233,7 @@ async function applyRouteSectionReplacement() {
     replaceSectionButton.disabled = true;
     generateButton.disabled = true;
     findMoreButton.disabled = true;
-    status.textContent = "Connecting the green trail selections and replacing only the orange section...";
+    status.textContent = "Connecting your green guide clicks from the chosen start to the chosen rejoin point...";
 
     try {
         const response = await fetch("/replace-route-section", {
@@ -9629,7 +9677,7 @@ function addClickedTrailSegment(kind, latlng) {
 
 
 function handleMapPlacementClick(event) {
-    if (routeReplacementMode && routeReplacementStage === "replacement") {
+    if (routeReplacementMode && routeReplacementStage === "guide") {
         addReplacementTrailSegment(event.latlng);
         return;
     }
@@ -10277,20 +10325,20 @@ function drawRouteOptions(result, selectedIndex = 0, fitMap = true) {
             interactive: true
         }).addTo(map);
         line.on("click", event => {
+            // Route choice changes are intentionally list-only. Clicking a route
+            // on the map must never switch the selected route. Map clicks on the
+            // currently selected route are still available to explicit editing
+            // tools such as section replacement / legacy edit mode.
             L.DomEvent.stopPropagation(event);
             if (routeReplacementMode && index === selectedRouteOptionIndex) {
-                if (routeReplacementStage === "replacement") {
-                    addReplacementTrailSegment(event.latlng);
-                } else {
-                    handleRouteReplacementRouteClick(event.latlng, index);
-                }
+                handleRouteReplacementRouteClick(event.latlng, index);
                 return;
             }
             if (routeEditMode && index === selectedRouteOptionIndex) {
                 addRouteEditPointFromRoute(event.latlng);
                 return;
             }
-            selectRouteOption(index, false);
+            // Do nothing. Select a different route only from the route list.
         });
         line.on("mousemove", event => {
             if (index === selectedRouteOptionIndex) {
