@@ -83,7 +83,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-10-v18-outward-natural-loop"
+APP_VERSION = "2026-08-10-v20-relaxed-show-solutions"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -96,8 +96,11 @@ CONNECTOR_CHEAP_SCORE_WEIGHT = 90.0
 
 # V10 returns several materially different successful candidates from the same
 # search instead of throwing away every route except the winner.
-MAX_ROUTE_OPTIONS = 5
-MAX_ROUTE_SHARED_FRACTION = 0.80
+# V20 exposes every accurately-scored finalist we keep instead of hiding
+# routes behind strict target-quality gates. Exact route duplicates are already
+# removed during exploration, so similarity is not used as a rejection rule.
+MAX_ROUTE_OPTIONS = 14
+MAX_ROUTE_SHARED_FRACTION = 1.0
 
 # V15 builds only a sparse connector backbone OFFLINE. It never stores the full
 # city street network, and normal route requests never make live connector calls.
@@ -251,11 +254,12 @@ def get_route_profile(target_distance_miles: float):
             "search_radius_m": search_radius_m,
             "attempts": 1200,
             "anchor_counts": [2, 3, 3, 3],
-            "min_anchor_distance_m": max(150, int(target_distance_m * 0.08)),
-            "min_anchor_separation_m": max(140, int(target_distance_m * 0.07)),
-            "far_anchor_min_ratio": 0.26,
+            "min_anchor_distance_m": max(120, int(target_distance_m * 0.05)),
+            "min_anchor_separation_m": max(100, int(target_distance_m * 0.04)),
+            "far_anchor_min_ratio": 0.24,
+            "far_anchor_attempt_probability": 0.45,
             "accurate_finalists": 14,
-            "candidate_pool_multiplier": 3,
+            "candidate_pool_multiplier": 4,
         }
     if target_distance_miles < 15.0:
         return {
@@ -263,24 +267,26 @@ def get_route_profile(target_distance_miles: float):
             "search_radius_m": search_radius_m,
             "attempts": 900,
             "anchor_counts": [3, 4, 4, 4],
-            # Long routes should not be allowed to build every waypoint within a
-            # few hundred meters of the start. Scale spacing with requested length.
-            "min_anchor_distance_m": max(300, int(target_distance_m * 0.15)),
-            "min_anchor_separation_m": max(250, int(target_distance_m * 0.10)),
-            "far_anchor_min_ratio": 0.32,
+            # V20: outward travel is encouraged, not required. Keep anchor
+            # spacing loose enough that real trail topology can dictate shape.
+            "min_anchor_distance_m": max(200, int(target_distance_m * 0.06)),
+            "min_anchor_separation_m": max(180, int(target_distance_m * 0.05)),
+            "far_anchor_min_ratio": 0.30,
+            "far_anchor_attempt_probability": 0.55,
             "accurate_finalists": 14,
-            "candidate_pool_multiplier": 3,
+            "candidate_pool_multiplier": 4,
         }
     return {
         "name": "ultra-waypoint",
         "search_radius_m": search_radius_m,
         "attempts": 700,
         "anchor_counts": [4, 4, 5],
-        "min_anchor_distance_m": max(400, int(target_distance_m * 0.18)),
-        "min_anchor_separation_m": max(300, int(target_distance_m * 0.12)),
-        "far_anchor_min_ratio": 0.35,
+        "min_anchor_distance_m": max(250, int(target_distance_m * 0.07)),
+        "min_anchor_separation_m": max(200, int(target_distance_m * 0.05)),
+        "far_anchor_min_ratio": 0.32,
+        "far_anchor_attempt_probability": 0.60,
         "accurate_finalists": 14,
-        "candidate_pool_multiplier": 3,
+        "candidate_pool_multiplier": 4,
     }
 
 
@@ -4722,41 +4728,35 @@ def beam_search_short_loop(
             )
         )
 
-    best_any = None
-    acceptable_candidates = []
-    for score, route_nodes, metrics in accurately_scored:
-        distance_error_miles = metrics["distance_error_meters"] / METERS_PER_MILE
-        gain_error_ft = metrics["gain_error_meters"] * FEET_PER_METER
-        acceptable = (
-            distance_error_miles <= limits["distance_error_limit_miles"]
-            and gain_error_ft <= limits["gain_error_limit_ft"]
+    # V20: once a closed loop has been accurately scored, keep it. Target
+    # distance/gain and route quality are ranking signals rather than hard gates.
+    valid_candidates = [
+        (score, route_nodes, metrics)
+        for score, route_nodes, metrics in accurately_scored
+        if metrics
+    ]
+
+    if valid_candidates:
+        for _, _, metrics in valid_candidates:
+            metrics["relaxed_target_filtering"] = True
+        diverse = select_diverse_accurate_candidates(
+            G,
+            valid_candidates,
+            max_routes=MAX_ROUTE_OPTIONS,
+            max_shared_fraction=MAX_ROUTE_SHARED_FRACTION,
         )
-
-        if best_any is None or score < best_any[0]:
-            best_any = (score, route_nodes, metrics)
-        if acceptable:
-            acceptable_candidates.append((score, route_nodes, metrics))
-
-    if acceptable_candidates:
-        diverse = select_diverse_accurate_candidates(G, acceptable_candidates)
         if not diverse:
-            diverse = [min(acceptable_candidates, key=lambda item: item[0])]
+            diverse = sorted(valid_candidates, key=lambda item: item[0])[:MAX_ROUTE_OPTIONS]
         _, route_nodes, metrics = diverse[0]
         metrics = dict(metrics)
         metrics["_route_options_candidates"] = copy_internal_route_options(diverse)
         return route_nodes, metrics, last_depth, states_expanded
 
-    _, best_route, best_metrics = best_any
-    best_distance = best_metrics["total_distance_meters"] / METERS_PER_MILE
-    best_gain = best_metrics["actual_gain_meters"] * FEET_PER_METER
     budget_text = " Search budget was reached." if budget_reached else ""
-
     raise HTTPException(
         status_code=400,
         detail=(
-            "Closed loops were found, but none met the requested quality limits. "
-            f"Best accurately scored route was {best_distance:.2f} mi / "
-            f"{round(best_gain)} ft gain."
+            "Closed loops were generated, but none could be accurately scored."
             + budget_text
         ),
     )
@@ -5177,7 +5177,13 @@ def generate_waypoint_loop(
             radial_by_node.get(node, 0.0) >= far_anchor_min_m
             for node in required_anchors
         )
-        if optional_count > 0 and far_candidates and not required_already_far:
+        far_anchor_probability = float(profile.get("far_anchor_attempt_probability", 0.0))
+        if (
+            optional_count > 0
+            and far_candidates
+            and not required_already_far
+            and random.random() < far_anchor_probability
+        ):
             far_pool = [node for node in far_candidates if node not in required_anchors]
             random.shuffle(far_pool)
             for candidate in far_pool:
@@ -5216,6 +5222,20 @@ def generate_waypoint_loop(
                     break
             if not spacing_bad:
                 optional_anchors.append(candidate)
+
+        # V20: anchor spacing is a preference, not a hard rejection. If the
+        # trail network cannot satisfy the preferred spacing, fill remaining
+        # anchor slots from any reachable candidates and let scoring rank the
+        # resulting route instead of discarding the attempt.
+        if len(optional_anchors) < optional_count:
+            fallback = [
+                node for node in available
+                if node not in optional_anchors and node not in required_anchors
+            ]
+            for candidate in fallback:
+                optional_anchors.append(candidate)
+                if len(optional_anchors) >= optional_count:
+                    break
 
         if len(optional_anchors) < optional_count:
             continue
@@ -5275,13 +5295,9 @@ def generate_waypoint_loop(
             target_gain_meters,
         )
 
-        distance = cheap_metrics.get("total_distance_meters", 0.0)
-
-        if (
-            distance < target_distance_meters * 0.72
-            or distance > target_distance_meters * 1.25
-        ):
-            continue
+        # V20: do not reject a valid loop just because it misses the requested
+        # distance during cheap exploration. Distance, gain, footprint, repeat,
+        # connector use, and loop shape are ranking signals only.
 
         # Preserve the best cheap candidates. We periodically trim instead of
         # allowing all 1200 routes to accumulate unnecessarily.
@@ -5332,11 +5348,7 @@ def generate_waypoint_loop(
             if len(finalists) >= accurate_finalists:
                 break
 
-    best_any_route = None
-    best_any_metrics = None
-    best_any_score = float("inf")
-    acceptable_candidates = []
-
+    valid_candidates = []
     accurately_scored = 0
 
     for cheap_score, route in finalists:
@@ -5357,7 +5369,7 @@ def generate_waypoint_loop(
         )
         metrics["required_pass_points"] = pass_metrics
         if pass_metrics and not all(item.get("satisfied") for item in pass_metrics):
-            # Hard requirement: numerical target quality never overrides a missed zone.
+            # Explicit user pass-through points remain a hard requirement.
             continue
 
         metrics["waypoint_attempts"] = profile["attempts"]
@@ -5366,30 +5378,23 @@ def generate_waypoint_loop(
         metrics["waypoint_cheap_score"] = cheap_score
         metrics["waypoint_leg_cache_hits"] = int(leg_cache_stats.get("hits", 0))
         metrics["waypoint_penalized_searches"] = int(leg_cache_stats.get("penalized_searches", 0))
+        metrics["relaxed_target_filtering"] = True
 
-        if score < best_any_score:
-            best_any_score = score
-            best_any_route = route
-            best_any_metrics = metrics
+        # V20: every accurately scored, routable candidate that satisfies any
+        # explicit pass-through zones survives. Numerical target mismatch and
+        # route-shape preferences only affect ranking.
+        valid_candidates.append((score, route, metrics))
 
-        distance_error_miles = (
-            metrics["distance_error_meters"] / METERS_PER_MILE
+    if valid_candidates:
+        diverse = select_diverse_accurate_candidates(
+            G,
+            valid_candidates,
+            max_routes=MAX_ROUTE_OPTIONS,
+            max_shared_fraction=MAX_ROUTE_SHARED_FRACTION,
         )
-
-        gain_error_ft = (
-            metrics["gain_error_meters"] * FEET_PER_METER
-        )
-
-        if (
-            distance_error_miles <= limits["distance_error_limit_miles"]
-            and gain_error_ft <= limits["gain_error_limit_ft"]
-        ):
-            acceptable_candidates.append((score, route, metrics))
-
-    if acceptable_candidates:
-        diverse = select_diverse_accurate_candidates(G, acceptable_candidates)
         if not diverse:
-            diverse = [min(acceptable_candidates, key=lambda item: item[0])]
+            diverse = sorted(valid_candidates, key=lambda item: item[0])[:MAX_ROUTE_OPTIONS]
+
         _, best_route, best_metrics = diverse[0]
         best_metrics = dict(best_metrics)
         best_metrics["waypoint_accurate_finalists"] = accurately_scored
@@ -5400,28 +5405,12 @@ def generate_waypoint_loop(
             profile["attempts"],
         )
 
-    if best_any_route is not None:
-        best_distance = (
-            best_any_metrics["total_distance_meters"] / METERS_PER_MILE
-        )
-
-        best_gain = (
-            best_any_metrics["actual_gain_meters"] * FEET_PER_METER
-        )
-
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "No route met the requested quality limits. "
-                f"Best accurately scored candidate was {best_distance:.2f} mi / "
-                f"{round(best_gain)} ft gain after "
-                f"{accurately_scored} full DEM finalist evaluations."
-            ),
-        )
-
     raise HTTPException(
         status_code=400,
-        detail="No suitable waypoint route found after finalist scoring.",
+        detail=(
+            "No routable waypoint finalist survived. "
+            "If required pass-through points are set, try increasing their tolerance."
+        ),
     )
 
 # ============================================================
