@@ -6,3 +6,4 @@ scikit-learn
 rasterio
 numpy
 python-multipart
+shapely
