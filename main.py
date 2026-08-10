@@ -83,7 +83,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-10-v25-avoid-areas"
+APP_VERSION = "2026-08-10-v26-click-start"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -7278,6 +7278,9 @@ button:disabled {
     </div>
 </div>
 
+<button id="chooseStartButton" type="button">Choose start on map</button>
+<div id="startPointStatus" class="small">Click anywhere on the map to choose the starting point.</div>
+
 <div class="input-row">
     <div class="input-group">
         <label for="distance">Target distance (miles)</label>
@@ -7356,6 +7359,7 @@ let loadedWorkspaceStartKey = null;
 let lastWorkspaceResult = null;
 let masterTrailOverlayLoaded = false;
 let masterTrailOverlayPromise = null;
+let startPointPlacementMode = true;
 let passPoints = [];
 let passPointLayers = [];
 let passPointPlacementMode = false;
@@ -7369,6 +7373,7 @@ const generateButton = document.getElementById("generateButton");
 const downloadGpxButton = document.getElementById("downloadGpxButton");
 const networkButton = document.getElementById("networkButton");
 const showNetworkCheckbox = document.getElementById("showNetwork");
+const chooseStartButton = document.getElementById("chooseStartButton");
 const addPassPointButton = document.getElementById("addPassPointButton");
 const addAvoidAreaButton = document.getElementById("addAvoidAreaButton");
 
@@ -7377,6 +7382,7 @@ generateButton.addEventListener("click", generateRoute);
 downloadGpxButton.addEventListener("click", downloadGeneratedGpx);
 networkButton.addEventListener("click", reloadNetwork);
 showNetworkCheckbox.addEventListener("change", updateNetworkVisibility);
+chooseStartButton.addEventListener("click", beginStartPointPlacement);
 addPassPointButton.addEventListener("click", beginPassPointPlacement);
 addAvoidAreaButton.addEventListener("click", beginAvoidAreaPlacement);
 map.on("click", handleMapPlacementClick);
@@ -7387,7 +7393,21 @@ window.addEventListener("resize", () => {
 });
 
 
+function beginStartPointPlacement() {
+    passPointPlacementMode = false;
+    avoidAreaPlacementMode = false;
+    addPassPointButton.textContent = "Add pass-through point";
+    addAvoidAreaButton.textContent = "Add avoid area";
+    startPointPlacementMode = true;
+    chooseStartButton.textContent = "Click map to place start...";
+    document.getElementById("startPointStatus").textContent =
+        "Click anywhere on the map to choose the starting point.";
+}
+
+
 function beginPassPointPlacement() {
+    startPointPlacementMode = false;
+    chooseStartButton.textContent = "Choose start on map";
     avoidAreaPlacementMode = false;
     addAvoidAreaButton.textContent = "Add avoid area";
     if (passPoints.length >= 5) {
@@ -7428,11 +7448,74 @@ function handleMapPlacementClick(event) {
         renderAvoidAreaRows();
         drawAvoidAreaLayers();
         document.getElementById("avoidAreaStatus").textContent = "Avoid area added. Edit its center/radius or remove it below.";
+        return;
+    }
+
+    if (startPointPlacementMode) {
+        const startLatInput = document.getElementById("start_lat");
+        const startLonInput = document.getElementById("start_lon");
+        const endLatInput = document.getElementById("end_lat");
+        const endLonInput = document.getElementById("end_lon");
+
+        const oldStartLat = Number(startLatInput.value);
+        const oldStartLon = Number(startLonInput.value);
+        const oldEndLat = Number(endLatInput.value);
+        const oldEndLon = Number(endLonInput.value);
+        const endWasFollowingStart =
+            Number.isFinite(oldStartLat) && Number.isFinite(oldStartLon) &&
+            Number.isFinite(oldEndLat) && Number.isFinite(oldEndLon) &&
+            Math.abs(oldEndLat - oldStartLat) < 0.000001 &&
+            Math.abs(oldEndLon - oldStartLon) < 0.000001;
+
+        const lat = Number(event.latlng.lat.toFixed(7));
+        const lon = Number(event.latlng.lng.toFixed(7));
+        startLatInput.value = lat;
+        startLonInput.value = lon;
+
+        // Keep the normal loop workflow convenient: when end was following
+        // start, move the finish to the newly selected start as well. A
+        // manually different end point is preserved.
+        if (endWasFollowingStart) {
+            endLatInput.value = lat;
+            endLonInput.value = lon;
+        }
+
+        loadedWorkspaceStartKey = null;
+        lastWorkspaceResult = null;
+        lastGeneratedRoute = null;
+        selectedRouteOptionIndex = 0;
+        downloadGpxButton.disabled = true;
+        clearGeneratedRouteLines();
+
+        if (requestedStartMarker) map.removeLayer(requestedStartMarker);
+        if (snappedStartMarker) map.removeLayer(snappedStartMarker);
+        if (snapLine) map.removeLayer(snapLine);
+        snappedStartMarker = null;
+        snapLine = null;
+
+        requestedStartMarker = L.circleMarker(
+            [lat, lon],
+            {
+                radius: 7,
+                weight: 2,
+                color: "#0066cc",
+                fillOpacity: 0.9
+            }
+        ).addTo(map).bindPopup("Selected start").openPopup();
+
+        startPointPlacementMode = false;
+        chooseStartButton.textContent = "Choose start on map";
+        document.getElementById("startPointStatus").textContent =
+            "Start selected. Generate a route or load the start area.";
+        document.getElementById("results").innerHTML =
+            '<span class="success">Start selected from map.</span>';
     }
 }
 
 
 function beginAvoidAreaPlacement() {
+    startPointPlacementMode = false;
+    chooseStartButton.textContent = "Choose start on map";
     passPointPlacementMode = false;
     addPassPointButton.textContent = "Add pass-through point";
     if (avoidAreas.length >= 5) {
@@ -8207,8 +8290,15 @@ async function generateRoute() {
     }
 }
 
-// Load the TIFF-wide gray overlay and prepare the default start workspace once.
-reloadNetwork();
+// Load only the TIFF-wide gray overlay on page load. Do not spend time
+// preparing the old default start: the first normal map click chooses the
+// user's start point, then Generate/Load prepares that start workspace.
+loadMasterTrailOverlayOnce().catch(error => {
+    console.warn("Trail overlay load failed:", error);
+});
+beginStartPointPlacement();
+document.getElementById("results").innerHTML =
+    '<span class="warning">Click the map to choose a starting point.</span>';
 </script>
 
 </body>
