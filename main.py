@@ -84,7 +84,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-10-v31-guided-section-replacement"
+APP_VERSION = "2026-08-10-v32-two-button-forced-section-replacement"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -223,6 +223,9 @@ class TrailSegmentPoint(BaseModel):
     # the request graph temporarily splits an edge at the exact start/pass point.
     lat: float
     lon: float
+    # V32 replacement edits also send the full gray-overlay geometry. Avoid/prefer
+    # controls can continue sending only lat/lon.
+    geometry: list[list[float]] = Field(default_factory=list)
 
 
 class RouteRequest(BaseModel):
@@ -6983,12 +6986,13 @@ def _sample_section_coords(coords, max_samples=28):
     ]
 
 
-def penalize_replaced_section_edges(G, section_coords, multiplier=45.0):
-    """Strongly discourage the old orange corridor during section replacement.
+def penalize_replaced_section_edges(G, section_coords, multiplier=100000.0):
+    """Make the old orange corridor effectively unavailable during replacement.
 
-    It is a penalty rather than deletion so the cut endpoints can still use a
-    few meters of their original edge when that is the only topologically valid
-    way to enter/leave the replacement.
+    We retain the edges instead of deleting them so a cut made in the middle of
+    an OSM edge can still attach cleanly, but the huge cost means a replacement
+    will not silently fall back to the old section when another connected path
+    exists.
     """
     matches = set()
     for point in _sample_section_coords(section_coords):
@@ -7015,6 +7019,75 @@ def penalize_replaced_section_edges(G, section_coords, multiplier=45.0):
         data["replaced_section_penalty"] = True
         touched += 1
     return H, touched
+
+
+def shortest_path_forcing_selected_edges(S, start_node, end_node, required_edges):
+    """Shortest connected path that actually traverses each selected green edge.
+
+    Each green click resolves to one physical trail edge.  Dynamic programming
+    considers both traversal directions for every required edge, connects the
+    pieces in the user's click order, and chooses the cheapest connected result.
+    This is intentionally different from a loose waypoint: touching a point on
+    the selected edge is not enough; the returned path must traverse that edge.
+    """
+    if not required_edges:
+        return nx.shortest_path(S, start_node, end_node, weight="routing_cost")
+
+    # state endpoint -> (total cost, full node path)
+    states = {start_node: (0.0, [start_node])}
+
+    for required in required_edges:
+        u = required["u"]
+        v = required["v"]
+        orientations = []
+        if S.has_edge(u, v):
+            orientations.append((u, v))
+        if S.has_edge(v, u):
+            orientations.append((v, u))
+        if not orientations:
+            raise nx.NetworkXNoPath("Selected replacement trail edge is not traversable.")
+
+        next_states = {}
+        for previous_end, (base_cost, base_path) in states.items():
+            for enter, leave in orientations:
+                try:
+                    leg = nx.shortest_path(S, previous_end, enter, weight="routing_cost")
+                    leg_cost = nx.path_weight(S, leg, weight="routing_cost") if len(leg) > 1 else 0.0
+                except (nx.NetworkXNoPath, nx.NodeNotFound):
+                    continue
+
+                forced_cost = float(S[enter][leave].get("routing_cost", 0.0) or 0.0)
+                total_cost = float(base_cost) + float(leg_cost) + forced_cost
+                path = list(base_path)
+                path.extend(leg[1:])
+                if not path or path[-1] != enter:
+                    path.append(enter)
+                if path[-1] != leave:
+                    path.append(leave)
+
+                existing = next_states.get(leave)
+                if existing is None or total_cost < existing[0]:
+                    next_states[leave] = (total_cost, path)
+
+        if not next_states:
+            raise nx.NetworkXNoPath("Selected replacement trail pieces cannot be connected in order.")
+        states = next_states
+
+    best = None
+    for previous_end, (base_cost, base_path) in states.items():
+        try:
+            leg = nx.shortest_path(S, previous_end, end_node, weight="routing_cost")
+            leg_cost = nx.path_weight(S, leg, weight="routing_cost") if len(leg) > 1 else 0.0
+        except (nx.NetworkXNoPath, nx.NodeNotFound):
+            continue
+        total_cost = float(base_cost) + float(leg_cost)
+        path = list(base_path) + list(leg[1:])
+        if best is None or total_cost < best[0]:
+            best = (total_cost, path)
+
+    if best is None:
+        raise nx.NetworkXNoPath("Replacement corridor cannot reconnect to the route.")
+    return best[1]
 
 
 def classify_route_geometry_against_graph(G, coords):
@@ -7280,7 +7353,11 @@ def replace_route_section(request: RouteSectionReplacementRequest):
                 detail="Could not anchor the selected orange section cleanly to the trail graph. Zoom in and choose the cut points again.",
             )
 
-        replacement_nodes = []
+        # Resolve each green selection to the actual natural-trail edge.  V31
+        # treated these as loose waypoint points, which meant the shortest path
+        # could touch a green segment and then continue somewhere else.  V32
+        # forces traversal of every selected edge, in click order.
+        required_edges = []
         resolved_segments = []
         for index, selected in enumerate(request.replacement_segments):
             match = _nearest_natural_edge_to_selected_point(
@@ -7291,39 +7368,45 @@ def replace_route_section(request: RouteSectionReplacementRequest):
                     status_code=400,
                     detail=f"Replacement trail segment {index + 1} is not available in the routing graph or is blocked by an avoid setting.",
                 )
-            G, node, info = insert_exact_routing_point(
-                G, match["routing_lat"], match["routing_lon"]
-            )
-            replacement_nodes.append(node)
+            required_edges.append(match)
             resolved_segments.append({
                 "index": index,
                 "lat": float(match["routing_lat"]),
                 "lon": float(match["routing_lon"]),
                 "snap_distance_m": round(float(match["distance_m"]), 2),
+                "edge_u": int(match["u"]),
+                "edge_v": int(match["v"]),
             })
 
-        # Strongly discourage the old orange section after all temporary split
-        # points exist so the cost penalty also reaches the split edge pieces.
+        # Make the orange section effectively unavailable. The selected green
+        # edges themselves remain traversable if they overlap an endpoint.
         G, penalized_edge_count = penalize_replaced_section_edges(
             G, route[cut_a:cut_b + 1]
         )
+
+        # Re-resolve the required edges after the orange penalty copy so the
+        # node references line up with the graph used for pathfinding.
+        forced_edges = []
+        for selected in request.replacement_segments:
+            match = _nearest_natural_edge_to_selected_point(
+                G, float(selected.lat), float(selected.lon)
+            )
+            if match is None:
+                raise HTTPException(status_code=400, detail="A selected green trail disappeared after applying route constraints.")
+            forced_edges.append(match)
 
         connector_multiplier = connector_path_multiplier_for_target(
             request.target_distance_miles * METERS_PER_MILE
         )
         S = make_simple_routing_graph(G, connector_multiplier=connector_multiplier)
-        destinations = list(replacement_nodes) + [selected_end_node]
-        new_path_nodes = [selected_start_node]
-        current = selected_start_node
         try:
-            for destination in destinations:
-                leg = nx.shortest_path(S, current, destination, weight="routing_cost")
-                new_path_nodes.extend(leg[1:])
-                current = destination
+            new_path_nodes = shortest_path_forcing_selected_edges(
+                S, selected_start_node, selected_end_node, forced_edges
+            )
         except (nx.NetworkXNoPath, nx.NodeNotFound):
             raise HTTPException(
                 status_code=400,
-                detail="The highlighted replacement trails cannot be connected in the order you selected them. Undo the last green segment or choose a connected corridor.",
+                detail="The green trail pieces cannot form one connected replacement between the two red-route cut points. Start the selection again and choose a connected corridor.",
             )
 
         replacement_coords = route_coordinates(G, new_path_nodes)
@@ -8309,7 +8392,7 @@ input[type="range"] {
     gap: 6px;
     margin-top: 8px;
 }
-.replacement-actions #applyReplacementButton { grid-column: span 2; background: #166534; }
+.replacement-actions #applyReplacementButton { background: #166534; }
 .replacement-status { margin-top: 7px; line-height: 1.35; }
 .replacement-summary {
     margin-top: 7px;
@@ -8463,20 +8546,21 @@ input[type="range"] {
     <div class="section-content">
         <div id="section-replacement-panel" class="tool-block section-replacement-panel">
             <div class="tool-heading">Replace a route section</div>
-            <div class="small">Click the red route where the replacement should start. Then click as many trail pieces as needed to guide the new path. When you reach the other side, click the red route again to choose where the replacement rejoins. The removed section turns orange and your guide trail selections turn green.</div>
+            <div class="small">Start the selection, click the red route where the old section begins, click the gray trail pieces you want the new route to actually use, then click the red route where it should reconnect. Orange is removed; green is forced into the replacement.</div>
             <div class="replacement-legend">
                 <span><i class="legend-line keep"></i> kept route</span>
-                <span><i class="legend-line remove"></i> replace</span>
-                <span><i class="legend-line replacement"></i> new trail</span>
+                <span><i class="legend-line remove"></i> remove</span>
+                <span><i class="legend-line replacement"></i> replacement</span>
             </div>
-            <button id="replaceSectionButton" type="button" disabled>Replace route section</button>
+            <div class="replacement-actions">
+                <button id="replaceSectionButton" type="button" disabled>Start selection</button>
+                <button id="applyReplacementButton" type="button" disabled>Replace section</button>
+            </div>
             <div id="routeReplacementStatus" class="small replacement-status">Select a route first.</div>
             <div id="replacementSelectionSummary" class="replacement-summary"></div>
-            <div class="replacement-actions">
-                <button id="undoReplacementSegmentButton" type="button" class="secondary-button" disabled>Undo last guide</button>
-                <button id="applyReplacementButton" type="button" disabled>Apply replacement</button>
-                <button id="cancelReplacementButton" type="button" class="secondary-button" disabled>Cancel</button>
-            </div>
+            <!-- Kept only as hidden compatibility hooks for older helper code. -->
+            <button id="undoReplacementSegmentButton" type="button" style="display:none" disabled></button>
+            <button id="cancelReplacementButton" type="button" style="display:none" disabled></button>
         </div>
 
         <!-- Legacy v28 edit-handle elements stay hidden so older browser code
@@ -8884,6 +8968,9 @@ function getQualityFilterConfig() {
 
 
 function routePassesQualityFilters(option) {
+    // A route the user explicitly edited must remain visible even when optional
+    // quality filters would normally hide generated alternatives.
+    if (option && option.is_edited) return true;
     const filter = getQualityFilterConfig();
     if (!filter.enabled) return true;
     const targetDistance = Number(lastGeneratedRoute?.requested_distance_miles ?? document.getElementById("distance").value);
@@ -8962,8 +9049,9 @@ function updateRouteReplacementControls() {
     const selected = getSelectedRouteOption();
 
     replaceSectionButton.disabled = !selected;
-    cancelReplacementButton.disabled = routeReplacementStage === "idle";
-    undoReplacementSegmentButton.disabled = replacementTrailSegments.length === 0;
+    replaceSectionButton.textContent = "Start selection";
+    cancelReplacementButton.disabled = true;
+    undoReplacementSegmentButton.disabled = true;
     applyReplacementButton.disabled = !(
         routeReplacementStage === "ready" &&
         replacementCutStartIndex !== null &&
@@ -8972,41 +9060,32 @@ function updateRouteReplacementControls() {
     );
 
     if (routeReplacementStage === "idle") {
-        replaceSectionButton.textContent = "Replace route section";
-        if (status && selected) {
-            status.textContent = "Start on the red route, guide the replacement with trail clicks, then finish on the red route.";
-        }
+        if (status) status.textContent = selected
+            ? "Click Start selection to replace part of the selected red route."
+            : "Select a route first.";
         if (summary) summary.innerHTML = "";
         return;
     }
 
     if (routeReplacementStage === "cut-start") {
-        replaceSectionButton.textContent = "Selecting replacement...";
-        status.textContent = "1/2 · Click the selected red route where the replacement should START.";
+        status.textContent = "Click the red route where the section you want to remove STARTS.";
         summary.innerHTML = "";
         return;
     }
 
     if (routeReplacementStage === "guide") {
-        replaceSectionButton.textContent = "Guiding replacement...";
         status.textContent = replacementTrailSegments.length
-            ? "2/2 · Keep clicking gray trail pieces to guide the green replacement. When you reach the other side, click the selected red route where it should REJOIN."
-            : "2/2 · Now click the first gray trail piece you want the replacement to follow. Add as many guide clicks as needed, then finish by clicking the selected red route.";
+            ? "Keep clicking gray trail pieces you want the replacement to use. When finished, click the red route where the new section should reconnect."
+            : "Now click the gray trail pieces you want the new section to follow, in order. Then click the red route to reconnect.";
         summary.innerHTML =
-            `<b>Start:</b> selected on red route<br>` +
-            `<b>Guide clicks:</b> ${replacementTrailSegments.length}` +
-            (replacementTrailSegments.length ? ` · order ${replacementTrailSegments.map((_, i) => i + 1).join(" → ")}` : "") +
-            `<br><b>End:</b> click the red route when your guide reaches it`;
+            `<b>Start:</b> selected · <b>replacement trail pieces:</b> ${replacementTrailSegments.length} · <b>End:</b> not selected`;
         return;
     }
 
-    replaceSectionButton.textContent = "Replacement ready";
-    status.textContent = "Replacement path is defined. Review orange = removed and green = guide corridor, then click Apply replacement.";
+    status.textContent = "Ready. Orange will be removed and the green trail pieces will be forced into the new connected section. Click Replace section.";
     summary.innerHTML =
-        `<b>Orange section:</b> route points ${Math.min(replacementCutStartIndex, replacementCutEndIndex) + 1}–${Math.max(replacementCutStartIndex, replacementCutEndIndex) + 1}<br>` +
-        `<b>Green guide clicks:</b> ${replacementTrailSegments.length}` +
-        (replacementTrailSegments.length ? ` · order ${replacementTrailSegments.map((_, i) => i + 1).join(" → ")}` : "") +
-        `<br><b>End:</b> selected on red route`;
+        `<b>Remove:</b> route points ${Math.min(replacementCutStartIndex, replacementCutEndIndex) + 1}–${Math.max(replacementCutStartIndex, replacementCutEndIndex) + 1} · ` +
+        `<b>Use:</b> ${replacementTrailSegments.length} green trail piece${replacementTrailSegments.length === 1 ? "" : "s"}`;
 }
 
 
@@ -9145,15 +9224,9 @@ function handleRouteReplacementRouteClick(latlng, routeIndex) {
         return;
     }
 
-    // When the replacement is already ready, clicking the selected red route
-    // simply moves the rejoin point. This makes the final connection easy to
-    // fine-tune without restarting the whole selection.
-    if (routeReplacementStage === "ready") {
-        if (Math.abs(index - replacementCutStartIndex) < 2) return;
-        replacementCutEndIndex = index;
-        updateRouteReplacementControls();
-        drawRouteReplacementLayers();
-    }
+    // Once both ends are chosen the selection is locked. Use Start selection
+    // again if you want to choose a different section.
+    if (routeReplacementStage === "ready") return;
 }
 
 
@@ -9222,7 +9295,8 @@ async function applyRouteSectionReplacement() {
         cut_end_index: replacementCutEndIndex,
         replacement_segments: replacementTrailSegments.map(item => ({
             lat: Number(item.lat),
-            lon: Number(item.lon)
+            lon: Number(item.lon),
+            geometry: (item.geometry || []).map(point => [Number(point[0]), Number(point[1])])
         })),
         avoid_areas: input.avoid_areas,
         avoid_segments: input.avoid_segments,
@@ -9233,7 +9307,7 @@ async function applyRouteSectionReplacement() {
     replaceSectionButton.disabled = true;
     generateButton.disabled = true;
     findMoreButton.disabled = true;
-    status.textContent = "Connecting your green guide clicks from the chosen start to the chosen rejoin point...";
+    status.textContent = "Replacing the orange section and forcing the selected green trail pieces into one connected route...";
 
     try {
         const response = await fetch("/replace-route-section", {
@@ -9249,27 +9323,23 @@ async function applyRouteSectionReplacement() {
         edited.is_edited = true;
         edited.edit_type = "section-replacement";
 
-        const signature = browserRouteSignature(edited);
-        let newIndex = lastGeneratedRoute.route_options.findIndex(
-            option => browserRouteSignature(option) === signature
-        );
-        if (newIndex < 0) {
-            lastGeneratedRoute.route_options.push(edited);
-            reindexRouteOptions(lastGeneratedRoute.route_options);
-            newIndex = lastGeneratedRoute.route_options.length - 1;
-        }
+        // Direct editing changes the route the user selected. Do not append a
+        // confusing extra alternative: replace that card/line in place and keep
+        // it selected so the map visibly changes immediately.
+        const editedIndex = replacementBaseRouteIndex;
+        edited.name = baseOption.name || edited.name;
+        edited.option_index = editedIndex + 1;
+        lastGeneratedRoute.route_options[editedIndex] = edited;
+        reindexRouteOptions(lastGeneratedRoute.route_options);
         lastGeneratedRoute.route_options_count = lastGeneratedRoute.route_options.length;
 
         cancelRouteSectionReplacement(false);
+        selectedRouteOptionIndex = editedIndex;
         renderRouteResults("Route section replaced");
-        if (routePassesQualityFilters(lastGeneratedRoute.route_options[newIndex])) {
-            drawRouteOptions(lastGeneratedRoute, newIndex, false);
-            selectRouteOption(newIndex, false);
-        } else {
-            drawRouteOptions(lastGeneratedRoute, selectedRouteOptionIndex, false);
-            document.getElementById("routeReplacementStatus").textContent =
-                "Replacement succeeded, but your active quality filters hide the edited route. Turn the filters off to see it.";
-        }
+        drawRouteOptions(lastGeneratedRoute, editedIndex, false);
+        selectRouteOption(editedIndex, false);
+        document.getElementById("routeReplacementStatus").textContent =
+            "Section replaced. The selected red route now contains the new connected trail section.";
     } catch (error) {
         status.textContent = "Replacement error: " + error.message;
         updateRouteReplacementControls();
