@@ -83,7 +83,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-10-v20-relaxed-show-solutions"
+APP_VERSION = "2026-08-10-v21-clean-ui"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -6815,24 +6815,9 @@ button:disabled {
     margin-top: 8px;
 }
 
-#gpx-panel {
-    border-top: 1px solid #ddd;
-    margin-top: 16px;
-    padding-top: 4px;
-}
 
 #results,
-#gpxResults {
-    margin-top: 12px;
-    line-height: 1.55;
-}
 
-#diagnostics {
-    margin-top: 8px;
-    line-height: 1.45;
-    font-size: 13px;
-    color: #555;
-}
 
 #map {
     height: 650px;
@@ -6930,8 +6915,6 @@ button:disabled {
 <div id="controls">
 
 <h2>Trail Running Creator</h2>
-<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-v16-required-pass-through</div>
-
 <div class="input-row">
     <div class="input-group">
         <label for="start_lat">Start latitude</label>
@@ -6986,27 +6969,6 @@ button:disabled {
 </div>
 
 <div id="results">Ready.</div>
-<div id="diagnostics"></div>
-
-<div id="gpx-panel">
-    <h3>Analyze Manual GPX</h3>
-
-    <div class="input-row">
-        <div class="input-group">
-            <label for="gpxFile">GPX file</label>
-            <input id="gpxFile" type="file" accept=".gpx,application/gpx+xml,application/xml,text/xml">
-        </div>
-    </div>
-
-    <button id="analyzeGpxButton">Analyze GPX</button>
-    <button id="testGpxButton">Test Generator Against GPX</button>
-    <button id="clearGpxButton">Clear GPX</button>
-
-    <div id="gpxResults">
-        Upload a manual GPX to compare it with the exact same DEM and allowed trail network.
-    </div>
-</div>
-
 </div>
 
 <div id="map"></div>
@@ -7030,7 +6992,6 @@ L.tileLayer(
 let routeLine = null;
 let routeOptionLines = [];
 let selectedRouteOptionIndex = 0;
-let gpxLine = null;
 let networkLayer = L.layerGroup();
 let lastGeneratedRoute = null;
 let requestedStartMarker = null;
@@ -7048,9 +7009,6 @@ let nextPassPointId = 1;
 const generateButton = document.getElementById("generateButton");
 const downloadGpxButton = document.getElementById("downloadGpxButton");
 const networkButton = document.getElementById("networkButton");
-const analyzeGpxButton = document.getElementById("analyzeGpxButton");
-const testGpxButton = document.getElementById("testGpxButton");
-const clearGpxButton = document.getElementById("clearGpxButton");
 const showNetworkCheckbox = document.getElementById("showNetwork");
 const addPassPointButton = document.getElementById("addPassPointButton");
 
@@ -7058,9 +7016,6 @@ const addPassPointButton = document.getElementById("addPassPointButton");
 generateButton.addEventListener("click", generateRoute);
 downloadGpxButton.addEventListener("click", downloadGeneratedGpx);
 networkButton.addEventListener("click", reloadNetwork);
-analyzeGpxButton.addEventListener("click", analyzeGpx);
-testGpxButton.addEventListener("click", testGpxAgainstGenerator);
-clearGpxButton.addEventListener("click", clearGpx);
 showNetworkCheckbox.addEventListener("change", updateNetworkVisibility);
 addPassPointButton.addEventListener("click", beginPassPointPlacement);
 map.on("click", handleMapPassPointClick);
@@ -7463,7 +7418,6 @@ async function loadMasterTrailOverlayOnce() {
 
 
 async function loadTrailNetwork(data) {
-    const diagnostics = document.getElementById("diagnostics");
     const startKey = getWorkspaceStartKey(data);
 
     // Start the gray-overlay fetch in parallel. It is visualization only and
@@ -7570,68 +7524,6 @@ async function loadTrailNetwork(data) {
         ).addTo(map);
     }
 
-    diagnostics.innerHTML =
-        "<b>Routing area ready for this start:</b> YES<br>" +
-        "<b>Distance/elevation changes reload trails:</b> NO<br>" +
-        "<b>Gray overlay:</b> TIFF-wide · loaded once in browser<br>" +
-        "<b>Current radius trail segments:</b> " +
-        result.allowed_trail_segments +
-        " physical segments<br>" +
-        "<b>Master TIFF trail network:</b> " +
-        result.master_physical_segments +
-        " physical segments<br>" +
-        "<b>Master TIFF:</b> " +
-        result.master_tiff +
-        "<br>" +
-        "<b>Master graph file:</b> " +
-        result.master_graph_file +
-        "<br>" +
-        "<b>Offline master loaded:</b> " +
-        (result.master_loaded_from_disk ? "YES" : "NO") +
-        "<br>" +
-        "<b>Trail elevation precomputed:</b> " +
-        (result.master_elevation_precomputed ? "YES" : "NO") +
-        "<br>" +
-        "<b>Workspace from cache:</b> " +
-        (result.workspace_from_cache ? "YES" : "NO") +
-        "<br>" +
-        "<b>Workspace build:</b> " +
-        result.workspace_build_seconds +
-        " s<br>" +
-        "<b>Workspace graph:</b> " +
-        result.workspace_nodes + " nodes / " + result.workspace_edges + " edges<br>" +
-        "<b>Current search graph:</b> " +
-        result.network_nodes + " nodes / " + result.network_edges + " edges<br>" +
-        "<b>Trail components:</b> " +
-        result.trail_components_before +
-        " → " +
-        result.trail_components_after +
-        "<br>" +
-        "<b>Offline connectors:</b> " +
-        result.selective_connectors_added +
-        " prebuilt (" + result.selective_connector_queries + " live queries)<br>" +
-        "<b>Routeable component:</b> " +
-        result.routeable_component_nodes +
-        " nodes / " + result.routeable_component_edges + " edges<br>" +
-        "<b>Start snap distance:</b> " +
-        result.snap_distance_m +
-        " m<br>" +
-        "<b>Exact start inserted:</b> " +
-        (result.exact_start_inserted ? "YES" : "NO") +
-        "<br>" +
-        "<b>Requested point → trail:</b> " +
-        result.start_trail_offset_m +
-        " m<br>" +
-        "<b>Current route search radius:</b> " +
-        result.search_radius_m +
-        " m<br>" +
-        "<b>Workspace TIFF-covering radius:</b> " +
-        result.workspace_max_radius_m +
-        " m<br>" +
-        "<b>Profile:</b> " +
-        result.route_profile +
-        "<br><b>Version:</b> " +
-        result.version;
 
     return result;
 }
@@ -7639,23 +7531,24 @@ async function loadTrailNetwork(data) {
 
 async function reloadNetwork() {
     const data = getInputData();
-    const diagnostics = document.getElementById("diagnostics");
+    const results = document.getElementById("results");
     const startKey = getWorkspaceStartKey(data);
 
     networkButton.disabled = true;
 
     if (loadedWorkspaceStartKey === startKey && lastWorkspaceResult) {
-        diagnostics.innerHTML = '<span class="success">Routing area is already loaded for this start. Distance/elevation changes reuse it.</span>';
+        results.innerHTML = '<span class="success">Routing area is already ready for this start.</span>';
         networkButton.disabled = false;
         return;
     }
 
-    diagnostics.innerHTML = '<span class="warning">Preparing routing area for this start...</span>';
+    results.innerHTML = '<span class="warning">Preparing routing area for this start...</span>';
 
     try {
         await loadTrailNetwork(data);
+        results.innerHTML = '<span class="success">Routing area ready.</span>';
     } catch (error) {
-        diagnostics.innerHTML = '<span class="error"><b>Error:</b> ' + error.message + '</span>';
+        results.innerHTML = '<span class="error"><b>Error:</b> ' + error.message + '</span>';
     } finally {
         networkButton.disabled = false;
     }
@@ -7741,33 +7634,16 @@ async function generateRoute() {
                 '</button>';
         }).join("");
 
-        const expandedText = result.states_expanded === null ? "N/A" : result.states_expanded;
-
         results.innerHTML =
             '<span class="success"><b>Route search complete</b></span><br>' +
             '<b>Found route choices:</b> ' + result.route_options.length + '<br>' +
-            '<span class="small">Routes are filtered to avoid near-duplicates; fewer than 5 may be shown when the trail network does not provide 5 materially different matches.</span>' +
             '<div class="route-choice-grid">' + routeButtons + '</div>' +
             '<div id="selectedRouteDetails"></div><br>' +
             '<b>Distance target:</b> ' + result.requested_distance_miles + ' mi<br>' +
             '<b>Elevation target:</b> ' + result.requested_gain_ft + ' ft<br>' +
-            '<b>Required pass-through points:</b> ' + (result.required_pass_points_count || 0) + '<br><br>' +
-            '<b>Search method:</b> ' + result.search_method + '<br>' +
-            '<b>Route profile:</b> ' + result.route_profile + '<br>' +
-            '<b>Search depth:</b> ' + result.search_steps + '<br>' +
-            '<b>States expanded:</b> ' + expandedText + '<br>' +
-            '<b>Start snap distance:</b> ' + result.snap_distance_m + ' m<br>' +
-            '<b>Exact start inserted:</b> ' + (result.exact_start_inserted ? 'YES' : 'NO') + '<br>' +
-            '<b>Requested point → trail:</b> ' + result.start_trail_offset_m + ' m<br><br>' +
-            '<b>Start workspace cached:</b> ' + result.graph_from_cache + '<br>' +
-            '<b>Elevation samples:</b> ' + result.unique_elevation_samples + '<br>' +
-            '<b>Elevation sample spacing:</b> ~' + result.elevation_sample_spacing_m + ' m<br>' +
-            '<b>Elevation smoothing:</b> ~' + result.elevation_smoothing_distance_m + ' m (' + result.elevation_smoothing_window_points + ' points)<br>' +
-            (result.waypoint_accurate_finalists !== null && result.waypoint_accurate_finalists !== undefined
-                ? '<b>Accurate waypoint finalists:</b> ' + result.waypoint_accurate_finalists + '<br>'
-                : '') +
-            '<b>Version:</b> ' + result.version + '<br>' +
-            '<span class="small">Selected route is red. Other choices are faint blue. Click a route above to switch. Download GPX exports the selected route with coordinates only for COROS.</span>';
+            (result.required_pass_points_count
+                ? '<b>Required pass-through points:</b> ' + result.required_pass_points_count + '<br>'
+                : '');
 
         document.querySelectorAll(".route-choice").forEach(button => {
             button.addEventListener("click", () => {
@@ -7781,235 +7657,11 @@ async function generateRoute() {
         results.innerHTML =
             '<span class="error"><b>Error:</b> ' +
             error.message +
-            '</span><br>' +
-            '<span class="small">The gray lines remain visible. If you have a manual GPX that works, upload it below and click Analyze GPX.</span>';
+            '</span>';
     } finally {
         generateButton.disabled = false;
     }
 }
-
-async function analyzeGpx() {
-    const gpxResults = document.getElementById("gpxResults");
-    const fileInput = document.getElementById("gpxFile");
-    const data = getInputData();
-
-    if (!fileInput.files || fileInput.files.length === 0) {
-        gpxResults.innerHTML = '<span class="error"><b>Error:</b> Choose a GPX file first.</span>';
-        return;
-    }
-
-    analyzeGpxButton.disabled = true;
-    gpxResults.innerHTML = '<span class="warning">Analyzing GPX with the same DEM and trail network...</span>';
-
-    try {
-        await loadTrailNetwork(data);
-
-        const formData = new FormData();
-        formData.append("file", fileInput.files[0]);
-
-        const query = new URLSearchParams({
-            start_lat: data.start_lat,
-            start_lon: data.start_lon,
-            target_distance_miles: data.target_distance_miles,
-            target_gain_ft: data.target_gain_ft
-        });
-
-        const response = await fetch(
-            "/analyze-gpx?" + query.toString(),
-            {
-                method: "POST",
-                body: formData
-            }
-        );
-
-        const result = await readJsonResponse(response);
-
-        const coordinates = result.route.map(
-            point => [point.lat, point.lon]
-        );
-
-        if (gpxLine) {
-            map.removeLayer(gpxLine);
-        }
-
-        gpxLine = L.polyline(
-            coordinates,
-            {
-                weight: 6,
-                opacity: 0.95,
-                color: "#0066cc"
-            }
-        ).addTo(map);
-
-        gpxLine.bringToFront();
-
-        map.fitBounds(
-            gpxLine.getBounds(),
-            {
-                padding: [30, 30]
-            }
-        );
-
-        const passText = result.meets_both_limits ? "YES" : "NO";
-
-        gpxResults.innerHTML =
-            '<span class="success"><b>GPX analyzed</b></span><br>' +
-            "<b>File:</b> " + result.filename + "<br>" +
-            "<b>Distance:</b> " + result.distance_miles + " mi<br>" +
-            "<b>DEM elevation gain:</b> " + result.gain_ft + " ft<br>" +
-            "<b>DEM descent:</b> " + result.descent_ft + " ft<br>" +
-            "<b>Distance error:</b> " + result.distance_error_miles + " mi<br>" +
-            "<b>Gain error:</b> " + result.gain_error_ft + " ft<br>" +
-            "<b>Meets generator quality limits:</b> " + passText + "<br><br>" +
-            "<b>Closed-loop gap:</b> " + result.closure_distance_m + " m<br>" +
-            "<b>GPX start from requested start:</b> " + result.distance_from_requested_start_m + " m<br><br>" +
-            "<b>Allowed-trail coverage:</b> " + result.trail_coverage_percent + "%<br>" +
-            "<b>Trail matching tolerance:</b> " + result.trail_match_tolerance_m + " m<br>" +
-            "<b>Mean distance to allowed trail:</b> " + result.mean_distance_to_allowed_trail_m + " m<br>" +
-            "<b>Max distance to allowed trail:</b> " + result.max_distance_to_allowed_trail_m + " m<br>" +
-            "<b>Matched samples:</b> " + result.trail_match_points_within_tolerance + " / " + result.trail_match_points_checked + "<br><br>" +
-            "<b>Raw GPX points:</b> " + result.raw_gpx_points + "<br>" +
-            "<b>DEM sample points:</b> " + result.dem_sample_points + "<br>" +
-            "<b>Elevation sample spacing:</b> ~" + result.elevation_sample_spacing_m + " m<br>" +
-            "<b>Elevation smoothing window:</b> " + result.elevation_smoothing_window_points + " points<br>" +
-            '<span class="small">Blue = manual GPX, red = generated route, gray = allowed trail network.</span>';
-
-    } catch (error) {
-        gpxResults.innerHTML = '<span class="error"><b>Error:</b> ' + error.message + "</span>";
-    } finally {
-        analyzeGpxButton.disabled = false;
-    }
-}
-
-
-async function testGpxAgainstGenerator() {
-    const gpxResults = document.getElementById("gpxResults");
-    const fileInput = document.getElementById("gpxFile");
-
-    if (!fileInput.files || fileInput.files.length === 0) {
-        gpxResults.innerHTML = '<span class="error"><b>Error:</b> Choose a GPX file first.</span>';
-        return;
-    }
-
-    testGpxButton.disabled = true;
-    analyzeGpxButton.disabled = true;
-    gpxResults.innerHTML = '<span class="warning">Running ground-truth test from the GPX own start, distance, and DEM gain. This may take about 20 seconds...</span>';
-
-    try {
-        const formData = new FormData();
-        formData.append("file", fileInput.files[0]);
-
-        const response = await fetch(
-            "/test-gpx",
-            {
-                method: "POST",
-                body: formData
-            }
-        );
-
-        const result = await readJsonResponse(response);
-        const benchmark = result.benchmark;
-        const trace = result.edge_trace;
-
-        if (benchmark.route && benchmark.route.length >= 2) {
-            const benchmarkCoordinates = benchmark.route.map(point => [point.lat, point.lon]);
-            if (gpxLine) {
-                map.removeLayer(gpxLine);
-            }
-            gpxLine = L.polyline(
-                benchmarkCoordinates,
-                {
-                    weight: 6,
-                    opacity: 0.95,
-                    color: "#0066cc"
-                }
-            ).addTo(map);
-            gpxLine.bringToFront();
-        }
-        const replay = result.hard_rule_replay;
-        const generator = result.generator;
-
-        // Put the GPX benchmark start/target into the main form so a normal
-        // Generate click immediately repeats the same benchmark.
-        document.getElementById("start_lat").value = benchmark.start.lat;
-        document.getElementById("start_lon").value = benchmark.start.lon;
-        document.getElementById("end_lat").value = benchmark.start.lat;
-        document.getElementById("end_lon").value = benchmark.start.lon;
-        document.getElementById("distance").value = benchmark.distance_miles;
-        document.getElementById("gain").value = benchmark.gain_ft;
-
-        if (generator.success && generator.route && generator.route.length >= 2) {
-            const generatedCoordinates = generator.route.map(point => [point.lat, point.lon]);
-            if (routeLine) {
-                map.removeLayer(routeLine);
-            }
-            routeLine = L.polyline(
-                generatedCoordinates,
-                {
-                    weight: 6,
-                    opacity: 0.95,
-                    color: "#d60000"
-                }
-            ).addTo(map);
-            routeLine.bringToFront();
-        }
-
-        const generatorText = generator.success
-            ? '<span class="success"><b>Generator benchmark result: SUCCESS</b></span><br>' +
-              '<b>Generated distance:</b> ' + generator.actual_distance_miles + ' mi<br>' +
-              '<b>Generated gain:</b> ' + generator.actual_gain_ft + ' ft<br>' +
-              '<b>Distance error:</b> ' + generator.distance_error_miles + ' mi<br>' +
-              '<b>Gain error:</b> ' + generator.gain_error_ft + ' ft<br>' +
-              '<b>States expanded:</b> ' + generator.states_expanded + '<br>' +
-              '<b>Partial-edge tuning:</b> ' + (generator.partial_edge_used ? 'YES' : 'NO')
-            : '<span class="error"><b>Generator benchmark result: FAILED</b></span><br>' +
-              '<b>Generator error:</b> ' + (generator.error || 'Unknown error');
-
-        gpxResults.innerHTML =
-            '<span class="success"><b>GPX ground-truth test complete</b></span><br>' +
-            '<b>Version:</b> ' + result.version + '<br><br>' +
-            '<b>Benchmark start:</b> ' + benchmark.start.lat.toFixed(6) + ', ' + benchmark.start.lon.toFixed(6) + '<br>' +
-            '<b>Benchmark distance:</b> ' + benchmark.distance_miles + ' mi<br>' +
-            '<b>Benchmark DEM gain:</b> ' + benchmark.gain_ft + ' ft<br>' +
-            '<b>Benchmark descent:</b> ' + benchmark.descent_ft + ' ft<br>' +
-            '<b>Graph-start snap:</b> ' + result.graph.start_snap_distance_m + ' m<br>' +
-            '<b>Exact GPX start inserted:</b> ' + (result.graph.exact_start_inserted ? 'YES' : 'NO') + '<br>' +
-            '<b>GPX start → trail:</b> ' + result.graph.start_trail_offset_m + ' m<br><br>' +
-            '<b>Allowed-trail coverage:</b> ' + result.coverage.percent + '%<br>' +
-            '<b>Mean trail match distance:</b> ' + result.coverage.mean_distance_m + ' m<br>' +
-            '<b>Max trail match distance:</b> ' + result.coverage.max_distance_m + ' m<br><br>' +
-            '<b>Matched physical edge runs:</b> ' + trace.physical_edge_runs + '<br>' +
-            '<b>Unique physical edges:</b> ' + trace.unique_physical_edges + '<br>' +
-            '<b>Edge-transition continuity:</b> ' + trace.transition_continuity_percent + '%<br>' +
-            '<b>Approximate graph trace closed:</b> ' + (trace.approximate_trace_closed ? 'YES' : 'NO') + '<br>' +
-            '<b>Trace note:</b> ' + trace.note + '<br><br>' +
-            '<b>Hard-rule replay:</b> ' + replay.status + '<br>' +
-            '<b>Replay explanation:</b> ' + replay.message + '<br><br>' +
-            generatorText + '<br><br>' +
-            '<span class="small">Blue = uploaded GPX. Red = route independently found by the generator using the GPX own start/distance/gain. The form has been updated to this benchmark automatically.</span>';
-
-        await loadTrailNetwork(getInputData());
-
-    } catch (error) {
-        gpxResults.innerHTML = '<span class="error"><b>Error:</b> ' + error.message + '</span>';
-    } finally {
-        testGpxButton.disabled = false;
-        analyzeGpxButton.disabled = false;
-    }
-}
-
-
-function clearGpx() {
-    if (gpxLine) {
-        map.removeLayer(gpxLine);
-        gpxLine = null;
-    }
-
-    document.getElementById("gpxFile").value = "";
-    document.getElementById("gpxResults").innerHTML =
-        "Upload a manual GPX to compare it with the exact same DEM and allowed trail network.";
-}
-
 
 // Load the TIFF-wide gray overlay and prepare the default start workspace once.
 reloadNetwork();
