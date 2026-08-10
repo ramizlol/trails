@@ -83,7 +83,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-10-v22-map-80vh"
+APP_VERSION = "2026-08-10-v24-elevation-profile"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -3899,6 +3899,49 @@ def big_loop_shape_penalty(
 # ROUTE SCORE / CONTINUOUS ELEVATION
 # ============================================================
 
+def build_elevation_profile(dense_lonlat, smoothed_elevations, max_points=240):
+    """Return a compact distance/elevation profile for browser rendering.
+
+    The authoritative route scorer already densifies the route and samples the
+    DEM, so this reuses those exact samples instead of performing any extra DEM
+    reads. The profile is downsampled to keep multi-route API responses small.
+    """
+    if not dense_lonlat or not smoothed_elevations:
+        return []
+
+    count = min(len(dense_lonlat), len(smoothed_elevations))
+    if count == 0:
+        return []
+
+    cumulative_m = [0.0] * count
+    for i in range(1, count):
+        lon1, lat1 = dense_lonlat[i - 1]
+        lon2, lat2 = dense_lonlat[i]
+        cumulative_m[i] = cumulative_m[i - 1] + haversine_meters(
+            lat1, lon1, lat2, lon2
+        )
+
+    if count <= max_points:
+        indices = list(range(count))
+    else:
+        # Preserve both endpoints and select evenly spaced source samples.
+        indices = sorted(set(
+            int(round(i * (count - 1) / (max_points - 1)))
+            for i in range(max_points)
+        ))
+
+    profile = []
+    for i in indices:
+        elevation = smoothed_elevations[i]
+        if elevation is None:
+            continue
+        profile.append({
+            "distance_miles": round(cumulative_m[i] / METERS_PER_MILE, 3),
+            "elevation_ft": round(float(elevation) * FEET_PER_METER, 1),
+        })
+    return profile
+
+
 def route_geometry_metrics(coords):
     """Authoritative distance/gain from one continuous route geometry."""
     if len(coords) < 2:
@@ -3907,6 +3950,7 @@ def route_geometry_metrics(coords):
             "gain_meters": 0.0,
             "descent_meters": 0.0,
             "dem_sample_points": 0,
+            "elevation_profile": [],
         }
 
     lonlat = [
@@ -3933,6 +3977,7 @@ def route_geometry_metrics(coords):
         "gain_meters": float(ascent_m),
         "descent_meters": float(descent_m),
         "dem_sample_points": len(dense),
+        "elevation_profile": build_elevation_profile(dense, smoothed),
     }
 
 
@@ -4063,6 +4108,7 @@ def score_route_coordinates(
             "score": score,
             "route_coordinates": coords,
             "route_elevation_sample_count": geometry["dem_sample_points"],
+            "elevation_profile": geometry.get("elevation_profile", []),
             "partial_edge_used": partial_added_distance_m > 0,
             "partial_added_distance_meters": float(partial_added_distance_m),
         },
@@ -4185,6 +4231,7 @@ def build_route_option_payload(
         "elevation_error_ft": round(abs(actual_gain_ft - request.target_gain_ft)),
         "route": coords,
         "gpx_export_points": build_gpx_export_points(coords),
+        "elevation_profile": metrics.get("elevation_profile", []),
         "route_nodes": len(route_nodes),
         "route_geometry_points": len(coords),
         "repeated_edges": metrics["repeated_edges"],
@@ -6664,6 +6711,7 @@ def generate_route(request: RouteRequest):
             "route_profile": profile["name"],
             "route": coords,
             "gpx_export_points": gpx_export_points,
+            "elevation_profile": metrics.get("elevation_profile", []),
             "route_options": route_options,
             "route_options_count": len(route_options),
             "route_option_max_shared_fraction": MAX_ROUTE_SHARED_FRACTION,
@@ -6833,14 +6881,56 @@ button:disabled {
 }
 
 
-#results,
+#results {
+    width: 100%;
+}
 
-
-#map {
+#visual-panel {
     flex: 1 1 80%;
     width: 80%;
     height: 100vh;
+    min-width: 0;
     min-height: 0;
+    display: flex;
+    flex-direction: column;
+    background: white;
+}
+
+#map {
+    flex: 0 0 80%;
+    width: 100%;
+    height: 80%;
+    min-height: 0;
+}
+
+#elevation-profile-panel {
+    flex: 0 0 20%;
+    width: 100%;
+    height: 20%;
+    min-height: 0;
+    padding: 8px 12px 10px 12px;
+    border-top: 1px solid #cfcfcf;
+    background: #fff;
+    display: flex;
+    flex-direction: column;
+}
+
+#elevation-profile-title {
+    font-size: 13px;
+    font-weight: bold;
+    margin-bottom: 3px;
+}
+
+#elevationProfileSvg {
+    display: block;
+    width: 100%;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+.elevation-axis-label {
+    fill: #555;
+    font-size: 11px;
 }
 
 .error {
@@ -6932,10 +7022,22 @@ button:disabled {
         border-bottom: 1px solid #ccc;
     }
 
+    #visual-panel {
+        width: 100%;
+        height: auto;
+        display: block;
+    }
+
     #map {
         width: 100%;
-        height: 70vh;
-        min-height: 500px;
+        height: 65vh;
+        min-height: 450px;
+    }
+
+    #elevation-profile-panel {
+        width: 100%;
+        height: 22vh;
+        min-height: 150px;
     }
 }
 </style>
@@ -7002,7 +7104,13 @@ button:disabled {
 <div id="results">Ready.</div>
 </div>
 
-<div id="map"></div>
+<div id="visual-panel">
+    <div id="map"></div>
+    <div id="elevation-profile-panel">
+        <div id="elevation-profile-title">Elevation profile · select a route</div>
+        <svg id="elevationProfileSvg" role="img" aria-label="Elevation profile of selected route"></svg>
+    </div>
+</div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 
@@ -7050,6 +7158,11 @@ networkButton.addEventListener("click", reloadNetwork);
 showNetworkCheckbox.addEventListener("change", updateNetworkVisibility);
 addPassPointButton.addEventListener("click", beginPassPointPlacement);
 map.on("click", handleMapPassPointClick);
+window.addEventListener("resize", () => {
+    map.invalidateSize();
+    const selected = getSelectedRouteOption();
+    if (selected) renderElevationProfile(selected);
+});
 
 
 function beginPassPointPlacement() {
@@ -7257,6 +7370,70 @@ function clearGeneratedRouteLines() {
 }
 
 
+function renderElevationProfile(option) {
+    const svg = document.getElementById("elevationProfileSvg");
+    const title = document.getElementById("elevation-profile-title");
+    if (!svg || !title) return;
+
+    const profile = (option && option.elevation_profile) || [];
+    if (!profile.length) {
+        title.textContent = "Elevation profile · no profile available";
+        svg.innerHTML = "";
+        return;
+    }
+
+    title.textContent = `${option.name} elevation profile · ${option.actual_distance_miles} mi · ${option.actual_gain_ft} ft gain`;
+
+    const width = Math.max(320, svg.clientWidth || 900);
+    const height = Math.max(100, svg.clientHeight || 150);
+    const margin = {left: 48, right: 16, top: 8, bottom: 24};
+    const plotW = Math.max(1, width - margin.left - margin.right);
+    const plotH = Math.max(1, height - margin.top - margin.bottom);
+
+    const distances = profile.map(p => Number(p.distance_miles));
+    const elevations = profile.map(p => Number(p.elevation_ft));
+    const maxDistance = Math.max(...distances, 0.001);
+    let minElevation = Math.min(...elevations);
+    let maxElevation = Math.max(...elevations);
+    if (maxElevation - minElevation < 10) {
+        minElevation -= 5;
+        maxElevation += 5;
+    }
+    const elevationRange = Math.max(1, maxElevation - minElevation);
+
+    const x = d => margin.left + (d / maxDistance) * plotW;
+    const y = e => margin.top + (1 - (e - minElevation) / elevationRange) * plotH;
+
+    const pathData = profile.map((p, i) => {
+        const command = i === 0 ? "M" : "L";
+        return `${command}${x(Number(p.distance_miles)).toFixed(1)},${y(Number(p.elevation_ft)).toFixed(1)}`;
+    }).join(" ");
+
+    const baseY = margin.top + plotH;
+    const firstX = x(Number(profile[0].distance_miles));
+    const lastX = x(Number(profile[profile.length - 1].distance_miles));
+    const areaPath = `${pathData} L${lastX.toFixed(1)},${baseY.toFixed(1)} L${firstX.toFixed(1)},${baseY.toFixed(1)} Z`;
+
+    const midDistance = maxDistance / 2;
+    const midElevation = (minElevation + maxElevation) / 2;
+
+    svg.setAttribute("viewBox", `0 0 ${width} ${height}`);
+    svg.innerHTML = `
+        <line x1="${margin.left}" y1="${baseY}" x2="${width - margin.right}" y2="${baseY}" stroke="#aaa" stroke-width="1"/>
+        <line x1="${margin.left}" y1="${margin.top}" x2="${margin.left}" y2="${baseY}" stroke="#aaa" stroke-width="1"/>
+        <line x1="${margin.left}" y1="${y(midElevation)}" x2="${width - margin.right}" y2="${y(midElevation)}" stroke="#e5e5e5" stroke-width="1"/>
+        <path d="${areaPath}" fill="#dbeafe" opacity="0.75"></path>
+        <path d="${pathData}" fill="none" stroke="#b91c1c" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"></path>
+        <text x="${margin.left}" y="${height - 5}" class="elevation-axis-label">0 mi</text>
+        <text x="${x(midDistance)}" y="${height - 5}" text-anchor="middle" class="elevation-axis-label">${midDistance.toFixed(1)} mi</text>
+        <text x="${width - margin.right}" y="${height - 5}" text-anchor="end" class="elevation-axis-label">${maxDistance.toFixed(1)} mi</text>
+        <text x="${margin.left - 6}" y="${margin.top + 9}" text-anchor="end" class="elevation-axis-label">${Math.round(maxElevation)} ft</text>
+        <text x="${margin.left - 6}" y="${y(midElevation) + 4}" text-anchor="end" class="elevation-axis-label">${Math.round(midElevation)} ft</text>
+        <text x="${margin.left - 6}" y="${baseY}" text-anchor="end" class="elevation-axis-label">${Math.round(minElevation)} ft</text>
+    `;
+}
+
+
 function renderSelectedRouteDetails(option) {
     const details = document.getElementById("selectedRouteDetails");
     if (!details || !option) {
@@ -7316,6 +7493,7 @@ function selectRouteOption(index, fitMap = true) {
 
     const selected = options[index];
     renderSelectedRouteDetails(selected);
+    renderElevationProfile(selected);
     downloadGpxButton.disabled = false;
 
     if (fitMap && routeLine) {
@@ -7637,6 +7815,7 @@ async function generateRoute() {
                 elevation_error_ft: result.elevation_error_ft,
                 route: result.route,
                 gpx_export_points: result.gpx_export_points,
+                elevation_profile: result.elevation_profile || [],
                 repeated_edges: result.repeated_edges,
                 repeated_distance_miles: result.repeated_distance_miles,
                 repeated_nodes: result.repeated_nodes,
