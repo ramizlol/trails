@@ -7,6 +7,8 @@ import os
 import random
 import time
 import threading
+import pickle
+import sys
 import xml.etree.ElementTree as ET
 
 import networkx as nx
@@ -42,7 +44,7 @@ ELEVATION_SAMPLE_SPACING_M = 5.0
 # GPX points within this distance of an allowed trail count as covered.
 GPX_TRAIL_MATCH_TOLERANCE_M = 25.0
 
-MAX_CACHED_GRAPHS = 5
+MAX_CACHED_GRAPHS = 10
 GRAPH_CACHE = {}
 
 # One filtered OSM natural-trail graph covering the entire DEM/TIFF footprint.
@@ -51,7 +53,10 @@ GRAPH_CACHE = {}
 MASTER_GRAPH = None
 MASTER_GRAPH_INFO = {}
 MASTER_GRAPH_LOCK = threading.Lock()
-MASTER_GRAPH_PATH = os.path.join(BASE_DIR, "master_trails_output_USGS10m_v9.graphml")
+MASTER_GRAPH_GRAPHML_PATH = os.path.join(BASE_DIR, "master_trails.graphml")
+MASTER_GRAPH_PICKLE_PATH = os.path.join(BASE_DIR, "master_trails.pkl")
+# GraphML is the portable repository file. The pickle is an optional fast cache.
+MASTER_GRAPH_PATH = MASTER_GRAPH_GRAPHML_PATH
 DEM_BOUNDS_WGS84_CACHE = None
 
 # Cache DEM values by rounded lat/lon. Graph construction already samples
@@ -60,7 +65,8 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-09-v10-fast-multi-route"
+APP_VERSION = "2026-08-09-v11-offline-master"
+MASTER_NETWORK_SCHEMA = "trail-only-v11-offline-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
 TRAIL_HIGHWAYS = {"path", "track", "steps"}
@@ -84,7 +90,7 @@ SELECTIVE_CONNECTOR_MIN_COMPONENT_TRAIL_M = 250.0
 SELECTIVE_CONNECTOR_MAX_GAP_M = 7000.0
 SELECTIVE_CONNECTOR_ATTACH_MAX_M = 90.0
 SELECTIVE_CONNECTOR_CACHE = {}
-MAX_SELECTIVE_CONNECTOR_CACHE = 8
+MAX_SELECTIVE_CONNECTOR_CACHE = 16
 CONNECTOR_FILTER = '["highway"~"footway|pedestrian|cycleway|bridleway|residential|living_street|service|unclassified|tertiary|secondary|primary|road"]'
 
 
@@ -1165,51 +1171,135 @@ def master_graph_metadata(G, loaded_from_disk=False):
             float(G.graph.get("master_filtered_edges_removed", 0) or 0)
         ),
         "loaded_from_disk": bool(loaded_from_disk),
+        "elevation_precomputed": str(
+            G.graph.get("master_elevation_precomputed", "0")
+        ) == "1",
+        "elevation_samples": int(
+            float(G.graph.get("master_elevation_unique_samples", 0) or 0)
+        ),
         "bbox": get_dem_bounds_wgs84(),
-        "saved_graph": os.path.basename(MASTER_GRAPH_PATH),
+        "saved_graph": os.path.basename(
+            str(G.graph.get("master_loaded_source", MASTER_GRAPH_PATH))
+        ),
     }
 
 
+def _validate_offline_master_graph(G):
+    if G is None:
+        return False
+    if not isinstance(G, (nx.MultiDiGraph, nx.MultiGraph, nx.DiGraph, nx.Graph)):
+        return False
+    if str(G.graph.get("dem_signature", "")) != get_dem_signature():
+        return False
+    if str(G.graph.get("master_network_schema", "")) != MASTER_NETWORK_SCHEMA:
+        return False
+    if str(G.graph.get("master_elevation_precomputed", "0")) != "1":
+        return False
+    if not G.number_of_nodes() or not G.number_of_edges():
+        return False
+
+    # A v11 offline file must already contain elevation heuristics on every
+    # natural-trail edge so ordinary requests never resample the full graph.
+    for _, _, _, data in G.edges(keys=True, data=True):
+        if str(data.get("route_class", "trail")) != "trail":
+            continue
+        try:
+            float(data["ascent_m"])
+            float(data["descent_m"])
+            float(data.get("routing_cost", data.get("length", 0) or 0))
+        except Exception:
+            return False
+    return True
+
+
 def try_load_saved_master_graph():
-    if not os.path.exists(MASTER_GRAPH_PATH):
-        return None
+    """
+    Load the prebuilt TIFF-wide graph without contacting OpenStreetMap.
 
-    try:
-        G = ox.io.load_graphml(filepath=MASTER_GRAPH_PATH)
+    Prefer a local pickle cache because it is fastest. If the pickle was made
+    by an incompatible Python/library version, fall back to the portable
+    GraphML committed to the repo and refresh the local pickle automatically.
+    """
+    if os.path.exists(MASTER_GRAPH_PICKLE_PATH):
+        try:
+            with open(MASTER_GRAPH_PICKLE_PATH, "rb") as f:
+                G = pickle.load(f)
+            if _validate_offline_master_graph(G):
+                G.graph["master_loaded_source"] = MASTER_GRAPH_PICKLE_PATH
+                return G
+        except Exception:
+            pass
 
-        if str(G.graph.get("dem_signature", "")) != get_dem_signature():
-            return None
+    if os.path.exists(MASTER_GRAPH_GRAPHML_PATH):
+        try:
+            G = ox.io.load_graphml(filepath=MASTER_GRAPH_GRAPHML_PATH)
+            if _validate_offline_master_graph(G):
+                G.graph["master_loaded_source"] = MASTER_GRAPH_GRAPHML_PATH
+                # Best-effort local binary cache. It is not required in Git.
+                try:
+                    with open(MASTER_GRAPH_PICKLE_PATH + ".tmp", "wb") as f:
+                        pickle.dump(G, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    os.replace(
+                        MASTER_GRAPH_PICKLE_PATH + ".tmp",
+                        MASTER_GRAPH_PICKLE_PATH,
+                    )
+                except Exception:
+                    pass
+                return G
+        except Exception:
+            pass
 
-        if str(G.graph.get("master_network_schema", "")) != "trail-only-v9":
-            return None
-
-        if not G.number_of_nodes() or not G.number_of_edges():
-            return None
-
-        return G
-    except Exception:
-        return None
+    return None
 
 
 def save_master_graph(G):
+    """
+    Save both formats:
+      * master_trails.graphml = portable file to commit to GitHub
+      * master_trails.pkl     = optional faster local cache
+    """
     try:
-        ox.io.save_graphml(G, filepath=MASTER_GRAPH_PATH)
-        return True
+        ox.io.save_graphml(G, filepath=MASTER_GRAPH_GRAPHML_PATH)
     except Exception:
         return False
+
+    # The pickle is a convenience cache. A GraphML-only repo is fully valid.
+    tmp_path = MASTER_GRAPH_PICKLE_PATH + ".tmp"
+    try:
+        with open(tmp_path, "wb") as f:
+            pickle.dump(G, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_path, MASTER_GRAPH_PICKLE_PATH)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
+
+    return True
 
 
 def build_master_trail_graph():
     """
-    Download every allowed natural trail inside the TIFF footprint once.
+    ONE-TIME OFFLINE BUILD.
 
-    V9 deliberately does NOT place the complete Phoenix street network in this
-    master graph. Walkable streets are fetched later only for small connector
-    corridors between trail components that are useful to a long route.
+    Download every allowed natural trail inside the TIFF, filter it, precompute
+    the 5 m / ~55 m-smoothed edge elevation heuristics, and save the resulting graph to master_trails.graphml (plus an optional
+    fast pickle cache). Render never needs to rebuild this graph.
+
+    This function requires internet access to OpenStreetMap/Overpass and is
+    intended to be run on the user's computer before committing the .pkl file.
     """
     configure_osmnx_trail_tags()
     bbox = get_dem_bounds_wgs84()
     trail_filter = '["highway"~"path|track|steps"]'
+
+    print("Building offline master trail graph...")
+    print(
+        "TIFF bounds: "
+        f"west={bbox[0]:.6f}, south={bbox[1]:.6f}, "
+        f"east={bbox[2]:.6f}, north={bbox[3]:.6f}"
+    )
 
     try:
         G = ox.graph.graph_from_bbox(
@@ -1221,10 +1311,9 @@ def build_master_trail_graph():
             truncate_by_edge=False,
         )
     except Exception as exc:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Could not download the master TIFF trail network: {exc}",
-        )
+        raise RuntimeError(
+            f"Could not download the master TIFF trail network: {exc}"
+        ) from exc
 
     original_edges = G.number_of_edges()
     remove = []
@@ -1233,7 +1322,6 @@ def build_master_trail_graph():
         if not edge_is_allowed_trail(data):
             remove.append((u, v, key))
             continue
-
         if not edge_fully_inside_dem(G, u, v, data):
             remove.append((u, v, key))
             continue
@@ -1245,10 +1333,22 @@ def build_master_trail_graph():
     G.remove_nodes_from(list(nx.isolates(G)))
 
     if not G.number_of_edges():
-        raise HTTPException(
-            status_code=400,
-            detail="No usable natural trail network was found inside the TIFF footprint.",
+        raise RuntimeError(
+            "No usable natural trail network was found inside the TIFF footprint."
         )
+
+    print(
+        f"Filtered graph: {G.number_of_nodes()} nodes / "
+        f"{G.number_of_edges()} directed edges"
+    )
+    print("Precomputing trail elevation heuristics from output_USGS10m.tif...")
+
+    # This is deliberately done once during the offline build. It is the same
+    # edge-elevation heuristic v10 used at request time.
+    G, unique_samples = add_local_dem_edge_elevations(G)
+
+    for _, _, _, data in G.edges(keys=True, data=True):
+        data["routing_cost"] = float(edge_routing_cost(data))
 
     G.graph["dem_signature"] = get_dem_signature()
     G.graph["master_filtered_edges_removed"] = int(
@@ -1256,9 +1356,23 @@ def build_master_trail_graph():
     )
     G.graph["master_tiff_name"] = os.path.basename(DEM_PATH)
     G.graph["master_network_version"] = APP_VERSION
-    G.graph["master_network_schema"] = "trail-only-v9"
+    G.graph["master_network_schema"] = MASTER_NETWORK_SCHEMA
+    G.graph["master_elevation_precomputed"] = "1"
+    G.graph["master_elevation_unique_samples"] = int(unique_samples)
+    G.graph["master_elevation_spacing_m"] = float(ELEVATION_SAMPLE_SPACING_M)
+    G.graph["master_elevation_smoothing_radius"] = int(ELEVATION_SMOOTHING_RADIUS)
 
-    save_master_graph(G)
+    if not save_master_graph(G):
+        raise RuntimeError(f"Could not save {MASTER_GRAPH_PATH}")
+
+    graphml_mb = os.path.getsize(MASTER_GRAPH_GRAPHML_PATH) / (1024 * 1024)
+    print(f"Saved portable graph: {MASTER_GRAPH_GRAPHML_PATH}")
+    print(f"GraphML size: {graphml_mb:.2f} MB")
+    if os.path.exists(MASTER_GRAPH_PICKLE_PATH):
+        pickle_mb = os.path.getsize(MASTER_GRAPH_PICKLE_PATH) / (1024 * 1024)
+        print(f"Saved fast cache: {MASTER_GRAPH_PICKLE_PATH} ({pickle_mb:.2f} MB)")
+    print(f"Unique DEM samples baked into build: {unique_samples}")
+    print("Commit master_trails.graphml beside main.py. master_trails.pkl is optional.")
     return G
 
 
@@ -1273,15 +1387,18 @@ def get_master_trail_graph():
             return MASTER_GRAPH, MASTER_GRAPH_INFO
 
         G = try_load_saved_master_graph()
-        loaded = G is not None
-
         if G is None:
-            G = build_master_trail_graph()
+            reason = (
+                "Offline master graph is missing or incompatible. "
+                "Put master_trails.graphml beside main.py. To create it once on a "
+                "computer with internet access, run: python main.py --build-master"
+            )
+            raise HTTPException(status_code=503, detail=reason)
 
         MASTER_GRAPH = G
         MASTER_GRAPH_INFO = master_graph_metadata(
             G,
-            loaded_from_disk=loaded,
+            loaded_from_disk=True,
         )
 
     return MASTER_GRAPH, MASTER_GRAPH_INFO
@@ -1907,10 +2024,13 @@ def add_selective_connectors(local_G, start_lat, start_lon, radius_meters):
 
 def add_reachable_dem_edge_elevations(G, start_lat, start_lon):
     """
-    Annotate only the trail/connector component that can actually be reached
-    from the requested start. Disconnected gray-map trail systems remain in G
-    for display, but they do not consume DEM sampling time until a connector
-    makes them routeable.
+    V11 fast path.
+
+    Natural trail edges already contain ascent/descent from master_trails.pkl,
+    so ordinary requests do not resample every reachable trail edge from the
+    TIFF. Selective connector edges keep zero heuristic ascent here; final route
+    scoring still samples the complete route geometry against the TIFF, so the
+    authoritative distance/gain result remains unchanged.
     """
     trail_graph = trail_only_graph(G)
     if not trail_graph.number_of_edges():
@@ -1933,39 +2053,45 @@ def add_reachable_dem_edge_elevations(G, start_lat, start_lon):
         )
     )
 
-    routeable = G.subgraph(reachable).copy()
-    routeable, unique_samples = add_local_dem_edge_elevations(routeable)
-
     H = G.copy()
+    routeable_edges = 0
 
-    # Give non-routeable display-only edges harmless defaults. If a later graph
-    # version connects them, that new local graph is rebuilt and annotated.
     for u, v, key, data in H.edges(keys=True, data=True):
-        data["ascent_m"] = float(data.get("ascent_m", 0) or 0)
-        data["descent_m"] = float(data.get("descent_m", 0) or 0)
-        data["elevation_sample_count"] = int(
-            float(data.get("elevation_sample_count", 0) or 0)
-        )
+        is_reachable = u in reachable and v in reachable
+        if is_reachable:
+            routeable_edges += 1
 
-    for u, v, key, data in routeable.edges(keys=True, data=True):
-        if H.has_edge(u, v, key):
-            H[u][v][key]["ascent_m"] = float(data.get("ascent_m", 0) or 0)
-            H[u][v][key]["descent_m"] = float(data.get("descent_m", 0) or 0)
-            H[u][v][key]["elevation_sample_count"] = int(
+        if str(data.get("route_class", "trail")) == "trail":
+            # Loaded from the offline master. Validation guarantees these exist.
+            data["ascent_m"] = float(data.get("ascent_m", 0) or 0)
+            data["descent_m"] = float(data.get("descent_m", 0) or 0)
+            data["elevation_sample_count"] = int(
                 float(data.get("elevation_sample_count", 0) or 0)
             )
-            H[u][v][key]["routing_cost"] = float(edge_routing_cost(H[u][v][key]))
+        else:
+            # Same heuristic treatment connectors had in v10. The final full
+            # route DEM pass captures their actual climbing/descending.
+            data["ascent_m"] = float(data.get("ascent_m", 0) or 0)
+            data["descent_m"] = float(data.get("descent_m", 0) or 0)
+            data["elevation_sample_count"] = int(
+                float(data.get("elevation_sample_count", 0) or 0)
+            )
+
+        data["routing_cost"] = float(edge_routing_cost(data))
 
     H.graph["routeable_component_nodes"] = len(reachable)
-    H.graph["routeable_component_edges"] = routeable.number_of_edges()
-    return H, unique_samples
+    H.graph["routeable_component_edges"] = routeable_edges
+    H.graph["offline_master_elevation_used"] = True
+    return H, 0
+
 
 def download_trail_graph(lat, lon, radius_meters):
     """
-    V9 compatibility wrapper.
+    V11 local-graph wrapper.
 
-    The master graph is trail-only. Long route requests may add only a handful
-    of reduced connector paths; the full urban street graph is never retained.
+    The master graph is loaded from the offline repository file. Long route
+    requests may still add only a handful of reduced connector paths; the full
+    urban street graph is never retained.
     """
     cache_key = (
         round(float(lat), 5),
@@ -1973,7 +2099,7 @@ def download_trail_graph(lat, lon, radius_meters):
         int(radius_meters),
         ELEVATION_SAMPLE_SPACING_M,
         os.path.basename(DEM_PATH),
-        "selective-v9",
+        "selective-v11-offline",
     )
 
     if cache_key in GRAPH_CACHE:
@@ -4219,6 +4345,9 @@ def trail_network(request: TrailNetworkRequest):
             "routeable_component_nodes": int(float(G.graph.get("routeable_component_nodes", 0) or 0)),
             "routeable_component_edges": int(float(G.graph.get("routeable_component_edges", 0) or 0)),
             "master_loaded_from_disk": master_info["loaded_from_disk"],
+            "master_elevation_precomputed": master_info.get("elevation_precomputed", False),
+            "master_graph_file": master_info.get("saved_graph", os.path.basename(MASTER_GRAPH_PATH)),
+            "request_edge_dem_samples": int(unique_elevation_samples),
             "master_tiff": os.path.basename(DEM_PATH),
             "search_radius_m": profile["search_radius_m"],
             "route_profile": profile["name"],
@@ -5206,6 +5335,18 @@ async function loadTrailNetwork(data) {
         "<b>Master TIFF:</b> " +
         result.master_tiff +
         "<br>" +
+        "<b>Master graph file:</b> " +
+        result.master_graph_file +
+        "<br>" +
+        "<b>Offline master loaded:</b> " +
+        (result.master_loaded_from_disk ? "YES" : "NO") +
+        "<br>" +
+        "<b>Trail elevation precomputed:</b> " +
+        (result.master_elevation_precomputed ? "YES" : "NO") +
+        "<br>" +
+        "<b>Request-time trail edge DEM samples:</b> " +
+        result.request_edge_dem_samples +
+        "<br>" +
         "<b>Graph nodes:</b> " +
         result.network_nodes +
         "<br>" +
@@ -5249,7 +5390,7 @@ async function reloadNetwork() {
     const diagnostics = document.getElementById("diagnostics");
 
     networkButton.disabled = true;
-    diagnostics.innerHTML = '<span class="warning">Loading allowed trail network...</span>';
+    diagnostics.innerHTML = '<span class="warning">Loading offline trail network...</span>';
 
     try {
         await loadTrailNetwork(data);
@@ -5603,3 +5744,22 @@ reloadNetwork();
 </body>
 </html>
 """
+
+
+# ============================================================
+# ONE-TIME OFFLINE MASTER BUILD CLI
+# ============================================================
+
+if __name__ == "__main__":
+    if "--build-master" in sys.argv:
+        try:
+            build_master_trail_graph()
+        except Exception as exc:
+            print(f"MASTER BUILD FAILED: {exc}", file=sys.stderr)
+            raise SystemExit(1)
+        raise SystemExit(0)
+
+    print(
+        "This file is the FastAPI app. Start it with uvicorn, or create the "
+        "offline master graph with: python main.py --build-master"
+    )
