@@ -83,7 +83,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-09-v16-required-pass-through"
+APP_VERSION = "2026-08-09-v17-natural-retrace"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -120,6 +120,20 @@ OFFLINE_CONNECTOR_MIN_COMPONENT_TRAIL_M = 250.0
 # Per-search baseline waypoint-leg cache. A cached unpenalized leg is reused when
 # it does not touch any edge already used by the current candidate loop.
 WAYPOINT_LEG_CACHE_MAX = 4096
+
+# V17 route-quality tuning. Reusing a trail is no longer treated as nearly
+# forbidden. Ordinary retracing is still discouraged, but if an edge is a graph
+# bridge (a stem/corridor that has no alternate graph connection), retracing it
+# is treated as effectively necessary and receives only a very small penalty.
+REUSED_EDGE_COST_MULTIPLIER = 3.5
+NECESSARY_REUSED_EDGE_COST_MULTIPLIER = 1.15
+NECESSARY_RETRACE_SCORE_FACTOR = 0.10
+LONG_REPEAT_SCORE_WEIGHT = 90.0
+LONG_REPEATED_NODE_WEIGHT = 4.0
+LONG_IMMEDIATE_REVERSAL_WEIGHT = 3.0
+CHEAP_REPEAT_SCORE_WEIGHT = 70.0
+CHEAP_REPEATED_NODE_WEIGHT = 4.0
+CHEAP_IMMEDIATE_REVERSAL_WEIGHT = 3.0
 
 # V16 required pass-through zones. A user point is not treated as an off-trail
 # routing coordinate: it is snapped to a natural trail inside the tolerance,
@@ -3349,9 +3363,38 @@ def make_simple_routing_graph(G):
 # REPETITION METRICS
 # ============================================================
 
-def repeated_edge_stats(G, route_nodes):
+def routing_bridge_edge_keys(G):
+    """
+    Return undirected edge keys that are graph bridges.
+
+    A bridge is the only graph connection between the two sides it joins. If a
+    route enters a branch over a bridge, using that same corridor to come back is
+    structurally unavoidable. V17 therefore treats repeated bridge mileage very
+    differently from optional retracing.
+    """
+    cached = G.graph.get("_v17_bridge_edge_keys")
+    if isinstance(cached, set):
+        return cached
+
+    U = nx.Graph()
+    U.add_nodes_from(G.nodes)
+    for u, v in G.edges():
+        if u != v:
+            U.add_edge(u, v)
+
+    try:
+        bridges = {undirected_edge_key(u, v) for u, v in nx.bridges(U)}
+    except Exception:
+        bridges = set()
+
+    G.graph["_v17_bridge_edge_keys"] = bridges
+    return bridges
+
+
+def repeated_edge_breakdown(G, route_nodes, bridge_edges=None):
     counts = {}
     lengths = {}
+    bridge_edges = bridge_edges if bridge_edges is not None else routing_bridge_edge_keys(G)
 
     for i in range(len(route_nodes) - 1):
         u = route_nodes[i]
@@ -3370,13 +3413,37 @@ def repeated_edge_stats(G, route_nodes):
 
     repeated_edges = 0
     repeated_distance = 0.0
+    necessary_repeated_distance = 0.0
+    optional_repeated_distance = 0.0
 
     for edge_key, count in counts.items():
-        if count > 1:
-            repeated_edges += count - 1
-            repeated_distance += lengths.get(edge_key, 0) * (count - 1)
+        if count <= 1:
+            continue
+        extra_distance = lengths.get(edge_key, 0.0) * (count - 1)
+        repeated_edges += count - 1
+        repeated_distance += extra_distance
+        if edge_key in bridge_edges:
+            necessary_repeated_distance += extra_distance
+        else:
+            optional_repeated_distance += extra_distance
 
-    return repeated_edges, repeated_distance
+    effective_repeated_distance = (
+        optional_repeated_distance
+        + necessary_repeated_distance * NECESSARY_RETRACE_SCORE_FACTOR
+    )
+
+    return {
+        "repeated_edges": repeated_edges,
+        "repeated_distance_meters": repeated_distance,
+        "necessary_repeated_distance_meters": necessary_repeated_distance,
+        "optional_repeated_distance_meters": optional_repeated_distance,
+        "effective_repeated_distance_meters": effective_repeated_distance,
+    }
+
+
+def repeated_edge_stats(G, route_nodes):
+    breakdown = repeated_edge_breakdown(G, route_nodes)
+    return breakdown["repeated_edges"], breakdown["repeated_distance_meters"]
 
 
 def connector_distance_meters(G, route_nodes):
@@ -3401,6 +3468,36 @@ def repeated_node_occurrences(route_nodes):
     )
 
 
+def repeated_node_breakdown(route_nodes, bridge_edges):
+    counts = {}
+    bridge_nodes = set()
+    for u, v in bridge_edges:
+        bridge_nodes.add(int(u))
+        bridge_nodes.add(int(v))
+
+    for node in route_nodes[1:-1]:
+        counts[node] = counts.get(node, 0) + 1
+
+    necessary = 0
+    optional = 0
+    for node, count in counts.items():
+        extra = max(0, count - 1)
+        if not extra:
+            continue
+        if int(node) in bridge_nodes:
+            necessary += extra
+        else:
+            optional += extra
+
+    effective = optional + necessary * NECESSARY_RETRACE_SCORE_FACTOR
+    return {
+        "repeated_nodes": necessary + optional,
+        "necessary_repeated_nodes": necessary,
+        "optional_repeated_nodes": optional,
+        "effective_repeated_nodes": effective,
+    }
+
+
 def count_immediate_reversals(route_nodes):
     count = 0
 
@@ -3409,6 +3506,27 @@ def count_immediate_reversals(route_nodes):
             count += 1
 
     return count
+
+
+def immediate_reversal_breakdown(route_nodes, bridge_edges):
+    necessary = 0
+    optional = 0
+    for i in range(len(route_nodes) - 2):
+        if route_nodes[i] != route_nodes[i + 2]:
+            continue
+        key = undirected_edge_key(route_nodes[i], route_nodes[i + 1])
+        if key in bridge_edges:
+            necessary += 1
+        else:
+            optional += 1
+
+    effective = optional + necessary * NECESSARY_RETRACE_SCORE_FACTOR
+    return {
+        "immediate_reversals": necessary + optional,
+        "necessary_immediate_reversals": necessary,
+        "optional_immediate_reversals": optional,
+        "effective_immediate_reversals": effective,
+    }
 
 
 
@@ -3675,12 +3793,25 @@ def score_route_coordinates(
     else:
         gain_ratio = actual_gain / 30.48
 
-    repeated_edges, repeated_distance = repeated_edge_stats(G, route_nodes)
-    # A partial out-and-back repeats the same physical trail by definition.
-    repeated_distance += max(0.0, float(partial_added_distance_m) / 2.0)
-    repeat_ratio = repeated_distance / total_distance
-    repeated_nodes = repeated_node_occurrences(route_nodes)
-    immediate_reversals = count_immediate_reversals(route_nodes)
+    bridge_edges = routing_bridge_edge_keys(G)
+    repeat_breakdown = repeated_edge_breakdown(G, route_nodes, bridge_edges)
+    repeated_edges = repeat_breakdown["repeated_edges"]
+    repeated_distance = repeat_breakdown["repeated_distance_meters"]
+    effective_repeated_distance = repeat_breakdown["effective_repeated_distance_meters"]
+    # A partial out-and-back repeats the same physical trail by definition. Keep
+    # it as an ordinary (not automatically necessary) retrace for scoring.
+    partial_repeat = max(0.0, float(partial_added_distance_m) / 2.0)
+    repeated_distance += partial_repeat
+    effective_repeated_distance += partial_repeat
+    repeat_ratio = effective_repeated_distance / total_distance
+
+    node_breakdown = repeated_node_breakdown(route_nodes, bridge_edges)
+    repeated_nodes = node_breakdown["repeated_nodes"]
+    effective_repeated_nodes = node_breakdown["effective_repeated_nodes"]
+
+    reversal_breakdown = immediate_reversal_breakdown(route_nodes, bridge_edges)
+    immediate_reversals = reversal_breakdown["immediate_reversals"]
+    effective_immediate_reversals = reversal_breakdown["effective_immediate_reversals"]
     connector_distance = connector_distance_meters(G, route_nodes)
     connector_ratio = connector_distance / max(total_distance, 1.0)
 
@@ -3696,18 +3827,20 @@ def score_route_coordinates(
     )
 
     if target_distance_meters < 4 * METERS_PER_MILE:
-        repeat_weight = 50.0
-        node_weight = 6.0
+        repeat_weight = 35.0
+        node_weight = 3.0
+        reversal_weight = 3.0
     else:
-        repeat_weight = 300.0
-        node_weight = 25.0
+        repeat_weight = LONG_REPEAT_SCORE_WEIGHT
+        node_weight = LONG_REPEATED_NODE_WEIGHT
+        reversal_weight = LONG_IMMEDIATE_REVERSAL_WEIGHT
 
     score = (
         distance_ratio * 190.0
         + gain_ratio * 240.0
         + repeat_ratio * repeat_weight
-        + repeated_nodes * node_weight
-        + immediate_reversals * 12.0
+        + effective_repeated_nodes * node_weight
+        + effective_immediate_reversals * reversal_weight
         + connector_ratio * CONNECTOR_FINAL_SCORE_WEIGHT
         + shape_penalty
     )
@@ -3722,9 +3855,16 @@ def score_route_coordinates(
             "gain_error_meters": gain_error,
             "repeated_edges": repeated_edges,
             "repeated_distance_meters": repeated_distance,
+            "necessary_repeated_distance_meters": repeat_breakdown["necessary_repeated_distance_meters"],
+            "optional_repeated_distance_meters": repeat_breakdown["optional_repeated_distance_meters"] + partial_repeat,
+            "effective_repeated_distance_meters": effective_repeated_distance,
             "repeat_ratio": repeat_ratio,
             "repeated_nodes": repeated_nodes,
+            "necessary_repeated_nodes": node_breakdown["necessary_repeated_nodes"],
+            "optional_repeated_nodes": node_breakdown["optional_repeated_nodes"],
             "immediate_reversals": immediate_reversals,
+            "necessary_immediate_reversals": reversal_breakdown["necessary_immediate_reversals"],
+            "optional_immediate_reversals": reversal_breakdown["optional_immediate_reversals"],
             "connector_distance_meters": connector_distance,
             "connector_ratio": connector_ratio,
             "trail_fraction": max(0.0, 1.0 - connector_ratio),
@@ -4081,6 +4221,7 @@ def beam_search_short_loop(
 ):
     """Budgeted multi-objective closed-loop search with partial-edge tuning."""
     S = make_simple_routing_graph(G)
+    bridge_edges = routing_bridge_edge_keys(S)
     reverse_S = S.reverse(copy=False)
 
     try:
@@ -4184,7 +4325,10 @@ def beam_search_short_loop(
                 edge_key = undirected_edge_key(current, neighbor)
                 already_used = edge_key in state["used_edges"]
                 repeat_distance = state["repeat_distance"] + (
-                    edge_length if already_used else 0.0
+                    edge_length * (
+                        NECESSARY_RETRACE_SCORE_FACTOR if edge_key in bridge_edges else 1.0
+                    )
+                    if already_used else 0.0
                 )
                 used_edges = set(state["used_edges"])
                 used_edges.add(edge_key)
@@ -4496,13 +4640,15 @@ def _route_edge_key_set(path):
     }
 
 
-def waypoint_path(S, source, target, used_edges, leg_cache=None, cache_stats=None):
+def waypoint_path(S, source, target, used_edges, leg_cache=None, cache_stats=None, bridge_edges=None):
     """
     A* leg with a safe baseline-path cache.
 
     The cached path is an ordinary shortest path. It is reused only when none
     of its physical edges have already been used by this candidate loop. If it
-    would overlap, V15 falls back to the original 40x repeat-penalized A*.
+    would overlap, V17 runs a lightly repeat-penalized A*. Ordinary reused
+    edges cost 3.5x, while graph-bridge/stem edges cost only 1.15x because
+    returning over those corridors is often unavoidable.
     """
     key = (source, target)
     if leg_cache is not None:
@@ -4542,10 +4688,16 @@ def waypoint_path(S, source, target, used_edges, leg_cache=None, cache_stats=Non
             cache_stats["misses"] = cache_stats.get("misses", 0) + 1
         return path
 
+    bridge_edges = bridge_edges if bridge_edges is not None else routing_bridge_edge_keys(S)
+
     def weight(u, v, data):
         cost = float(data.get("routing_cost", data.get("length", 1.0)))
-        if undirected_edge_key(u, v) in used_edges:
-            cost *= 40.0
+        edge_key = undirected_edge_key(u, v)
+        if edge_key in used_edges:
+            if edge_key in bridge_edges:
+                cost *= NECESSARY_REUSED_EDGE_COST_MULTIPLIER
+            else:
+                cost *= REUSED_EDGE_COST_MULTIPLIER
         return cost
 
     path = nx.astar_path(
@@ -4590,10 +4742,20 @@ def cheap_waypoint_score(
     else:
         gain_ratio = approximate_gain / 30.48
 
-    repeated_edges, repeated_distance = repeated_edge_stats(G, route_nodes)
-    repeat_ratio = repeated_distance / max(total_distance, 1.0)
-    repeated_nodes = repeated_node_occurrences(route_nodes)
-    immediate_reversals = count_immediate_reversals(route_nodes)
+    bridge_edges = routing_bridge_edge_keys(G)
+    repeat_breakdown = repeated_edge_breakdown(G, route_nodes, bridge_edges)
+    repeated_edges = repeat_breakdown["repeated_edges"]
+    repeated_distance = repeat_breakdown["repeated_distance_meters"]
+    effective_repeated_distance = repeat_breakdown["effective_repeated_distance_meters"]
+    repeat_ratio = effective_repeated_distance / max(total_distance, 1.0)
+
+    node_breakdown = repeated_node_breakdown(route_nodes, bridge_edges)
+    repeated_nodes = node_breakdown["repeated_nodes"]
+    effective_repeated_nodes = node_breakdown["effective_repeated_nodes"]
+
+    reversal_breakdown = immediate_reversal_breakdown(route_nodes, bridge_edges)
+    immediate_reversals = reversal_breakdown["immediate_reversals"]
+    effective_immediate_reversals = reversal_breakdown["effective_immediate_reversals"]
     connector_distance = connector_distance_meters(G, route_nodes)
     connector_ratio = connector_distance / max(total_distance, 1.0)
 
@@ -4608,15 +4770,14 @@ def cheap_waypoint_score(
     )
 
     # Distance and approximate elevation are the primary exploratory goals.
-    # Repetition remains a meaningful but secondary penalty. V13 also gives
-    # clean, broad single-loop candidates a soft advantage so they survive
-    # into the small set of expensive DEM finalists.
+    # V17 keeps the strong mini-loop shape penalty, but makes ordinary retracing
+    # secondary and treats bridge/stem retracing as nearly unavoidable.
     score = (
         distance_ratio * 190.0
         + gain_ratio * 150.0
-        + repeat_ratio * 170.0
-        + repeated_nodes * 12.0
-        + immediate_reversals * 10.0
+        + repeat_ratio * CHEAP_REPEAT_SCORE_WEIGHT
+        + effective_repeated_nodes * CHEAP_REPEATED_NODE_WEIGHT
+        + effective_immediate_reversals * CHEAP_IMMEDIATE_REVERSAL_WEIGHT
         + connector_ratio * CONNECTOR_CHEAP_SCORE_WEIGHT
         + shape_penalty
     )
@@ -4626,8 +4787,15 @@ def cheap_waypoint_score(
         "approximate_gain_meters": approximate_gain,
         "repeated_edges": repeated_edges,
         "repeated_distance_meters": repeated_distance,
+        "necessary_repeated_distance_meters": repeat_breakdown["necessary_repeated_distance_meters"],
+        "optional_repeated_distance_meters": repeat_breakdown["optional_repeated_distance_meters"],
+        "effective_repeated_distance_meters": effective_repeated_distance,
         "repeated_nodes": repeated_nodes,
+        "necessary_repeated_nodes": node_breakdown["necessary_repeated_nodes"],
+        "optional_repeated_nodes": node_breakdown["optional_repeated_nodes"],
         "immediate_reversals": immediate_reversals,
+        "necessary_immediate_reversals": reversal_breakdown["necessary_immediate_reversals"],
+        "optional_immediate_reversals": reversal_breakdown["optional_immediate_reversals"],
         "connector_distance_meters": connector_distance,
         "connector_ratio": connector_ratio,
         "cycle_rank": topology["cycle_rank"],
@@ -4661,6 +4829,7 @@ def generate_waypoint_loop(
       continuous 5 m DEM profile + ~55 m smoothing.
     """
     S = make_simple_routing_graph(G)
+    bridge_edges = routing_bridge_edge_keys(S)
 
     start_lat = float(G.nodes[start_node]["y"])
     start_lon = float(G.nodes[start_node]["x"])
@@ -4844,6 +5013,7 @@ def generate_waypoint_loop(
                     used_edges,
                     leg_cache=leg_cache,
                     cache_stats=leg_cache_stats,
+                    bridge_edges=bridge_edges,
                 )
             except nx.NetworkXNoPath:
                 failed = True
