@@ -11,6 +11,9 @@ import time
 import threading
 import pickle
 import sys
+import subprocess
+import tempfile
+import shutil
 import xml.etree.ElementTree as ET
 
 import networkx as nx
@@ -33,6 +36,7 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DEM_PATH = os.path.join(BASE_DIR, "output_USGS10m.tif")
+LOCAL_OSM_PBF_PATH = os.path.join(BASE_DIR, "phoenix-tiff.osm.pbf")
 
 METERS_PER_MILE = 1609.344
 FEET_PER_METER = 3.28084
@@ -51,7 +55,7 @@ MAX_CACHED_GRAPHS = 10
 GRAPH_CACHE = {}
 
 # One filtered OSM natural-trail graph covering the entire DEM/TIFF footprint.
-# V14 keeps the runtime fully offline. Natural trails plus a sparse set of
+# V15 keeps the runtime fully offline. Natural trails plus a sparse set of
 # useful prebuilt walking connectors are loaded from disk; normal requests never
 # contact OpenStreetMap/Overpass.
 MASTER_GRAPH = None
@@ -69,7 +73,7 @@ MASTER_ROUTING_INFO = {}
 MASTER_ROUTING_LOCK = threading.Lock()
 MASTER_ROUTING_GRAPHML_PATH = os.path.join(BASE_DIR, "master_routing.graphml")
 MASTER_ROUTING_PICKLE_PATH = os.path.join(BASE_DIR, "master_routing.pkl")
-ROUTING_NETWORK_SCHEMA = "trail-plus-sparse-connectors-v14-offline"
+ROUTING_NETWORK_SCHEMA = "trail-plus-sparse-connectors-v15-local-pbf"
 
 DEM_BOUNDS_WGS84_CACHE = None
 
@@ -79,8 +83,8 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-09-v14-offline-connectors-fast-search"
-MASTER_NETWORK_SCHEMA = "trail-only-v11-offline-precomputed"
+APP_VERSION = "2026-08-09-v15-local-pbf-zero-overpass"
+MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
 TRAIL_HIGHWAYS = {"path", "track", "steps"}
@@ -95,7 +99,7 @@ CONNECTOR_CHEAP_SCORE_WEIGHT = 90.0
 MAX_ROUTE_OPTIONS = 5
 MAX_ROUTE_SHARED_FRACTION = 0.80
 
-# V14 builds only a sparse connector backbone OFFLINE. It never stores the full
+# V15 builds only a sparse connector backbone OFFLINE. It never stores the full
 # city street network, and normal route requests never make live connector calls.
 SELECTIVE_CONNECTORS_MIN_RADIUS_M = 8.0 * METERS_PER_MILE
 SELECTIVE_CONNECTOR_MAX_COUNT = 4
@@ -117,7 +121,7 @@ OFFLINE_CONNECTOR_MIN_COMPONENT_TRAIL_M = 250.0
 # it does not touch any edge already used by the current candidate loop.
 WAYPOINT_LEG_CACHE_MAX = 4096
 
-# V14 separates the start workspace from distance/elevation
+# V15 separates the start workspace from distance/elevation
 # targets. A workspace is keyed only by the requested start coordinate and
 # contains the TIFF-wide trail graph plus the small selective connector set.
 # Changing distance/gain reuses this workspace and only creates a cheap in-memory
@@ -1335,58 +1339,264 @@ def save_master_graph(G):
     return True
 
 
-def build_master_trail_graph():
+
+def _run_osmium_command(args):
+    """Run osmium-tool for the one-time local PBF build."""
+    executable = shutil.which("osmium")
+    if not executable:
+        raise RuntimeError(
+            "osmium-tool is required only for the one-time local build. "
+            "In GitHub Codespaces run: sudo apt-get update && "
+            "sudo apt-get install -y osmium-tool"
+        )
+
+    command = [executable] + list(args)
+    started = time.perf_counter()
+    completed = subprocess.run(
+        command,
+        cwd=BASE_DIR,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    elapsed = time.perf_counter() - started
+
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "unknown osmium error").strip()
+        raise RuntimeError(
+            f"osmium command failed after {elapsed:.1f}s: {' '.join(command)}\n{detail}"
+        )
+
+    return elapsed
+
+
+def load_local_highway_graph_from_pbf():
     """
-    ONE-TIME OFFLINE BUILD.
+    Read the 9-ish MB TIFF-local OSM PBF without Overpass.
 
-    Download every allowed natural trail inside the TIFF, filter it, precompute
-    the 5 m / ~55 m-smoothed edge elevation heuristics, and save the resulting graph to master_trails.graphml (plus an optional
-    fast pickle cache). Render never needs to rebuild this graph.
-
-    This function requires internet access to OpenStreetMap/Overpass and is
-    intended to be run on the user's computer before committing the .pkl file.
+    osmium-tool first filters to highway ways (while retaining referenced nodes),
+    converts that temporary extract to OSM XML, and OSMnx builds the graph from
+    the local XML. The temporary files disappear automatically.
     """
     configure_osmnx_trail_tags()
-    bbox = get_dem_bounds_wgs84()
-    trail_filter = '["highway"~"path|track|steps"]'
 
-    print("Building offline master trail graph...")
+    if not os.path.exists(LOCAL_OSM_PBF_PATH):
+        raise RuntimeError(
+            f"Missing {os.path.basename(LOCAL_OSM_PBF_PATH)} beside main.py. "
+            "Commit the cropped Phoenix TIFF PBF to the repo first."
+        )
+
+    pbf_mb = os.path.getsize(LOCAL_OSM_PBF_PATH) / (1024 * 1024)
+    print(
+        f"Loading local OSM source: {os.path.basename(LOCAL_OSM_PBF_PATH)} "
+        f"({pbf_mb:.2f} MB)"
+    )
+
+    with tempfile.TemporaryDirectory(prefix="trail_pbf_build_") as tmpdir:
+        highways_pbf = os.path.join(tmpdir, "highways.osm.pbf")
+        highways_xml = os.path.join(tmpdir, "highways.osm")
+
+        elapsed_filter = _run_osmium_command([
+            "tags-filter",
+            "-O",
+            "-o", highways_pbf,
+            LOCAL_OSM_PBF_PATH,
+            "w/highway",
+        ])
+        print(f"  osmium highway filter: {elapsed_filter:.1f}s")
+
+        elapsed_xml = _run_osmium_command([
+            "cat",
+            "-O",
+            "-o", highways_xml,
+            highways_pbf,
+        ])
+        print(f"  osmium PBF -> XML: {elapsed_xml:.1f}s")
+
+        started = time.perf_counter()
+        try:
+            G = ox.graph.graph_from_xml(
+                highways_xml,
+                bidirectional=True,
+                simplify=True,
+                retain_all=True,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"Could not build local OSMnx graph from PBF extract: {exc}") from exc
+        print(
+            f"  OSMnx local graph parse: {time.perf_counter() - started:.1f}s "
+            f"({G.number_of_nodes()} nodes / {G.number_of_edges()} directed edges)"
+        )
+
+    return G
+
+
+def _classified_subgraph_from_local_osm(source_G, route_class):
+    """Create either the natural-trail graph or connector graph from local OSM."""
+    H = nx.MultiDiGraph()
+    H.graph.update(dict(source_G.graph))
+
+    kept = 0
+    removed = 0
+    for u, v, key, data in source_G.edges(keys=True, data=True):
+        classification = classify_walkable_edge(data)
+        if classification != route_class:
+            removed += 1
+            continue
+        if not edge_fully_inside_dem(source_G, u, v, data):
+            removed += 1
+            continue
+
+        if u not in H:
+            H.add_node(u, **dict(source_G.nodes[u]))
+        if v not in H:
+            H.add_node(v, **dict(source_G.nodes[v]))
+
+        attrs = dict(data)
+        attrs["route_class"] = route_class
+        length = float(attrs.get("length", 0) or 0)
+        attrs["routing_cost"] = (
+            length * CONNECTOR_PATH_COST_MULTIPLIER
+            if route_class == "connector"
+            else length
+        )
+        H.add_edge(u, v, key=key, **attrs)
+        kept += 1
+
+    H.remove_nodes_from(list(nx.isolates(H)))
+    H.graph["local_source_edges_kept"] = int(kept)
+    H.graph["local_source_edges_removed"] = int(removed)
+    H.graph["local_osm_source"] = os.path.basename(LOCAL_OSM_PBF_PATH)
+    return H
+
+
+def _build_walk_node_index(W):
+    nodes = list(W.nodes)
+    if not nodes:
+        return None
+    coords = np.asarray(
+        [[float(W.nodes[n]["y"]), float(W.nodes[n]["x"])] for n in nodes],
+        dtype=float,
+    )
+    tree = BallTree(np.radians(coords), metric="haversine")
+    return {"nodes": nodes, "coords": coords, "tree": tree}
+
+
+def _nearest_walk_candidates(W, walk_index, trail_G, trail_node, k=6):
+    if walk_index is None or trail_node not in trail_G:
+        return []
+
+    lat = float(trail_G.nodes[trail_node]["y"])
+    lon = float(trail_G.nodes[trail_node]["x"])
+    k = max(1, min(int(k), len(walk_index["nodes"])))
+    distances, indices = walk_index["tree"].query(
+        np.radians(np.asarray([[lat, lon]], dtype=float)),
+        k=k,
+    )
+
+    rows = []
+    for angular, idx in zip(distances[0], indices[0]):
+        node = walk_index["nodes"][int(idx)]
+        distance_m = float(angular) * 6371000.0
+        if distance_m <= SELECTIVE_CONNECTOR_ATTACH_MAX_M:
+            rows.append((node, distance_m))
+    return rows
+
+
+def _find_local_connector_path(
+    trail_G,
+    walk_G,
+    walk_index,
+    source_hint,
+    target_hint,
+    straight_gap,
+):
+    """Find one useful connector path entirely inside the local PBF graph."""
+    source_candidates = _nearest_walk_candidates(
+        walk_G, walk_index, trail_G, source_hint, k=8
+    )
+    target_candidates = _nearest_walk_candidates(
+        walk_G, walk_index, trail_G, target_hint, k=8
+    )
+
+    if not source_candidates or not target_candidates:
+        return None, "no walkable network attachment within 90 m of both trail systems"
+
+    source_nodes = [node for node, _ in source_candidates]
+    source_offsets = {node: offset for node, offset in source_candidates}
+    target_offsets = {node: offset for node, offset in target_candidates}
+
+    max_reasonable = max(1800.0, float(straight_gap) * 3.5 + 1200.0)
+
+    try:
+        distances, paths = nx.multi_source_dijkstra(
+            walk_G,
+            source_nodes,
+            cutoff=max_reasonable,
+            weight="length",
+        )
+    except Exception as exc:
+        return None, f"local connector shortest-path search failed: {exc}"
+
+    reachable_targets = []
+    for target_walk, target_offset in target_candidates:
+        if target_walk not in distances:
+            continue
+        path = paths[target_walk]
+        if not path:
+            continue
+        source_walk = path[0]
+        source_offset = source_offsets.get(source_walk)
+        if source_offset is None:
+            continue
+        total = float(distances[target_walk]) + float(source_offset) + float(target_offset)
+        reachable_targets.append(
+            (total, target_walk, source_walk, path, source_offset, target_offset)
+        )
+
+    if not reachable_targets:
+        return None, "local walkable network does not connect the two trail systems"
+
+    reachable_targets.sort(key=lambda row: row[0])
+    _, target_walk, source_walk, path, source_offset, target_offset = reachable_targets[0]
+    path_length = float(distances[target_walk])
+
+    if path_length > max_reasonable:
+        return None, "local walkable connector path is too indirect"
+
+    return {
+        "walk_graph": walk_G,
+        "path": path,
+        "path_length_m": path_length,
+        "source_trail": source_hint,
+        "source_walk": source_walk,
+        "source_offset_m": float(source_offset),
+        "target_trail": target_hint,
+        "target_walk": target_walk,
+        "target_offset_m": float(target_offset),
+        "straight_gap_m": float(straight_gap),
+    }, None
+
+
+def build_master_trail_graph(local_source_graph=None):
+    """
+    ONE-TIME LOCAL BUILD from phoenix-tiff.osm.pbf.
+
+    No Overpass/API requests are made. Natural trails are selected from the
+    already-cropped local PBF, then the trail elevation heuristics are baked in
+    from output_USGS10m.tif and saved to master_trails.graphml.
+    """
+    bbox = get_dem_bounds_wgs84()
+    print("Building offline master trail graph from LOCAL PBF...")
     print(
         "TIFF bounds: "
         f"west={bbox[0]:.6f}, south={bbox[1]:.6f}, "
         f"east={bbox[2]:.6f}, north={bbox[3]:.6f}"
     )
 
-    try:
-        G = ox.graph.graph_from_bbox(
-            bbox,
-            network_type="walk",
-            custom_filter=trail_filter,
-            simplify=True,
-            retain_all=True,
-            truncate_by_edge=False,
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not download the master TIFF trail network: {exc}"
-        ) from exc
-
-    original_edges = G.number_of_edges()
-    remove = []
-
-    for u, v, key, data in G.edges(keys=True, data=True):
-        if not edge_is_allowed_trail(data):
-            remove.append((u, v, key))
-            continue
-        if not edge_fully_inside_dem(G, u, v, data):
-            remove.append((u, v, key))
-            continue
-
-        data["route_class"] = "trail"
-        data["routing_cost"] = float(data.get("length", 0) or 0)
-
-    G.remove_edges_from(remove)
-    G.remove_nodes_from(list(nx.isolates(G)))
+    source_G = local_source_graph or load_local_highway_graph_from_pbf()
+    G = _classified_subgraph_from_local_osm(source_G, "trail")
 
     if not G.number_of_edges():
         raise RuntimeError(
@@ -1394,21 +1604,20 @@ def build_master_trail_graph():
         )
 
     print(
-        f"Filtered graph: {G.number_of_nodes()} nodes / "
+        f"Filtered trail graph: {G.number_of_nodes()} nodes / "
         f"{G.number_of_edges()} directed edges"
     )
     print("Precomputing trail elevation heuristics from output_USGS10m.tif...")
 
-    # This is deliberately done once during the offline build. It is the same
-    # edge-elevation heuristic v10 used at request time.
     G, unique_samples = add_local_dem_edge_elevations(G)
 
     for _, _, _, data in G.edges(keys=True, data=True):
+        data["route_class"] = "trail"
         data["routing_cost"] = float(edge_routing_cost(data))
 
     G.graph["dem_signature"] = get_dem_signature()
     G.graph["master_filtered_edges_removed"] = int(
-        original_edges - G.number_of_edges()
+        source_G.number_of_edges() - G.number_of_edges()
     )
     G.graph["master_tiff_name"] = os.path.basename(DEM_PATH)
     G.graph["master_network_version"] = APP_VERSION
@@ -1417,18 +1626,18 @@ def build_master_trail_graph():
     G.graph["master_elevation_unique_samples"] = int(unique_samples)
     G.graph["master_elevation_spacing_m"] = float(ELEVATION_SAMPLE_SPACING_M)
     G.graph["master_elevation_smoothing_radius"] = int(ELEVATION_SMOOTHING_RADIUS)
+    G.graph["local_osm_source"] = os.path.basename(LOCAL_OSM_PBF_PATH)
+    G.graph["overpass_used"] = "0"
 
     if not save_master_graph(G):
         raise RuntimeError(f"Could not save {MASTER_GRAPH_PATH}")
 
     graphml_mb = os.path.getsize(MASTER_GRAPH_GRAPHML_PATH) / (1024 * 1024)
-    print(f"Saved portable graph: {MASTER_GRAPH_GRAPHML_PATH}")
-    print(f"GraphML size: {graphml_mb:.2f} MB")
+    print(f"Saved portable trail graph: {MASTER_GRAPH_GRAPHML_PATH} ({graphml_mb:.2f} MB)")
     if os.path.exists(MASTER_GRAPH_PICKLE_PATH):
         pickle_mb = os.path.getsize(MASTER_GRAPH_PICKLE_PATH) / (1024 * 1024)
-        print(f"Saved fast cache: {MASTER_GRAPH_PICKLE_PATH} ({pickle_mb:.2f} MB)")
-    print(f"Unique DEM samples baked into build: {unique_samples}")
-    print("Commit master_trails.graphml beside main.py. master_trails.pkl is optional.")
+        print(f"Saved optional trail pickle: {MASTER_GRAPH_PICKLE_PATH} ({pickle_mb:.2f} MB)")
+    print(f"Unique DEM samples baked into trail build: {unique_samples}")
     return G
 
 
@@ -1642,29 +1851,45 @@ def _offline_connector_candidate_pairs(G, components, component_lengths):
     return rows
 
 
-def build_master_routing_graph(rebuild_trails=False):
+def build_master_routing_graph(rebuild_trails=True):
     """
-    ONE-TIME V14 ROUTING BUILD.
+    ONE-TIME V15 LOCAL ROUTING BUILD.
 
-    Start from the compact natural-trail master and add only a sparse backbone
-    of useful real walkable connector paths. Each corridor is downloaded during
-    this one-time build, reduced immediately to one shortest connector path, and
-    then the surrounding street network is discarded.
-
-    Normal FastAPI requests never contact OpenStreetMap/Overpass.
+    Everything comes from phoenix-tiff.osm.pbf. The full local walkable graph is
+    held only during this build. We save natural trails plus a sparse set of
+    useful connector paths to master_routing.graphml. No Overpass requests are
+    made during the build or during normal FastAPI use.
     """
+    build_started = time.perf_counter()
     configure_osmnx_trail_tags()
 
-    trail_G = None
-    if not rebuild_trails:
+    # Parse the local PBF once, then derive both trails and walkable connectors
+    # from the same node/way source so topology and OSM IDs stay consistent.
+    source_G = load_local_highway_graph_from_pbf()
+
+    if rebuild_trails:
+        trail_G = build_master_trail_graph(local_source_graph=source_G)
+    else:
         trail_G = try_load_saved_master_graph()
-    if trail_G is None:
-        print("Trail master missing/incompatible; rebuilding it first...")
-        trail_G = build_master_trail_graph()
+        if trail_G is None:
+            trail_G = build_master_trail_graph(local_source_graph=source_G)
+
+    walk_G = _classified_subgraph_from_local_osm(source_G, "connector")
+    if not walk_G.number_of_edges():
+        raise RuntimeError("No walkable connector network was found in phoenix-tiff.osm.pbf")
+
+    print(
+        f"Local connector graph: {walk_G.number_of_nodes()} nodes / "
+        f"{walk_G.number_of_edges()} directed edges"
+    )
+    walk_index = _build_walk_node_index(walk_G)
 
     G = trail_G.copy()
     trail_base = trail_only_graph(G)
-    components = [set(c) for c in nx.connected_components(trail_base.to_undirected(as_view=True))]
+    components = [
+        set(c)
+        for c in nx.connected_components(trail_base.to_undirected(as_view=True))
+    ]
     component_lengths = {
         i: _component_unique_trail_length(G, nodes)
         for i, nodes in enumerate(components)
@@ -1675,7 +1900,7 @@ def build_master_routing_graph(rebuild_trails=False):
         if component_lengths.get(i, 0.0) >= OFFLINE_CONNECTOR_MIN_COMPONENT_TRAIL_M
     )
 
-    print("Building sparse OFFLINE connector backbone...")
+    print("Building sparse connector backbone from LOCAL PBF...")
     print(f"Trail components: {len(components)} total / {useful_count} useful")
 
     candidate_rows = _offline_connector_candidate_pairs(
@@ -1686,30 +1911,29 @@ def build_master_routing_graph(rebuild_trails=False):
 
     union = nx.utils.UnionFind(range(len(components)))
     connector_count = 0
-    connector_queries = 0
+    connector_checks = 0
     connector_path_meters = 0.0
     errors = []
 
-    # Short useful bridges first. Kruskal-style union prevents redundant city
-    # connectors from accumulating once two trail systems are already joined.
     for _, gap_m, a, b, source_hint, target_hint in candidate_rows:
         if connector_count >= OFFLINE_CONNECTOR_MAX_COUNT:
             break
         if union[a] == union[b]:
             continue
 
-        connector_queries += 1
+        connector_checks += 1
         print(
-            f"  connector query {connector_queries}: components {a}<->{b}, "
+            f"  local connector {connector_checks}: components {a}<->{b}, "
             f"straight gap {gap_m:.0f} m"
         )
 
-        result, error = _download_connector_corridor(
+        result, error = _find_local_connector_path(
             G,
-            components[a],
-            components[b],
+            walk_G,
+            walk_index,
             source_hint,
             target_hint,
+            gap_m,
         )
         if result is None:
             if error:
@@ -1723,7 +1947,6 @@ def build_master_routing_graph(rebuild_trails=False):
         connector_path_meters += float(copied)
         print(f"    added {copied:.0f} m connector path")
 
-    # Make connector heuristic fields explicit so GraphML round trips cleanly.
     for _, _, _, data in G.edges(keys=True, data=True):
         if str(data.get("route_class", "trail")) == "connector":
             data["ascent_m"] = float(data.get("ascent_m", 0) or 0)
@@ -1743,11 +1966,15 @@ def build_master_routing_graph(rebuild_trails=False):
     G.graph["routing_network_version"] = APP_VERSION
     G.graph["offline_connectors_prebuilt"] = "1"
     G.graph["offline_connector_count"] = int(connector_count)
-    G.graph["offline_connector_queries"] = int(connector_queries)
+    # Kept for API/UI compatibility: this is deliberately zero in V15.
+    G.graph["offline_connector_queries"] = 0
+    G.graph["offline_connector_checks"] = int(connector_checks)
     G.graph["offline_connector_path_meters"] = float(connector_path_meters)
     G.graph["offline_components_before"] = int(before)
     G.graph["offline_components_after"] = int(after)
-    G.graph["offline_connector_errors_json"] = json.dumps(errors[:50])
+    G.graph["offline_connector_errors_json"] = json.dumps(errors[:100])
+    G.graph["local_osm_source"] = os.path.basename(LOCAL_OSM_PBF_PATH)
+    G.graph["overpass_used"] = "0"
 
     if not save_master_routing_graph(G):
         raise RuntimeError(f"Could not save {MASTER_ROUTING_GRAPHML_PATH}")
@@ -1759,12 +1986,14 @@ def build_master_routing_graph(rebuild_trails=False):
         pickle_mb = os.path.getsize(MASTER_ROUTING_PICKLE_PATH) / (1024 * 1024)
         print(f"Saved optional fast cache: {MASTER_ROUTING_PICKLE_PATH} ({pickle_mb:.2f} MB)")
     print(
-        f"Offline connectors added: {connector_count}; "
+        f"Local connectors added: {connector_count}; "
+        f"connector checks: {connector_checks}; "
         f"selected connector mileage: {connector_path_meters / METERS_PER_MILE:.2f} mi"
     )
+    print(f"Total local build time: {time.perf_counter() - build_started:.1f}s")
     print(
-        "Commit master_routing.graphml beside main.py. Normal Render requests "
-        "will make zero Overpass connector calls."
+        "No Overpass calls were used. Commit master_routing.graphml beside "
+        "main.py; normal Render requests remain fully offline."
     )
     return G
 
@@ -1782,9 +2011,9 @@ def get_master_routing_graph():
         G = try_load_saved_routing_graph()
         if G is None:
             reason = (
-                "Offline V14 routing graph is missing or incompatible. Put "
-                "master_routing.graphml beside main.py. Create it once with: "
-                "python main.py --build-routing"
+                "Offline V15 routing graph is missing or incompatible. Put "
+                "master_routing.graphml beside main.py. Build it locally from "
+                "phoenix-tiff.osm.pbf with: python main.py --build-routing"
             )
             raise HTTPException(status_code=503, detail=reason)
 
@@ -2556,7 +2785,7 @@ def finalize_workspace_graph(G, start_node, start_lat, start_lon):
     """
     Prepare only start-specific metadata.
 
-    V14 normalizes the production routing graph once at load time, so we no
+    V15 normalizes the production routing graph once at load time, so we no
     longer walk every edge on every new start. Only the newly split exact-start
     edges need any defaults, and those inherit their source edge attributes.
     """
@@ -2590,7 +2819,7 @@ def get_start_workspace(lat, lon, force_rebuild=False):
     Build/load a start-specific workspace with ZERO live OSM calls.
 
     The expensive trail/connector discovery was moved into master_routing.graphml
-    during the one-time V14 build. A new start now only:
+    during the one-time V15 build. A new start now only:
       1) loads/reuses the in-memory production graph,
       2) inserts the exact start point (one graph copy, not two),
       3) computes vectorized radial distances and connectivity.
@@ -3981,7 +4210,7 @@ def waypoint_path(S, source, target, used_edges, leg_cache=None, cache_stats=Non
 
     The cached path is an ordinary shortest path. It is reused only when none
     of its physical edges have already been used by this candidate loop. If it
-    would overlap, V14 falls back to the original 40x repeat-penalized A*.
+    would overlap, V15 falls back to the original 40x repeat-penalized A*.
     """
     key = (source, target)
     if leg_cache is not None:
@@ -4198,7 +4427,7 @@ def generate_waypoint_loop(
     pool_multiplier = int(profile.get("candidate_pool_multiplier", 3))
     pool_limit = max(accurate_finalists, accurate_finalists * pool_multiplier)
 
-    # V14: one static shortest-path tree from the start replaces hundreds of
+    # V15: one static shortest-path tree from the start replaces hundreds of
     # repeated start->first-anchor A* calls. Additional baseline legs are cached
     # lazily and reused only when they do not overlap already-used loop edges.
     leg_cache = {}
@@ -6862,29 +7091,19 @@ reloadNetwork();
 # ============================================================
 
 if __name__ == "__main__":
-    if "--build-master" in sys.argv:
+    if "--build-master" in sys.argv or "--build-routing" in sys.argv or "--build-local" in sys.argv:
         try:
-            # Full rebuild: natural trail master first, then the sparse offline
-            # connector production graph.
-            build_master_trail_graph()
-            build_master_routing_graph(rebuild_trails=False)
+            # V15: all aliases use the already-cropped phoenix-tiff.osm.pbf.
+            # No Overpass/API calls are made. The command rebuilds both the
+            # natural-trail master and final sparse routing graph in one pass.
+            build_master_routing_graph(rebuild_trails=True)
         except Exception as exc:
-            print(f"MASTER/ROUTING BUILD FAILED: {exc}", file=sys.stderr)
-            raise SystemExit(1)
-        raise SystemExit(0)
-
-    if "--build-routing" in sys.argv:
-        try:
-            # Fast path when master_trails.graphml already exists.
-            build_master_routing_graph(rebuild_trails=False)
-        except Exception as exc:
-            print(f"ROUTING BUILD FAILED: {exc}", file=sys.stderr)
+            print(f"LOCAL ROUTING BUILD FAILED: {exc}", file=sys.stderr)
             raise SystemExit(1)
         raise SystemExit(0)
 
     print(
-        "This file is the FastAPI app. Start it with uvicorn. To build only the "
-        "V14 sparse offline routing graph from an existing master_trails.graphml, "
-        "run: python main.py --build-routing. For a full rebuild, run: "
-        "python main.py --build-master"
+        "This file is the FastAPI app. Start it with uvicorn. To build the "
+        "fully offline routing graph from phoenix-tiff.osm.pbf, run: "
+        "python main.py --build-routing"
     )
