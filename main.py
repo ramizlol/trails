@@ -60,7 +60,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-09-v9-selective-connectors"
+APP_VERSION = "2026-08-09-v10-fast-multi-route"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
 TRAIL_HIGHWAYS = {"path", "track", "steps"}
@@ -69,6 +69,11 @@ CONNECTOR_HIGHWAYS = {"footway", "pedestrian", "cycleway", "bridleway", "residen
 CONNECTOR_PATH_COST_MULTIPLIER = 2.5
 CONNECTOR_FINAL_SCORE_WEIGHT = 120.0
 CONNECTOR_CHEAP_SCORE_WEIGHT = 90.0
+
+# V10 returns several materially different successful candidates from the same
+# search instead of throwing away every route except the winner.
+MAX_ROUTE_OPTIONS = 5
+MAX_ROUTE_SHARED_FRACTION = 0.80
 
 # V9 keeps the TIFF-wide master graph trail-only. For long routes it downloads
 # only a few narrow walkable-road corridors needed to bridge nearby disconnected
@@ -148,7 +153,7 @@ def get_route_profile(target_distance_miles: float):
             "anchor_counts": [2, 3, 3, 3],
             "min_anchor_distance_m": 150,
             "min_anchor_separation_m": 140,
-            "accurate_finalists": 40,
+            "accurate_finalists": 24,
             "candidate_pool_multiplier": 3,
         }
     if target_distance_miles < 15.0:
@@ -159,7 +164,7 @@ def get_route_profile(target_distance_miles: float):
             "anchor_counts": [3, 4, 4, 4],
             "min_anchor_distance_m": 300,
             "min_anchor_separation_m": 250,
-            "accurate_finalists": 50,
+            "accurate_finalists": 24,
             "candidate_pool_multiplier": 3,
         }
     return {
@@ -169,7 +174,7 @@ def get_route_profile(target_distance_miles: float):
         "anchor_counts": [4, 4, 5],
         "min_anchor_distance_m": 400,
         "min_anchor_separation_m": 300,
-        "accurate_finalists": 60,
+        "accurate_finalists": 24,
         "candidate_pool_multiplier": 3,
     }
 
@@ -2234,6 +2239,126 @@ def route_score(G, route_nodes, target_distance_meters, target_gain_meters):
     )
 
 
+def route_unique_edge_lengths(G, route_nodes):
+    """Return unique physical trail/connector edge lengths used by a route."""
+    result = {}
+    for i in range(len(route_nodes) - 1):
+        u = route_nodes[i]
+        v = route_nodes[i + 1]
+        data = get_shortest_edge(G, u, v)
+        if data is None:
+            continue
+        key = undirected_edge_key(u, v)
+        length = float(data.get("length", 0) or 0)
+        if length > 0:
+            result[key] = max(result.get(key, 0.0), length)
+    return result
+
+
+def route_shared_fraction(G, route_a, route_b):
+    """
+    Fraction of the smaller route's unique physical-edge distance shared with
+    the other route. A value of 1 means essentially the same physical route.
+    """
+    a = route_unique_edge_lengths(G, route_a)
+    b = route_unique_edge_lengths(G, route_b)
+    if not a or not b:
+        return 1.0
+
+    total_a = sum(a.values())
+    total_b = sum(b.values())
+    denominator = min(total_a, total_b)
+    if denominator <= 0:
+        return 1.0
+
+    shared = 0.0
+    for key in set(a).intersection(b):
+        shared += min(a[key], b[key])
+    return shared / denominator
+
+
+def select_diverse_accurate_candidates(
+    G,
+    scored_candidates,
+    max_routes=MAX_ROUTE_OPTIONS,
+    max_shared_fraction=MAX_ROUTE_SHARED_FRACTION,
+):
+    """
+    Pick the best accurately scored routes while rejecting near-duplicates.
+    scored_candidates contains (score, route_nodes, metrics).
+    """
+    ordered = sorted(scored_candidates, key=lambda item: item[0])
+    selected = []
+
+    for candidate in ordered:
+        _, route_nodes, _ = candidate
+        if any(
+            route_shared_fraction(G, route_nodes, existing[1]) > max_shared_fraction
+            for existing in selected
+        ):
+            continue
+        selected.append(candidate)
+        if len(selected) >= max_routes:
+            break
+
+    return selected
+
+
+def copy_internal_route_options(candidates):
+    """Make non-circular internal copies safe to attach to winning metrics."""
+    packaged = []
+    for score, route_nodes, metrics in candidates:
+        clean_metrics = {
+            key: value
+            for key, value in metrics.items()
+            if key != "_route_options_candidates"
+        }
+        packaged.append({
+            "score": float(score),
+            "route_nodes": list(route_nodes),
+            "metrics": clean_metrics,
+        })
+    return packaged
+
+
+def build_route_option_payload(
+    G,
+    route_nodes,
+    metrics,
+    request,
+    option_index,
+):
+    coords = metrics.get("route_coordinates") or route_coordinates(G, route_nodes)
+    route_distance_miles = metrics["total_distance_meters"] / METERS_PER_MILE
+    actual_gain_ft = metrics["actual_gain_meters"] * FEET_PER_METER
+    actual_descent_ft = metrics.get("actual_descent_meters", 0.0) * FEET_PER_METER
+    repeated_distance_miles = metrics["repeated_distance_meters"] / METERS_PER_MILE
+
+    return {
+        "index": int(option_index),
+        "name": f"Route {int(option_index) + 1}",
+        "actual_distance_miles": round(route_distance_miles, 2),
+        "distance_error_miles": round(abs(route_distance_miles - request.target_distance_miles), 2),
+        "actual_gain_ft": round(actual_gain_ft),
+        "actual_descent_ft": round(actual_descent_ft),
+        "elevation_error_ft": round(abs(actual_gain_ft - request.target_gain_ft)),
+        "route": coords,
+        "gpx_export_points": build_gpx_export_points(coords),
+        "route_nodes": len(route_nodes),
+        "route_geometry_points": len(coords),
+        "repeated_edges": metrics["repeated_edges"],
+        "repeated_distance_miles": round(repeated_distance_miles, 2),
+        "repeated_nodes": metrics["repeated_nodes"],
+        "immediate_reversals": metrics["immediate_reversals"],
+        "connector_distance_miles": round(metrics.get("connector_distance_meters", 0.0) / METERS_PER_MILE, 2),
+        "trail_percent": round(metrics.get("trail_fraction", 1.0) * 100.0, 1),
+        "route_score": round(metrics["score"], 2),
+        "partial_edge_used": bool(metrics.get("partial_edge_used", False)),
+        "partial_added_distance_miles": round(metrics.get("partial_added_distance_meters", 0.0) / METERS_PER_MILE, 3),
+        "partial_outward_distance_meters": round(metrics.get("partial_outward_distance_meters", 0.0), 1),
+    }
+
+
 # ============================================================
 # PARTIAL-EDGE OUT-AND-BACK TUNING
 # ============================================================
@@ -2752,7 +2877,7 @@ def beam_search_short_loop(
         )
 
     best_any = None
-    best_acceptable = None
+    acceptable_candidates = []
     for score, route_nodes, metrics in accurately_scored:
         distance_error_miles = metrics["distance_error_meters"] / METERS_PER_MILE
         gain_error_ft = metrics["gain_error_meters"] * FEET_PER_METER
@@ -2763,11 +2888,16 @@ def beam_search_short_loop(
 
         if best_any is None or score < best_any[0]:
             best_any = (score, route_nodes, metrics)
-        if acceptable and (best_acceptable is None or score < best_acceptable[0]):
-            best_acceptable = (score, route_nodes, metrics)
+        if acceptable:
+            acceptable_candidates.append((score, route_nodes, metrics))
 
-    if best_acceptable is not None:
-        _, route_nodes, metrics = best_acceptable
+    if acceptable_candidates:
+        diverse = select_diverse_accurate_candidates(G, acceptable_candidates)
+        if not diverse:
+            diverse = [min(acceptable_candidates, key=lambda item: item[0])]
+        _, route_nodes, metrics = diverse[0]
+        metrics = dict(metrics)
+        metrics["_route_options_candidates"] = copy_internal_route_options(diverse)
         return route_nodes, metrics, last_depth, states_expanded
 
     _, best_route, best_metrics = best_any
@@ -3139,13 +3269,10 @@ def generate_waypoint_loop(
             if len(finalists) >= accurate_finalists:
                 break
 
-    best_route = None
-    best_metrics = None
-    best_score = float("inf")
-
     best_any_route = None
     best_any_metrics = None
     best_any_score = float("inf")
+    acceptable_candidates = []
 
     accurately_scored = 0
 
@@ -3183,13 +3310,16 @@ def generate_waypoint_loop(
             distance_error_miles <= limits["distance_error_limit_miles"]
             and gain_error_ft <= limits["gain_error_limit_ft"]
         ):
-            if score < best_score:
-                best_score = score
-                best_route = route
-                best_metrics = metrics
+            acceptable_candidates.append((score, route, metrics))
 
-    if best_route is not None:
+    if acceptable_candidates:
+        diverse = select_diverse_accurate_candidates(G, acceptable_candidates)
+        if not diverse:
+            diverse = [min(acceptable_candidates, key=lambda item: item[0])]
+        _, best_route, best_metrics = diverse[0]
+        best_metrics = dict(best_metrics)
         best_metrics["waypoint_accurate_finalists"] = accurately_scored
+        best_metrics["_route_options_candidates"] = copy_internal_route_options(diverse)
         return (
             best_route,
             best_metrics,
@@ -4346,6 +4476,30 @@ def generate_route(request: RouteRequest):
 
         coords = metrics.get("route_coordinates") or route_coordinates(G, route_nodes)
 
+        internal_options = metrics.get("_route_options_candidates") or [
+            {
+                "score": float(metrics.get("score", 0.0)),
+                "route_nodes": list(route_nodes),
+                "metrics": {
+                    key: value
+                    for key, value in metrics.items()
+                    if key != "_route_options_candidates"
+                },
+            }
+        ]
+
+        route_options = []
+        for option_index, option in enumerate(internal_options[:MAX_ROUTE_OPTIONS]):
+            route_options.append(
+                build_route_option_payload(
+                    G,
+                    option["route_nodes"],
+                    option["metrics"],
+                    request,
+                    option_index,
+                )
+            )
+
         # Build the no-elevation COROS GPX track only after the winning route
         # has been selected. This is geometry-only and performs no extra DEM
         # raster sampling.
@@ -4364,6 +4518,9 @@ def generate_route(request: RouteRequest):
             "route_profile": profile["name"],
             "route": coords,
             "gpx_export_points": gpx_export_points,
+            "route_options": route_options,
+            "route_options_count": len(route_options),
+            "route_option_max_shared_fraction": MAX_ROUTE_SHARED_FRACTION,
             "route_nodes": len(route_nodes),
             "route_geometry_points": len(coords),
             "repeated_edges": metrics["repeated_edges"],
@@ -4551,6 +4708,32 @@ button:disabled {
     color: #666;
 }
 
+.route-choice-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 10px 0 12px 0;
+}
+
+.route-choice {
+    background: #f3f4f6;
+    color: #111;
+    border: 1px solid #bbb;
+    margin: 0;
+    padding: 8px 10px;
+    font-size: 13px;
+}
+
+.route-choice.selected {
+    background: #b91c1c;
+    color: white;
+    border-color: #991b1b;
+}
+
+#selectedRouteDetails {
+    margin-top: 8px;
+}
+
 @media (max-width: 700px) {
     input[type="number"] {
         width: 145px;
@@ -4569,7 +4752,7 @@ button:disabled {
 <div id="controls">
 
 <h2>Trail Running Creator</h2>
-<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-v9-selective-connectors</div>
+<div style="font-size:12px;color:#666;margin-bottom:10px;">Version: 2026-08-09-v10-fast-multi-route</div>
 
 <div class="input-row">
     <div class="input-group">
@@ -4659,6 +4842,8 @@ L.tileLayer(
 ).addTo(map);
 
 let routeLine = null;
+let routeOptionLines = [];
+let selectedRouteOptionIndex = 0;
 let gpxLine = null;
 let networkLayer = L.layerGroup();
 let lastGeneratedRoute = null;
@@ -4732,25 +4917,131 @@ function triggerTextDownload(filename, contents, mimeType) {
 }
 
 
-function downloadGeneratedGpx() {
+function getSelectedRouteOption() {
     if (!lastGeneratedRoute) {
+        return null;
+    }
+    const options = lastGeneratedRoute.route_options || [];
+    if (options.length > 0) {
+        return options[Math.max(0, Math.min(selectedRouteOptionIndex, options.length - 1))];
+    }
+    return lastGeneratedRoute;
+}
+
+
+function downloadGeneratedGpx() {
+    const selected = getSelectedRouteOption();
+    if (!selected) {
         return;
     }
 
-    const points = lastGeneratedRoute.gpx_export_points;
+    const points = selected.gpx_export_points;
 
     if (!points || points.length < 2) {
-        alert("The generated route does not contain enough points to export.");
+        alert("The selected route does not contain enough points to export.");
         return;
     }
 
-    const distance = Number(lastGeneratedRoute.actual_distance_miles).toFixed(2);
-    const gain = Math.round(Number(lastGeneratedRoute.actual_gain_ft));
-    const routeName = `Trail Route ${distance} mi - COROS`;
-    const filename = `trail-route-${distance}mi-${gain}ft-coros.gpx`;
+    const distance = Number(selected.actual_distance_miles).toFixed(2);
+    const gain = Math.round(Number(selected.actual_gain_ft));
+    const routeNumber = Number(selected.index ?? selectedRouteOptionIndex) + 1;
+    const routeName = `Trail Route ${routeNumber} - ${distance} mi - COROS`;
+    const filename = `trail-route-${routeNumber}-${distance}mi-${gain}ft-coros.gpx`;
     const xml = buildGpxXml(points, routeName);
 
     triggerTextDownload(filename, xml, "application/gpx+xml;charset=utf-8");
+}
+
+
+function clearGeneratedRouteLines() {
+    for (const line of routeOptionLines) {
+        if (map.hasLayer(line)) {
+            map.removeLayer(line);
+        }
+    }
+    routeOptionLines = [];
+
+    if (routeLine && map.hasLayer(routeLine)) {
+        map.removeLayer(routeLine);
+    }
+    routeLine = null;
+}
+
+
+function renderSelectedRouteDetails(option) {
+    const details = document.getElementById("selectedRouteDetails");
+    if (!details || !option) {
+        return;
+    }
+
+    details.innerHTML =
+        "<b>Selected:</b> " + option.name + "<br>" +
+        "<b>Actual distance:</b> " + option.actual_distance_miles + " mi " +
+        "(error " + option.distance_error_miles + " mi)<br>" +
+        "<b>Elevation gain:</b> " + option.actual_gain_ft + " ft " +
+        "(error " + option.elevation_error_ft + " ft)<br>" +
+        "<b>Descent:</b> " + option.actual_descent_ft + " ft<br>" +
+        "<b>Trail:</b> " + option.trail_percent + "% · " +
+        "<b>Connector:</b> " + option.connector_distance_miles + " mi<br>" +
+        "<b>Repeated trail:</b> " + option.repeated_distance_miles + " mi · " +
+        "<b>Score:</b> " + option.route_score + "<br>" +
+        "<b>Partial-edge tuning:</b> " + (option.partial_edge_used ? "YES" : "NO");
+}
+
+
+function selectRouteOption(index, fitMap = true) {
+    if (!lastGeneratedRoute || !lastGeneratedRoute.route_options) {
+        return;
+    }
+
+    const options = lastGeneratedRoute.route_options;
+    if (index < 0 || index >= options.length) {
+        return;
+    }
+
+    selectedRouteOptionIndex = index;
+
+    routeOptionLines.forEach((line, lineIndex) => {
+        if (lineIndex === index) {
+            line.setStyle({weight: 7, opacity: 0.96, color: "#d60000"});
+            line.bringToFront();
+            routeLine = line;
+        } else {
+            line.setStyle({weight: 4, opacity: 0.30, color: "#4455aa"});
+        }
+    });
+
+    document.querySelectorAll(".route-choice").forEach(button => {
+        button.classList.toggle("selected", Number(button.dataset.routeIndex) === index);
+    });
+
+    const selected = options[index];
+    renderSelectedRouteDetails(selected);
+    downloadGpxButton.disabled = false;
+
+    if (fitMap && routeLine) {
+        map.fitBounds(routeLine.getBounds(), {padding: [30, 30]});
+    }
+}
+
+
+function drawRouteOptions(result) {
+    clearGeneratedRouteLines();
+    const options = result.route_options || [];
+
+    for (const option of options) {
+        const coordinates = option.route.map(point => [point.lat, point.lon]);
+        const line = L.polyline(coordinates, {
+            weight: 4,
+            opacity: 0.30,
+            color: "#4455aa"
+        }).addTo(map);
+        routeOptionLines.push(line);
+    }
+
+    if (options.length > 0) {
+        selectRouteOption(0, true);
+    }
 }
 
 function updateNetworkVisibility() {
@@ -4977,12 +5268,14 @@ async function generateRoute() {
     results.innerHTML = '<span class="warning">Loading allowed trails...</span>';
     generateButton.disabled = true;
     lastGeneratedRoute = null;
+    selectedRouteOptionIndex = 0;
     downloadGpxButton.disabled = true;
+    clearGeneratedRouteLines();
 
     try {
         await loadTrailNetwork(data);
 
-        results.innerHTML = '<span class="warning">Searching closed-loop trail combinations...</span>';
+        results.innerHTML = '<span class="warning">Searching route alternatives...</span>';
 
         const response = await fetch(
             "/generate-route",
@@ -4996,99 +5289,89 @@ async function generateRoute() {
         );
 
         const result = await readJsonResponse(response);
+        const options = result.route_options || [];
 
         if (!result.route || result.route.length < 2) {
             throw new Error("Server returned an empty route.");
         }
 
-        if (!result.gpx_export_points || result.gpx_export_points.length < 2) {
-            throw new Error("Server returned a route but no GPX export profile.");
+        if (options.length === 0) {
+            result.route_options = [{
+                index: 0,
+                name: "Route 1",
+                actual_distance_miles: result.actual_distance_miles,
+                distance_error_miles: result.distance_error_miles,
+                actual_gain_ft: result.actual_gain_ft,
+                actual_descent_ft: result.actual_descent_ft,
+                elevation_error_ft: result.elevation_error_ft,
+                route: result.route,
+                gpx_export_points: result.gpx_export_points,
+                repeated_edges: result.repeated_edges,
+                repeated_distance_miles: result.repeated_distance_miles,
+                repeated_nodes: result.repeated_nodes,
+                immediate_reversals: result.immediate_reversals,
+                connector_distance_miles: result.connector_distance_miles,
+                trail_percent: result.trail_percent,
+                route_score: result.route_score,
+                partial_edge_used: result.partial_edge_used,
+                partial_added_distance_miles: result.partial_added_distance_miles,
+                partial_outward_distance_meters: result.partial_outward_distance_meters
+            }];
         }
 
         lastGeneratedRoute = result;
-        downloadGpxButton.disabled = false;
 
-        const coordinates = result.route.map(
-            point => [point.lat, point.lon]
-        );
+        const routeButtons = result.route_options.map((option, index) => {
+            return '<button type="button" class="route-choice" data-route-index="' + index + '">' +
+                option.name + ' · ' + option.actual_distance_miles + ' mi · ' + option.actual_gain_ft + ' ft' +
+                '</button>';
+        }).join("");
 
-        if (routeLine) {
-            map.removeLayer(routeLine);
-        }
-
-        routeLine = L.polyline(
-            coordinates,
-            {
-                weight: 6,
-                opacity: 0.95,
-                color: "#d60000"
-            }
-        ).addTo(map);
-
-        routeLine.bringToFront();
-
-        map.fitBounds(
-            routeLine.getBounds(),
-            {
-                padding: [30, 30]
-            }
-        );
-
-        const expandedText =
-            result.states_expanded === null
-            ? "N/A"
-            : result.states_expanded;
+        const expandedText = result.states_expanded === null ? "N/A" : result.states_expanded;
 
         results.innerHTML =
-            '<span class="success"><b>Route generated</b></span><br>' +
-            "<b>Distance target:</b> " + result.requested_distance_miles + " mi<br>" +
-            "<b>Actual distance:</b> " + result.actual_distance_miles + " mi<br>" +
-            "<b>Distance error:</b> " + result.distance_error_miles + " mi<br><br>" +
-            "<b>Elevation target:</b> " + result.requested_gain_ft + " ft<br>" +
-            "<b>Actual elevation gain:</b> " + result.actual_gain_ft + " ft<br>" +
-            "<b>Actual descent:</b> " + result.actual_descent_ft + " ft<br>" +
-            "<b>Elevation error:</b> " + result.elevation_error_ft + " ft<br>" +
-            "<b>Partial-edge tuning:</b> " + (result.partial_edge_used ? "YES" : "NO") + "<br>" +
-            (result.partial_edge_used
-                ? "<b>Partial distance added:</b> " + result.partial_added_distance_miles + " mi<br>" +
-                  "<b>Turnaround distance from node:</b> " + result.partial_outward_distance_meters + " m<br>"
-                : "") +
-            "<br>" +
-            "<b>Search method:</b> " + result.search_method + "<br>" +
-            "<b>Route profile:</b> " + result.route_profile + "<br>" +
-            "<b>Search depth:</b> " + result.search_steps + "<br>" +
-            "<b>States expanded:</b> " + expandedText + "<br>" +
-            "<b>Start snap distance:</b> " + result.snap_distance_m + " m<br>" +
-            "<b>Exact start inserted:</b> " + (result.exact_start_inserted ? "YES" : "NO") + "<br>" +
-            "<b>Requested point → trail:</b> " + result.start_trail_offset_m + " m<br><br>" +
-            "<b>Repeated trail distance:</b> " + result.repeated_distance_miles + " mi<br>" +
-            "<b>Repeated edges:</b> " + result.repeated_edges + "<br>" +
-            "<b>Repeated junctions:</b> " + result.repeated_nodes + "<br>" +
-            "<b>Immediate reversals:</b> " + result.immediate_reversals + "<br>" +
-            "<b>Route score:</b> " + result.route_score + "<br><br>" +
-            "<b>Graph cached:</b> " + result.graph_from_cache + "<br>" +
-            "<b>Elevation samples:</b> " + result.unique_elevation_samples + "<br>" +
-            "<b>Elevation sample spacing:</b> ~" + result.elevation_sample_spacing_m + " m<br>" +
-            "<b>Elevation smoothing:</b> ~" + result.elevation_smoothing_distance_m + " m (" + result.elevation_smoothing_window_points + " points)<br>" +
-            "<b>Version:</b> " + result.version + "<br>" +
-            "<b>GPX export points:</b> " + result.gpx_export_points.length + "<br>" +
+            '<span class="success"><b>Route search complete</b></span><br>' +
+            '<b>Found route choices:</b> ' + result.route_options.length + '<br>' +
+            '<span class="small">Routes are filtered to avoid near-duplicates; fewer than 5 may be shown when the trail network does not provide 5 materially different matches.</span>' +
+            '<div class="route-choice-grid">' + routeButtons + '</div>' +
+            '<div id="selectedRouteDetails"></div><br>' +
+            '<b>Distance target:</b> ' + result.requested_distance_miles + ' mi<br>' +
+            '<b>Elevation target:</b> ' + result.requested_gain_ft + ' ft<br><br>' +
+            '<b>Search method:</b> ' + result.search_method + '<br>' +
+            '<b>Route profile:</b> ' + result.route_profile + '<br>' +
+            '<b>Search depth:</b> ' + result.search_steps + '<br>' +
+            '<b>States expanded:</b> ' + expandedText + '<br>' +
+            '<b>Start snap distance:</b> ' + result.snap_distance_m + ' m<br>' +
+            '<b>Exact start inserted:</b> ' + (result.exact_start_inserted ? 'YES' : 'NO') + '<br>' +
+            '<b>Requested point → trail:</b> ' + result.start_trail_offset_m + ' m<br><br>' +
+            '<b>Graph cached:</b> ' + result.graph_from_cache + '<br>' +
+            '<b>Elevation samples:</b> ' + result.unique_elevation_samples + '<br>' +
+            '<b>Elevation sample spacing:</b> ~' + result.elevation_sample_spacing_m + ' m<br>' +
+            '<b>Elevation smoothing:</b> ~' + result.elevation_smoothing_distance_m + ' m (' + result.elevation_smoothing_window_points + ' points)<br>' +
             (result.waypoint_accurate_finalists !== null && result.waypoint_accurate_finalists !== undefined
-                ? "<b>Accurate waypoint finalists:</b> " + result.waypoint_accurate_finalists + "<br>"
-                : "") +
-            '<span class="small">Download GPX exports coordinates only for COROS; no elevation is embedded.</span><br>' +
-            '<span class="small">Elevation source used for route selection: ' + result.elevation_source + "</span>";
+                ? '<b>Accurate waypoint finalists:</b> ' + result.waypoint_accurate_finalists + '<br>'
+                : '') +
+            '<b>Version:</b> ' + result.version + '<br>' +
+            '<span class="small">Selected route is red. Other choices are faint blue. Click a route above to switch. Download GPX exports the selected route with coordinates only for COROS.</span>';
+
+        document.querySelectorAll(".route-choice").forEach(button => {
+            button.addEventListener("click", () => {
+                selectRouteOption(Number(button.dataset.routeIndex), true);
+            });
+        });
+
+        drawRouteOptions(result);
 
     } catch (error) {
         results.innerHTML =
             '<span class="error"><b>Error:</b> ' +
             error.message +
-            "</span><br>" +
+            '</span><br>' +
             '<span class="small">The gray lines remain visible. If you have a manual GPX that works, upload it below and click Analyze GPX.</span>';
     } finally {
         generateButton.disabled = false;
     }
 }
-
 
 async function analyzeGpx() {
     const gpxResults = document.getElementById("gpxResults");
