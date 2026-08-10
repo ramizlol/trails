@@ -83,7 +83,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 250000
 
-APP_VERSION = "2026-08-10-v24-elevation-profile"
+APP_VERSION = "2026-08-10-v25-avoid-areas"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -164,6 +164,12 @@ DEFAULT_PASS_THROUGH_TOLERANCE_MILES = 0.25
 MAX_REQUIRED_PASS_POINTS = 5
 PASS_POINT_CANDIDATES_PER_ZONE = 18
 
+# V25 avoid zones. These are hard exclusions: routing edges that touch an
+# avoid circle are removed from the per-request search graph before candidate
+# generation. The saved offline routing graph remains unchanged.
+DEFAULT_AVOID_RADIUS_MILES = 0.25
+MAX_AVOID_AREAS = 5
+
 
 # V15 separates the start workspace from distance/elevation
 # targets. A workspace is keyed only by the requested start coordinate and
@@ -192,6 +198,12 @@ class RequiredPassPoint(BaseModel):
     tolerance_miles: float = DEFAULT_PASS_THROUGH_TOLERANCE_MILES
 
 
+class AvoidArea(BaseModel):
+    lat: float
+    lon: float
+    radius_miles: float = DEFAULT_AVOID_RADIUS_MILES
+
+
 class RouteRequest(BaseModel):
     start_lat: float
     start_lon: float
@@ -200,6 +212,7 @@ class RouteRequest(BaseModel):
     target_distance_miles: float
     target_gain_ft: float
     pass_points: list[RequiredPassPoint] = Field(default_factory=list)
+    avoid_areas: list[AvoidArea] = Field(default_factory=list)
 
 
 class TrailNetworkRequest(BaseModel):
@@ -810,6 +823,182 @@ def insert_exact_routing_point(G, lat, lon):
         "source_edge": [int(u), int(v), str(key)],
         "split_directed_pieces": split_count,
     }
+
+
+# ============================================================
+# AVOID AREAS
+# ============================================================
+
+def _local_xy_meters(lon, lat, origin_lon, origin_lat):
+    """Approximate lon/lat as local planar meters around one avoid-zone center."""
+    lat_scale = 110540.0
+    lon_scale = 111320.0 * max(0.01, math.cos(math.radians(float(origin_lat))))
+    return (
+        (float(lon) - float(origin_lon)) * lon_scale,
+        (float(lat) - float(origin_lat)) * lat_scale,
+    )
+
+
+def _point_to_segment_distance_local_m(cx, cy, ax, ay, bx, by):
+    dx = bx - ax
+    dy = by - ay
+    denom = dx * dx + dy * dy
+    if denom <= 1e-12:
+        return math.hypot(cx - ax, cy - ay)
+    t = ((cx - ax) * dx + (cy - ay) * dy) / denom
+    t = max(0.0, min(1.0, t))
+    px = ax + t * dx
+    py = ay + t * dy
+    return math.hypot(cx - px, cy - py)
+
+
+def _polyline_intersects_avoid_circle(coords, center_lat, center_lon, radius_m):
+    """Return True when any polyline segment touches the avoid circle."""
+    coords = list(coords or [])
+    if not coords:
+        return False
+
+    radius_m = float(radius_m)
+    center_lat = float(center_lat)
+    center_lon = float(center_lon)
+
+    local = [
+        _local_xy_meters(lon, lat, center_lon, center_lat)
+        for lon, lat in coords
+    ]
+
+    r2 = radius_m * radius_m
+    for x, y in local:
+        if x * x + y * y <= r2:
+            return True
+
+    for i in range(1, len(local)):
+        ax, ay = local[i - 1]
+        bx, by = local[i]
+        if _point_to_segment_distance_local_m(0.0, 0.0, ax, ay, bx, by) <= radius_m:
+            return True
+
+    return False
+
+
+def normalize_avoid_areas(avoid_areas):
+    avoid_areas = list(avoid_areas or [])
+    if len(avoid_areas) > MAX_AVOID_AREAS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"A maximum of {MAX_AVOID_AREAS} avoid areas is supported.",
+        )
+
+    normalized = []
+    for index, area in enumerate(avoid_areas):
+        lat = float(area.lat)
+        lon = float(area.lon)
+        radius_miles = float(area.radius_miles)
+        if not math.isfinite(lat) or not math.isfinite(lon):
+            raise HTTPException(status_code=400, detail=f"Avoid area {index + 1} has invalid coordinates.")
+        if radius_miles <= 0 or radius_miles > 10.0:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Avoid area {index + 1} radius must be between 0 and 10 miles.",
+            )
+        normalized.append({
+            "index": index,
+            "lat": lat,
+            "lon": lon,
+            "radius_miles": radius_miles,
+            "radius_m": radius_miles * METERS_PER_MILE,
+        })
+    return normalized
+
+
+def requested_point_inside_avoid_area(lat, lon, normalized_areas):
+    for area in normalized_areas:
+        distance_m = haversine_meters(
+            float(lat), float(lon), area["lat"], area["lon"]
+        )
+        if distance_m <= area["radius_m"]:
+            return area, distance_m
+    return None, None
+
+
+def apply_avoid_areas_to_graph(G, avoid_areas, start_node=None, start_lat=None, start_lon=None, end_lat=None, end_lon=None):
+    """
+    Remove every routing edge that intersects an avoid circle, then retain only
+    the undirected component reachable from the selected start.
+
+    This is intentionally request-local: MASTER_ROUTING_GRAPH and the cached
+    start workspace are never mutated.
+    """
+    normalized = normalize_avoid_areas(avoid_areas)
+    if not normalized:
+        return G, []
+
+    if start_lat is not None and start_lon is not None:
+        area, _ = requested_point_inside_avoid_area(start_lat, start_lon, normalized)
+        if area is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"The start point is inside avoid area {area['index'] + 1}. Move or resize that avoid area.",
+            )
+
+    if end_lat is not None and end_lon is not None:
+        # Same start/end is already covered above; this is mainly for point-to-point routes.
+        area, _ = requested_point_inside_avoid_area(end_lat, end_lon, normalized)
+        if area is not None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"The end point is inside avoid area {area['index'] + 1}. Move or resize that avoid area.",
+            )
+
+    H = G.copy()
+    removals = []
+
+    for u, v, key, data in list(H.edges(keys=True, data=True)):
+        coords = oriented_edge_coords(H, u, v, data)
+        if not coords:
+            coords = [
+                (float(H.nodes[u]["x"]), float(H.nodes[u]["y"])),
+                (float(H.nodes[v]["x"]), float(H.nodes[v]["y"])),
+            ]
+
+        blocked = False
+        for area in normalized:
+            # Cheap endpoint/edge bounding check happens naturally inside the
+            # local segment test; this graph is already radius-limited.
+            if _polyline_intersects_avoid_circle(
+                coords, area["lat"], area["lon"], area["radius_m"]
+            ):
+                blocked = True
+                break
+        if blocked:
+            removals.append((u, v, key))
+
+    for u, v, key in removals:
+        if H.has_edge(u, v, key):
+            H.remove_edge(u, v, key)
+
+    # Remove dead nodes but keep the exact start long enough to provide a useful
+    # blocked-start error below.
+    protected = {start_node} if start_node is not None else set()
+    dead_nodes = [node for node in H.nodes if H.degree(node) == 0 and node not in protected]
+    if dead_nodes:
+        H.remove_nodes_from(dead_nodes)
+
+    if start_node is not None:
+        if start_node not in H or H.degree(start_node) == 0:
+            raise HTTPException(
+                status_code=400,
+                detail="The avoid areas block all usable trails from the selected start.",
+            )
+
+        undirected = H.to_undirected(as_view=True)
+        component = set(nx.node_connected_component(undirected, start_node))
+        H = H.subgraph(component).copy()
+
+    if H.number_of_edges() == 0:
+        raise HTTPException(status_code=400, detail="The avoid areas remove all usable routing trails in this search area.")
+
+    return H, normalized
 
 
 # ============================================================
@@ -6517,6 +6706,23 @@ def generate_route(request: RouteRequest):
                 request.start_lon,
             )
 
+        snapped_start_lat = float(G.nodes[start_node]["y"])
+        snapped_start_lon = float(G.nodes[start_node]["x"])
+        snap_distance_m = float(start_info["routing_offset_m"])
+
+        # V25: avoid areas are hard exclusions. Remove intersecting routing
+        # edges before selecting the end node or inserting required pass-through
+        # points, so every returned candidate automatically respects them.
+        G, resolved_avoid_areas = apply_avoid_areas_to_graph(
+            G,
+            request.avoid_areas,
+            start_node=start_node,
+            start_lat=request.start_lat,
+            start_lon=request.start_lon,
+            end_lat=None if same_point else request.end_lat,
+            end_lon=None if same_point else request.end_lon,
+        )
+
         if same_point:
             end_node = start_node
         else:
@@ -6525,10 +6731,6 @@ def generate_route(request: RouteRequest):
                 X=request.end_lon,
                 Y=request.end_lat,
             )
-
-        snapped_start_lat = float(G.nodes[start_node]["y"])
-        snapped_start_lon = float(G.nodes[start_node]["x"])
-        snap_distance_m = float(start_info["routing_offset_m"])
 
         # V16: pass-through markers are snapped to nearby natural trails and
         # inserted as temporary routing nodes. They do not rebuild the start
@@ -6754,6 +6956,7 @@ def generate_route(request: RouteRequest):
             "partial_outward_distance_meters": round(metrics.get("partial_outward_distance_meters", 0.0), 1),
             "required_pass_points": metrics.get("required_pass_points", []),
             "required_pass_points_count": len(required_pass_points),
+            "avoid_areas_count": len(resolved_avoid_areas),
             "version": APP_VERSION,
             "snapped_start_lat": snapped_start_lat,
             "snapped_start_lon": snapped_start_lon,
@@ -6950,7 +7153,8 @@ button:disabled {
     color: #666;
 }
 
-#pass-point-panel {
+#pass-point-panel,
+#avoid-area-panel {
     border: 1px solid #ddd;
     border-radius: 6px;
     padding: 10px;
@@ -6958,7 +7162,8 @@ button:disabled {
     background: #fafafa;
 }
 
-.pass-point-row {
+.pass-point-row,
+.avoid-area-row {
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
@@ -6968,15 +7173,18 @@ button:disabled {
     border-top: 1px solid #e5e5e5;
 }
 
-.pass-point-row input[type="number"] {
+.pass-point-row input[type="number"],
+.avoid-area-row input[type="number"] {
     width: 150px;
 }
 
-.pass-point-remove {
+.pass-point-remove,
+.avoid-area-remove {
     background: #666;
 }
 
-#passPointStatus {
+#passPointStatus,
+#avoidAreaStatus {
     margin-top: 6px;
 }
 
@@ -7090,6 +7298,14 @@ button:disabled {
     <div id="passPointRows"></div>
 </div>
 
+<div id="avoid-area-panel">
+    <b>Avoid areas</b><br>
+    <span class="small">Add an area, then click the map. Generated routes will not use any routing trail or connector that enters the circle.</span><br>
+    <button id="addAvoidAreaButton" type="button" style="margin-top:8px;">Add avoid area</button>
+    <div id="avoidAreaStatus" class="small"></div>
+    <div id="avoidAreaRows"></div>
+</div>
+
 <button id="generateButton">Generate Trail Route</button>
 <button id="downloadGpxButton" disabled>Download GPX for COROS</button>
 <button id="networkButton">Load / Refresh Start Area</button>
@@ -7144,12 +7360,17 @@ let passPoints = [];
 let passPointLayers = [];
 let passPointPlacementMode = false;
 let nextPassPointId = 1;
+let avoidAreas = [];
+let avoidAreaLayers = [];
+let avoidAreaPlacementMode = false;
+let nextAvoidAreaId = 1;
 
 const generateButton = document.getElementById("generateButton");
 const downloadGpxButton = document.getElementById("downloadGpxButton");
 const networkButton = document.getElementById("networkButton");
 const showNetworkCheckbox = document.getElementById("showNetwork");
 const addPassPointButton = document.getElementById("addPassPointButton");
+const addAvoidAreaButton = document.getElementById("addAvoidAreaButton");
 
 
 generateButton.addEventListener("click", generateRoute);
@@ -7157,7 +7378,8 @@ downloadGpxButton.addEventListener("click", downloadGeneratedGpx);
 networkButton.addEventListener("click", reloadNetwork);
 showNetworkCheckbox.addEventListener("change", updateNetworkVisibility);
 addPassPointButton.addEventListener("click", beginPassPointPlacement);
-map.on("click", handleMapPassPointClick);
+addAvoidAreaButton.addEventListener("click", beginAvoidAreaPlacement);
+map.on("click", handleMapPlacementClick);
 window.addEventListener("resize", () => {
     map.invalidateSize();
     const selected = getSelectedRouteOption();
@@ -7166,6 +7388,8 @@ window.addEventListener("resize", () => {
 
 
 function beginPassPointPlacement() {
+    avoidAreaPlacementMode = false;
+    addAvoidAreaButton.textContent = "Add avoid area";
     if (passPoints.length >= 5) {
         document.getElementById("passPointStatus").textContent = "Maximum of 5 pass-through points reached.";
         return;
@@ -7176,21 +7400,48 @@ function beginPassPointPlacement() {
 }
 
 
-function handleMapPassPointClick(event) {
-    if (!passPointPlacementMode) {
+function handleMapPlacementClick(event) {
+    if (passPointPlacementMode) {
+        passPointPlacementMode = false;
+        addPassPointButton.textContent = "Add pass-through point";
+        passPoints.push({
+            id: nextPassPointId++,
+            lat: Number(event.latlng.lat.toFixed(7)),
+            lon: Number(event.latlng.lng.toFixed(7)),
+            tolerance_miles: 0.25
+        });
+        renderPassPointRows();
+        drawPassPointLayers();
+        document.getElementById("passPointStatus").textContent = "Pass-through point added. Edit its coordinates/tolerance or remove it below.";
         return;
     }
+
+    if (avoidAreaPlacementMode) {
+        avoidAreaPlacementMode = false;
+        addAvoidAreaButton.textContent = "Add avoid area";
+        avoidAreas.push({
+            id: nextAvoidAreaId++,
+            lat: Number(event.latlng.lat.toFixed(7)),
+            lon: Number(event.latlng.lng.toFixed(7)),
+            radius_miles: 0.25
+        });
+        renderAvoidAreaRows();
+        drawAvoidAreaLayers();
+        document.getElementById("avoidAreaStatus").textContent = "Avoid area added. Edit its center/radius or remove it below.";
+    }
+}
+
+
+function beginAvoidAreaPlacement() {
     passPointPlacementMode = false;
     addPassPointButton.textContent = "Add pass-through point";
-    passPoints.push({
-        id: nextPassPointId++,
-        lat: Number(event.latlng.lat.toFixed(7)),
-        lon: Number(event.latlng.lng.toFixed(7)),
-        tolerance_miles: 0.25
-    });
-    renderPassPointRows();
-    drawPassPointLayers();
-    document.getElementById("passPointStatus").textContent = "Pass-through point added. Dragging is not required; edit its coordinates or remove it below.";
+    if (avoidAreas.length >= 5) {
+        document.getElementById("avoidAreaStatus").textContent = "Maximum of 5 avoid areas reached.";
+        return;
+    }
+    avoidAreaPlacementMode = true;
+    addAvoidAreaButton.textContent = "Click map to place area...";
+    document.getElementById("avoidAreaStatus").textContent = "Click the center of the area you want the generated route to avoid.";
 }
 
 
@@ -7267,6 +7518,84 @@ function drawPassPointLayers() {
             fillOpacity: 0.95
         }).bindTooltip(`Required point ${index + 1}`).addTo(map);
         passPointLayers.push(circle, marker);
+    });
+}
+
+
+function renderAvoidAreaRows() {
+    const container = document.getElementById("avoidAreaRows");
+    container.innerHTML = "";
+    avoidAreas.forEach((area, index) => {
+        const row = document.createElement("div");
+        row.className = "avoid-area-row";
+        row.innerHTML = `
+            <div class="input-group">
+                <label>Area ${index + 1} latitude</label>
+                <input type="number" step="any" data-avoid-id="${area.id}" data-field="lat" value="${area.lat}">
+            </div>
+            <div class="input-group">
+                <label>Area ${index + 1} longitude</label>
+                <input type="number" step="any" data-avoid-id="${area.id}" data-field="lon" value="${area.lon}">
+            </div>
+            <div class="input-group">
+                <label>Radius (mi)</label>
+                <input type="number" min="0.01" max="10" step="0.05" data-avoid-id="${area.id}" data-field="radius_miles" value="${area.radius_miles}">
+            </div>
+            <button type="button" class="avoid-area-remove" data-remove-avoid-id="${area.id}">Remove</button>
+        `;
+        container.appendChild(row);
+    });
+
+    container.querySelectorAll("input[data-avoid-id]").forEach(input => {
+        input.addEventListener("change", () => {
+            const id = Number(input.dataset.avoidId);
+            const area = avoidAreas.find(item => item.id === id);
+            if (!area) return;
+            area[input.dataset.field] = Number(input.value);
+            drawAvoidAreaLayers();
+        });
+    });
+
+    container.querySelectorAll("button[data-remove-avoid-id]").forEach(button => {
+        button.addEventListener("click", () => {
+            const id = Number(button.dataset.removeAvoidId);
+            avoidAreas = avoidAreas.filter(item => item.id !== id);
+            renderAvoidAreaRows();
+            drawAvoidAreaLayers();
+        });
+    });
+}
+
+
+function drawAvoidAreaLayers() {
+    for (const layer of avoidAreaLayers) {
+        if (map.hasLayer(layer)) map.removeLayer(layer);
+    }
+    avoidAreaLayers = [];
+
+    avoidAreas.forEach((area, index) => {
+        const lat = Number(area.lat);
+        const lon = Number(area.lon);
+        const radiusMiles = Number(area.radius_miles);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(radiusMiles)) return;
+
+        const circle = L.circle([lat, lon], {
+            radius: Math.max(1, radiusMiles * 1609.344),
+            color: "#c2410c",
+            weight: 2,
+            opacity: 0.9,
+            dashArray: "7 5",
+            fillColor: "#f97316",
+            fillOpacity: 0.12
+        }).addTo(map);
+        const marker = L.circleMarker([lat, lon], {
+            radius: 6,
+            color: "#7c2d12",
+            weight: 2,
+            fillColor: "#f97316",
+            fillOpacity: 0.95
+        }).bindTooltip(`Avoid area ${index + 1}`).addTo(map);
+        avoidAreaLayers.push(circle, marker);
     });
 }
 
@@ -7546,6 +7875,11 @@ function getInputData() {
             lat: Number(point.lat),
             lon: Number(point.lon),
             tolerance_miles: Number(point.tolerance_miles)
+        })),
+        avoid_areas: avoidAreas.map(area => ({
+            lat: Number(area.lat),
+            lon: Number(area.lon),
+            radius_miles: Number(area.radius_miles)
         }))
     };
 }
