@@ -6745,16 +6745,30 @@ def route_map():
     box-sizing: border-box;
 }
 
-body {
+html, body {
     margin: 0;
+    width: 100%;
+    height: 100%;
+}
+
+body {
     font-family: Arial, sans-serif;
     background: #f5f5f5;
+    display: flex;
+    height: 100vh;
+    overflow: hidden;
 }
 
 #controls {
-    padding: 16px;
+    flex: 0 0 20%;
+    width: 20%;
+    max-width: 20%;
+    height: 100vh;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 14px;
     background: white;
-    border-bottom: 1px solid #ccc;
+    border-right: 1px solid #ccc;
 }
 
 h2 {
@@ -6775,6 +6789,8 @@ h3 {
 .input-group {
     display: flex;
     flex-direction: column;
+    flex: 1 1 135px;
+    min-width: 0;
 }
 
 label {
@@ -6784,7 +6800,8 @@ label {
 }
 
 input[type="number"] {
-    width: 170px;
+    width: 100%;
+    min-width: 0;
     padding: 8px;
     border: 1px solid #aaa;
     border-radius: 4px;
@@ -6820,9 +6837,10 @@ button:disabled {
 
 
 #map {
-    height: 80vh;
-    min-height: 650px;
-    width: 100%;
+    flex: 1 1 80%;
+    width: 80%;
+    height: 100vh;
+    min-height: 0;
 }
 
 .error {
@@ -6898,14 +6916,26 @@ button:disabled {
     margin-top: 8px;
 }
 
-@media (max-width: 700px) {
-    input[type="number"] {
-        width: 145px;
+@media (max-width: 900px) {
+    body {
+        display: block;
+        height: auto;
+        overflow: auto;
+    }
+
+    #controls {
+        width: 100%;
+        max-width: none;
+        height: auto;
+        overflow: visible;
+        border-right: none;
+        border-bottom: 1px solid #ccc;
     }
 
     #map {
-        height: 80vh;
-        min-height: 520px;
+        width: 100%;
+        height: 70vh;
+        min-height: 500px;
     }
 }
 </style>
