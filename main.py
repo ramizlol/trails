@@ -82,7 +82,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 # most trail points, so later route scoring can reuse those values instead
 # of reopening/resampling the GeoTIFF for every finalist.
 DEM_POINT_CACHE = {}
-MAX_DEM_POINT_CACHE = 250000
+MAX_DEM_POINT_CACHE = 50000
 
 APP_VERSION = "2026-08-10-v35-direct-green-splice"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
@@ -190,6 +190,14 @@ DEFAULT_ROUTE_DIVERSITY = 50.0
 # Changing distance/gain reuses this workspace and only creates a cheap in-memory
 # radius subgraph for the actual route search.
 MAX_CACHED_WORKSPACES = 1
+
+# The region graph is now large (~44k nodes). Previously the workspace covered
+# the ENTIRE DEM footprint from any start, which meant copying/projecting the
+# whole region graph for every new start point -- fine for the old small
+# single-city build, but a major memory cost now. Cap the workspace to a
+# generous straight-line radius instead. Routes wanting trails farther than
+# this from their start will not find them; raise this if memory allows.
+WORKSPACE_RADIUS_CAP_M = 25.0 * METERS_PER_MILE
 WORKSPACE_CACHE = {}
 WORKSPACE_CACHE_LOCK = threading.Lock()
 
@@ -3673,12 +3681,29 @@ def get_start_workspace(lat, lon, force_rebuild=False):
 
         started = time.perf_counter()
         routing_G, routing_info = get_master_routing_graph()
-        max_radius_m = workspace_max_radius_meters(lat, lon)
+        full_footprint_radius_m = workspace_max_radius_meters(lat, lon)
+        max_radius_m = min(full_footprint_radius_m, WORKSPACE_RADIUS_CAP_M)
+
+        # V36 memory fix: truncate to a bounded radius BEFORE copying/projecting.
+        # insert_exact_routing_point always does a full graph copy of whatever
+        # it is given, so handing it the entire ~44k-node region graph for
+        # every new start point (as V15 did, when the region was tiny) is the
+        # dominant memory cost at this dataset size. Truncating first bounds
+        # both the copy and the projection step to the requested area.
+        if max_radius_m < full_footprint_radius_m:
+            source_G = extract_local_master_subgraph(
+                routing_G,
+                float(lat),
+                float(lon),
+                max_radius_m,
+            )
+        else:
+            source_G = routing_G
 
         # insert_exact_routing_point performs the single required graph copy so
         # the shared production graph remains immutable between users/starts.
         G, start_node, start_info = insert_exact_routing_point(
-            routing_G,
+            source_G,
             float(lat),
             float(lon),
         )
