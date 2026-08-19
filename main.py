@@ -90,7 +90,7 @@ ROUTING_TILE_MANIFEST_LOCK = threading.Lock()
 
 # Keep only a few decompressed tile graphs resident. Pickle files are small,
 # but NetworkX's in-memory representation is much larger than the file itself.
-MAX_ROUTING_TILE_CACHE = 4
+MAX_ROUTING_TILE_CACHE = 2
 ROUTING_TILE_CACHE = OrderedDict()
 ROUTING_TILE_CACHE_LOCK = threading.Lock()
 
@@ -108,7 +108,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 50000
 
-APP_VERSION = "2026-08-19-v37-runtime-routing-tiles"
+APP_VERSION = "2026-08-19-v38-viewport-overlay-low-memory"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -225,11 +225,12 @@ WORKSPACE_RADIUS_CAP_M = 25.0 * METERS_PER_MILE
 WORKSPACE_CACHE = {}
 WORKSPACE_CACHE_LOCK = threading.Lock()
 
-# The gray TIFF-wide trail overlay is serialized once per server process and
-# served as compact, gzip-compressed JSON. The browser fetches it once and keeps
-# it while distance/elevation targets change.
-MASTER_TRAIL_OVERLAY_JSON = None
-MASTER_TRAIL_OVERLAY_LOCK = threading.Lock()
+# V38 gray trail overlay is viewport-scoped. Never serialize the whole regional
+# network into one Python list/JSON string: that can exceed a 512 MB Render
+# instance even though the on-disk routing tiles are compact.
+TRAIL_OVERLAY_MAX_TILES = 12
+TRAIL_OVERLAY_BOUNDS_PAD_DEG = 0.002
+TRAIL_OVERLAY_LOCK = threading.Lock()
 CONNECTOR_FILTER = '["highway"~"path|track|steps|footway|pedestrian|cycleway|bridleway|residential|living_street|service|unclassified|tertiary|secondary|primary|road"]'
 
 
@@ -3031,6 +3032,13 @@ def load_routing_tile(row):
     return G
 
 
+def clear_routing_tile_cache():
+    """Release decompressed tile graphs once a merged workspace owns the data."""
+    with ROUTING_TILE_CACHE_LOCK:
+        ROUTING_TILE_CACHE.clear()
+    gc.collect()
+
+
 def _merge_tile_graph_into(target, tile_G):
     """Merge one tile in-place to avoid nx.compose_all's repeated full copies."""
     if target.number_of_nodes() == 0:
@@ -3103,6 +3111,10 @@ def load_tiled_workspace_source_graph(lat, lon, radius_m):
         float(radius_m),
     )
     del merged
+    # The local workspace now owns the merged/truncated data. Keeping the same
+    # decompressed source tiles in the LRU would duplicate NetworkX objects in
+    # memory on small Render instances.
+    clear_routing_tile_cache()
     gc.collect()
 
     info = tiled_routing_info(manifest, rows, local)
@@ -4126,65 +4138,82 @@ def download_trail_graph(lat, lon, radius_meters):
     )
 
 
-def get_master_trail_overlay_json():
+def _overlay_rows_for_bounds(west, south, east, north):
+    """Select only routing tiles intersecting the browser's current viewport."""
+    manifest = load_routing_tile_manifest()
+    query = (
+        float(west) - TRAIL_OVERLAY_BOUNDS_PAD_DEG,
+        float(south) - TRAIL_OVERLAY_BOUNDS_PAD_DEG,
+        float(east) + TRAIL_OVERLAY_BOUNDS_PAD_DEG,
+        float(north) + TRAIL_OVERLAY_BOUNDS_PAD_DEG,
+    )
+    rows = []
+    for row in manifest.get("tiles", []):
+        if int(row.get("trail_edges", 0) or 0) <= 0:
+            continue
+        bounds = _tile_row_bounds(row)
+        if bounds is not None and _bounds_intersect(query, bounds):
+            rows.append(row)
+
+    # The overlay is visual aid only. At very wide zoom levels, refuse to load
+    # dozens of tiles into one response. The browser will request again once the
+    # user zooms in.
+    too_wide = len(rows) > TRAIL_OVERLAY_MAX_TILES
+    if too_wide:
+        rows = []
+    return manifest, rows, too_wide
+
+
+def get_viewport_trail_overlay_json(west, south, east, north):
     """
-    Serialize all prebuilt natural-trail tiles without ever composing a
-    statewide NetworkX graph. Each tile is loaded and released sequentially.
+    Serialize natural trails for the CURRENT MAP VIEW only.
 
-    This preserves the existing browser contract (/trail-overlay) while keeping
-    peak server memory far below loading master_routing.pkl.
+    Each selected tile is loaded uncached, converted to lightweight coordinate
+    arrays, and immediately released. No statewide segment list or statewide
+    JSON cache is ever constructed.
     """
-    global MASTER_TRAIL_OVERLAY_JSON
+    manifest, rows, too_wide = _overlay_rows_for_bounds(west, south, east, north)
+    segments = []
+    seen = set()
 
-    if MASTER_TRAIL_OVERLAY_JSON is not None:
-        return MASTER_TRAIL_OVERLAY_JSON
+    if not too_wide:
+        with TRAIL_OVERLAY_LOCK:
+            for row in rows:
+                tile_G = _load_routing_tile_uncached(row)
+                try:
+                    for u, v, key, data in tile_G.edges(keys=True, data=True):
+                        if str(data.get("route_class", "trail")) != "trail":
+                            continue
+                        physical = (
+                            min(int(u), int(v)),
+                            max(int(u), int(v)),
+                            round(float(data.get("length", 0) or 0), 1),
+                        )
+                        if physical in seen:
+                            continue
+                        seen.add(physical)
+                        coords = oriented_edge_coords(tile_G, u, v, data)
+                        if len(coords) >= 2:
+                            segments.append([
+                                [float(lat), float(lon)]
+                                for lon, lat in coords
+                            ])
+                finally:
+                    del tile_G
+                    gc.collect()
 
-    with MASTER_TRAIL_OVERLAY_LOCK:
-        if MASTER_TRAIL_OVERLAY_JSON is not None:
-            return MASTER_TRAIL_OVERLAY_JSON
-
-        manifest = load_routing_tile_manifest()
-        segments = []
-        seen = set()
-
-        for row in manifest.get("tiles", []):
-            if int(row.get("trail_edges", 0) or 0) <= 0:
-                continue
-
-            # Do not populate the runtime tile LRU while building the map layer.
-            tile_G = _load_routing_tile_uncached(row)
-            for u, v, key, data in tile_G.edges(keys=True, data=True):
-                if str(data.get("route_class", "trail")) != "trail":
-                    continue
-                physical = (
-                    min(int(u), int(v)),
-                    max(int(u), int(v)),
-                    round(float(data.get("length", 0) or 0), 1),
-                )
-                if physical in seen:
-                    continue
-                seen.add(physical)
-                coords = oriented_edge_coords(tile_G, u, v, data)
-                if len(coords) >= 2:
-                    segments.append([
-                        [float(lat), float(lon)]
-                        for lon, lat in coords
-                    ])
-            del tile_G
-            gc.collect()
-
-        rows = list(manifest.get("tiles") or [])
-        payload = {
-            "allowed_trails": segments,
-            "allowed_trail_segments": len(segments),
-            "master_network_nodes": int(sum(int(r.get("nodes", 0) or 0) for r in rows)),
-            "master_network_edges": int(sum(int(r.get("edges", 0) or 0) for r in rows)),
-            "master_graph_file": os.path.join("routing_tiles", "manifest.json"),
-            "master_tiff": os.path.basename(DEM_PATH),
-            "version": APP_VERSION,
-        }
-        MASTER_TRAIL_OVERLAY_JSON = json.dumps(payload, separators=(",", ":"))
-        return MASTER_TRAIL_OVERLAY_JSON
+    payload = {
+        "allowed_trails": segments,
+        "allowed_trail_segments": len(segments),
+        "selected_tile_count": len(rows),
+        "selected_tile_ids": [str(r.get("id", "")) for r in rows],
+        "viewport_too_wide": bool(too_wide),
+        "max_overlay_tiles": TRAIL_OVERLAY_MAX_TILES,
+        "master_graph_file": os.path.join("routing_tiles", "manifest.json"),
+        "master_tiff": os.path.basename(DEM_PATH),
+        "version": APP_VERSION,
+    }
+    return json.dumps(payload, separators=(",", ":"))
 
 
 # ============================================================
@@ -7188,20 +7217,21 @@ async def analyze_gpx(
 # ============================================================
 
 @app.get("/trail-overlay")
-def trail_overlay():
-    """
-    TIFF-wide natural-trail visualization, independent of route targets.
-
-    The JSON string is created once and GZipMiddleware compresses it in transit.
-    The browser fetches this endpoint once per page session instead of receiving
-    gray trail geometry before every route search.
-    """
+def trail_overlay(
+    west: float = Query(...),
+    south: float = Query(...),
+    east: float = Query(...),
+    north: float = Query(...),
+):
+    """Return only gray trail geometry intersecting the current map viewport."""
+    if not all(math.isfinite(v) for v in (west, south, east, north)):
+        raise HTTPException(status_code=400, detail="Invalid map bounds.")
+    if east <= west or north <= south:
+        raise HTTPException(status_code=400, detail="Invalid map bounds order.")
     return Response(
-        content=get_master_trail_overlay_json(),
+        content=get_viewport_trail_overlay_json(west, south, east, north),
         media_type="application/json",
-        headers={
-            "Cache-Control": "public, max-age=3600",
-        },
+        headers={"Cache-Control": "public, max-age=120"},
     )
 
 
@@ -9185,9 +9215,12 @@ let snappedStartMarker = null;
 let snapLine = null;
 let loadedWorkspaceStartKey = null;
 let lastWorkspaceResult = null;
-let masterTrailOverlayLoaded = false;
 let masterTrailOverlayPromise = null;
+let masterTrailOverlayRequestId = 0;
+let masterTrailOverlayLastKey = "";
+let masterTrailOverlayTimer = null;
 let masterTrailSegments = [];
+const MIN_TRAIL_OVERLAY_ZOOM = 11;
 let startPointPlacementMode = true;
 let passPoints = [];
 let passPointLayers = [];
@@ -11096,26 +11129,67 @@ function getWorkspaceStartKey(data) {
 }
 
 
-async function loadMasterTrailOverlayOnce() {
-    if (masterTrailOverlayLoaded) {
-        return;
+function currentTrailOverlayBounds() {
+    const b = map.getBounds();
+    return {
+        west: b.getWest(),
+        south: b.getSouth(),
+        east: b.getEast(),
+        north: b.getNorth()
+    };
+}
+
+
+function trailOverlayBoundsKey(bounds) {
+    return [bounds.west, bounds.south, bounds.east, bounds.north]
+        .map(value => Number(value).toFixed(4))
+        .join(",") + "@" + map.getZoom();
+}
+
+
+async function loadMasterTrailOverlayOnce(force = false) {
+    // Kept under the old function name so the rest of the UI needs almost no
+    // changes. V38 now loads only the current viewport, not the whole region.
+    if (map.getZoom() < MIN_TRAIL_OVERLAY_ZOOM) {
+        networkLayer.clearLayers();
+        masterTrailSegments = [];
+        masterTrailOverlayLastKey = "";
+        return null;
     }
 
-    if (masterTrailOverlayPromise) {
-        return masterTrailOverlayPromise;
+    const bounds = currentTrailOverlayBounds();
+    const key = trailOverlayBoundsKey(bounds);
+    if (!force && key === masterTrailOverlayLastKey) {
+        return null;
     }
+
+    const requestId = ++masterTrailOverlayRequestId;
+    const params = new URLSearchParams({
+        west: String(bounds.west),
+        south: String(bounds.south),
+        east: String(bounds.east),
+        north: String(bounds.north)
+    });
 
     masterTrailOverlayPromise = (async () => {
-        const response = await fetch("/trail-overlay");
+        const response = await fetch("/trail-overlay?" + params.toString());
         const result = await readJsonResponse(response);
 
-        networkLayer.clearLayers();
+        // Ignore a stale response if the user panned/zoomed while it was loading.
+        if (requestId !== masterTrailOverlayRequestId) {
+            return result;
+        }
 
+        networkLayer.clearLayers();
         masterTrailSegments = result.allowed_trails || [];
 
+        if (result.viewport_too_wide) {
+            masterTrailOverlayLastKey = key;
+            updateNetworkVisibility();
+            return result;
+        }
+
         if (masterTrailSegments.length > 0) {
-            // One canvas-backed multi-polyline is much cheaper for Leaflet than
-            // creating thousands of individual line-layer objects.
             L.polyline(
                 masterTrailSegments,
                 {
@@ -11127,7 +11201,7 @@ async function loadMasterTrailOverlayOnce() {
             ).addTo(networkLayer);
         }
 
-        masterTrailOverlayLoaded = true;
+        masterTrailOverlayLastKey = key;
         updateNetworkVisibility();
         return result;
     })();
@@ -11135,16 +11209,36 @@ async function loadMasterTrailOverlayOnce() {
     try {
         return await masterTrailOverlayPromise;
     } finally {
-        masterTrailOverlayPromise = null;
+        if (requestId === masterTrailOverlayRequestId) {
+            masterTrailOverlayPromise = null;
+        }
     }
 }
+
+
+function scheduleTrailOverlayRefresh(delayMs = 180) {
+    if (masterTrailOverlayTimer) {
+        clearTimeout(masterTrailOverlayTimer);
+    }
+    masterTrailOverlayTimer = setTimeout(() => {
+        masterTrailOverlayTimer = null;
+        loadMasterTrailOverlayOnce(true).catch(error => {
+            console.warn("Trail overlay load failed:", error);
+        });
+    }, delayMs);
+}
+
+
+map.on("moveend zoomend", () => {
+    scheduleTrailOverlayRefresh();
+});
 
 
 async function loadTrailNetwork(data) {
     const startKey = getWorkspaceStartKey(data);
 
-    // Start the gray-overlay fetch in parallel. It is visualization only and
-    // must never block routing-area preparation or route search.
+    // Refresh the current viewport overlay in parallel. It is visualization only
+    // and must never block routing-area preparation or route search.
     loadMasterTrailOverlayOnce().catch(error => {
         console.warn("Trail overlay load failed:", error);
     });
@@ -11523,8 +11617,8 @@ async function findMoreRoutes() {
     }
 }
 
-// Load only the TIFF-wide gray overlay on page load. Do not spend time
-// preparing the old default start: the first normal map click chooses the
+// Load only gray trails visible in the initial map viewport. Do not spend
+// time preparing the old default start: the first normal map click chooses the
 // user's start point, then Generate/Load prepares that start workspace.
 updateQualityFilterUi();
 renderRouteEditRows();
