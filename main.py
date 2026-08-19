@@ -36,8 +36,8 @@ app.add_middleware(GZipMiddleware, minimum_size=1000)
 # ============================================================
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DEM_PATH = os.path.join(BASE_DIR, "output_USGS10m.tif")
-LOCAL_OSM_PBF_PATH = os.path.join(BASE_DIR, "phoenix-tiff.osm.pbf")
+DEM_PATH = os.path.join(BASE_DIR, "output_hh.tif")
+LOCAL_OSM_PBF_PATH = os.path.join(BASE_DIR, "central-az.osm.pbf")
 
 METERS_PER_MILE = 1609.344
 FEET_PER_METER = 3.28084
@@ -2120,9 +2120,9 @@ def _run_osmium_command(args):
     return elapsed
 
 
-def load_local_highway_graph_from_pbf():
+def load_local_highway_graph_from_pbf(pbf_path=None):
     """
-    Read the 9-ish MB TIFF-local OSM PBF without Overpass.
+    Read one local OSM PBF (a full region, or one tile of it) without Overpass.
 
     osmium-tool first filters to highway ways (while retaining referenced nodes),
     converts that temporary extract to OSM XML, and OSMnx builds the graph from
@@ -2130,15 +2130,17 @@ def load_local_highway_graph_from_pbf():
     """
     configure_osmnx_trail_tags()
 
-    if not os.path.exists(LOCAL_OSM_PBF_PATH):
+    pbf_path = pbf_path or LOCAL_OSM_PBF_PATH
+
+    if not os.path.exists(pbf_path):
         raise RuntimeError(
-            f"Missing {os.path.basename(LOCAL_OSM_PBF_PATH)} beside main.py. "
-            "Commit the cropped Phoenix TIFF PBF to the repo first."
+            f"Missing {os.path.basename(pbf_path)} beside main.py. "
+            "Commit the cropped local-area OSM PBF to the repo first."
         )
 
-    pbf_mb = os.path.getsize(LOCAL_OSM_PBF_PATH) / (1024 * 1024)
+    pbf_mb = os.path.getsize(pbf_path) / (1024 * 1024)
     print(
-        f"Loading local OSM source: {os.path.basename(LOCAL_OSM_PBF_PATH)} "
+        f"Loading local OSM source: {os.path.basename(pbf_path)} "
         f"({pbf_mb:.2f} MB)"
     )
 
@@ -2150,7 +2152,7 @@ def load_local_highway_graph_from_pbf():
             "tags-filter",
             "-O",
             "-o", highways_pbf,
-            LOCAL_OSM_PBF_PATH,
+            pbf_path,
             "w/highway",
         ])
         print(f"  osmium highway filter: {elapsed_filter:.1f}s")
@@ -2179,6 +2181,43 @@ def load_local_highway_graph_from_pbf():
         )
 
     return G
+
+
+def load_local_highway_graph_tiled(tile_paths):
+    """
+    Memory-bounded alternative to load_local_highway_graph_from_pbf(): runs the
+    same osmium->XML->osmnx pipeline once per tile (so peak memory is bounded
+    by the single largest tile, not the whole region), immediately narrows each
+    tile down to just trail+connector-relevant edges (discarding everything
+    else -- motorway, aeroway, etc. -- right away), frees the tile's raw graph,
+    then unions the small narrowed tiles together.
+    """
+    import gc
+
+    kept_parts = []
+    for i, path in enumerate(tile_paths, start=1):
+        print(f"--- Tile {i}/{len(tile_paths)}: {os.path.basename(path)} ---")
+        raw_tile_G = load_local_highway_graph_from_pbf(pbf_path=path)
+
+        trail_part = _classified_subgraph_from_local_osm(raw_tile_G, "trail")
+        connector_part = _classified_subgraph_from_local_osm(raw_tile_G, "connector")
+
+        del raw_tile_G
+        gc.collect()
+
+        print(
+            f"  kept: {trail_part.number_of_edges()} trail edges, "
+            f"{connector_part.number_of_edges()} connector edges"
+        )
+        kept_parts.append(trail_part)
+        kept_parts.append(connector_part)
+
+    merged = nx.compose_all(kept_parts)
+    print(
+        f"Merged all tiles: {merged.number_of_nodes()} nodes / "
+        f"{merged.number_of_edges()} directed edges"
+    )
+    return merged
 
 
 def _classified_subgraph_from_local_osm(source_G, route_class):
@@ -2600,21 +2639,24 @@ def _offline_connector_candidate_pairs(G, components, component_lengths):
     return rows
 
 
-def build_master_routing_graph(rebuild_trails=True):
+def build_master_routing_graph(rebuild_trails=True, source_G=None):
     """
     ONE-TIME V15 LOCAL ROUTING BUILD.
 
-    Everything comes from phoenix-tiff.osm.pbf. The full local walkable graph is
-    held only during this build. We save natural trails plus a sparse set of
-    useful connector paths to master_routing.graphml. No Overpass requests are
-    made during the build or during normal FastAPI use.
+    Everything comes from the local OSM PBF (either the single-file path, or a
+    pre-merged tiled graph passed in via source_G). The full local walkable
+    graph is held only during this build. We save natural trails plus a sparse
+    set of useful connector paths to master_routing.graphml. No Overpass
+    requests are made during the build or during normal FastAPI use.
     """
     build_started = time.perf_counter()
     configure_osmnx_trail_tags()
 
     # Parse the local PBF once, then derive both trails and walkable connectors
     # from the same node/way source so topology and OSM IDs stay consistent.
-    source_G = load_local_highway_graph_from_pbf()
+    # If a pre-built source_G was passed in (e.g. from the tiled loader), reuse
+    # it instead of loading LOCAL_OSM_PBF_PATH again.
+    source_G = source_G or load_local_highway_graph_from_pbf()
 
     if rebuild_trails:
         trail_G = build_master_trail_graph(local_source_graph=source_G)
