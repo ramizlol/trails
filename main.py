@@ -116,7 +116,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 50000
 
-APP_VERSION = "2026-08-19-v42-instant-direct-splice"
+APP_VERSION = "2026-08-19-v43-segment-rejoin-detection"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -10397,6 +10397,113 @@ function undoReplacementTrailSegment() {
 }
 
 
+function closestPointsBetweenEditSegments(a0, a1, b0, b1) {
+    // Work in Leaflet layer pixels so both polylines use the same local planar
+    // coordinate system. We convert the winning points back to lat/lon and use
+    // map.distance() for the final meter distance.
+    const A0 = map.latLngToLayerPoint(L.latLng(Number(a0.lat), Number(a0.lon)));
+    const A1 = map.latLngToLayerPoint(L.latLng(Number(a1.lat), Number(a1.lon)));
+    const B0 = map.latLngToLayerPoint(L.latLng(Number(b0.lat), Number(b0.lon)));
+    const B1 = map.latLngToLayerPoint(L.latLng(Number(b1.lat), Number(b1.lon)));
+
+    const ux = A1.x - A0.x;
+    const uy = A1.y - A0.y;
+    const vx = B1.x - B0.x;
+    const vy = B1.y - B0.y;
+    const wx = A0.x - B0.x;
+    const wy = A0.y - B0.y;
+
+    const a = ux * ux + uy * uy;
+    const b = ux * vx + uy * vy;
+    const c = vx * vx + vy * vy;
+    const d = ux * wx + uy * wy;
+    const e = vx * wx + vy * wy;
+    const EPS = 1e-12;
+
+    let sN;
+    let sD = a * c - b * b;
+    let tN;
+    let tD = sD;
+
+    if (a <= EPS && c <= EPS) {
+        sN = 0;
+        sD = 1;
+        tN = 0;
+        tD = 1;
+    } else if (a <= EPS) {
+        sN = 0;
+        sD = 1;
+        tN = e;
+        tD = c;
+    } else if (c <= EPS) {
+        tN = 0;
+        tD = 1;
+        sN = -d;
+        sD = a;
+    } else {
+        if (sD < EPS) {
+            sN = 0;
+            sD = 1;
+            tN = e;
+            tD = c;
+        } else {
+            sN = b * e - c * d;
+            tN = a * e - b * d;
+
+            if (sN < 0) {
+                sN = 0;
+                tN = e;
+                tD = c;
+            } else if (sN > sD) {
+                sN = sD;
+                tN = e + b;
+                tD = c;
+            }
+        }
+
+        if (tN < 0) {
+            tN = 0;
+            if (-d < 0) {
+                sN = 0;
+                sD = 1;
+            } else if (-d > a) {
+                sN = sD;
+            } else {
+                sN = -d;
+                sD = a;
+            }
+        } else if (tN > tD) {
+            tN = tD;
+            if ((-d + b) < 0) {
+                sN = 0;
+                sD = 1;
+            } else if ((-d + b) > a) {
+                sN = sD;
+            } else {
+                sN = -d + b;
+                sD = a;
+            }
+        }
+    }
+
+    const s = Math.max(0, Math.min(1, Math.abs(sN) < EPS ? 0 : sN / sD));
+    const t = Math.max(0, Math.min(1, Math.abs(tN) < EPS ? 0 : tN / tD));
+
+    const ap = L.point(A0.x + s * ux, A0.y + s * uy);
+    const bp = L.point(B0.x + t * vx, B0.y + t * vy);
+    const aLL = map.layerPointToLatLng(ap);
+    const bLL = map.layerPointToLatLng(bp);
+
+    return {
+        routeT: s,
+        greenT: t,
+        routePoint: {lat: Number(aLL.lat), lon: Number(aLL.lng)},
+        greenPoint: {lat: Number(bLL.lat), lon: Number(bLL.lng)},
+        distanceMeters: map.distance(aLL, bLL)
+    };
+}
+
+
 function inferReplacementRejoinIndex() {
     if (
         replacementBaseRouteIndex === null ||
@@ -10406,41 +10513,83 @@ function inferReplacementRejoinIndex() {
     ) return null;
 
     const option = lastGeneratedRoute.route_options?.[replacementBaseRouteIndex];
-    if (!option || !option.route || !option.route.length) return null;
-    const lastSelected = replacementTrailSegments[replacementTrailSegments.length - 1];
-    const geometry = (lastSelected.geometry && lastSelected.geometry.length)
-        ? lastSelected.geometry
-        : [[lastSelected.lat, lastSelected.lon]];
+    if (!option || !option.route || option.route.length < 2) return null;
 
-    let bestIndex = null;
-    let bestDistance = Infinity;
-    const n = option.route.length;
-    // Exclude a useful neighborhood around the start cut, including the
-    // duplicated beginning/end of a closed loop, so the automatic rejoin does
-    // not snap straight back to where selection began.
+    const lastSelected =
+        replacementTrailSegments[replacementTrailSegments.length - 1];
+
+    const geometry = (lastSelected.geometry || [])
+        .map(p => ({lat: Number(p[0]), lon: Number(p[1])}))
+        .filter(p => Number.isFinite(p.lat) && Number.isFinite(p.lon));
+
+    if (geometry.length < 2) return null;
+
+    const route = option.route.map(p => ({
+        lat: Number(p.lat),
+        lon: Number(p.lon)
+    }));
+
+    const n = route.length;
     const minIndexGap = Math.max(4, Math.round(n * 0.006));
+    const MAX_REJOIN_DISTANCE_M = 18;
 
-    for (let i = 0; i < n; i++) {
-        const directGap = Math.abs(i - replacementCutStartIndex);
-        const cyclicGap = Math.min(directGap, Math.max(0, n - 1 - directGap));
+    let best = null;
+
+    // Compare EVERY segment of the final green trail edge with EVERY eligible
+    // segment of the red route. This fixes the old bug where only stored
+    // vertices were compared and a mid-edge intersection could be missed.
+    for (let ri = 0; ri < route.length - 1; ri++) {
+        const routeMidIndex = ri + 0.5;
+        const directGap = Math.abs(routeMidIndex - replacementCutStartIndex);
+        const cyclicGap = Math.min(
+            directGap,
+            Math.max(0, n - 1 - directGap)
+        );
         if (cyclicGap < minIndexGap) continue;
-        const rp = L.latLng(Number(option.route[i].lat), Number(option.route[i].lon));
-        for (const gp of geometry) {
-            const d = map.distance(rp, L.latLng(Number(gp[0]), Number(gp[1])));
-            if (d < bestDistance) {
-                bestDistance = d;
-                bestIndex = i;
+
+        for (let gi = 0; gi < geometry.length - 1; gi++) {
+            const closest = closestPointsBetweenEditSegments(
+                route[ri],
+                route[ri + 1],
+                geometry[gi],
+                geometry[gi + 1]
+            );
+
+            if (closest.distanceMeters > MAX_REJOIN_DISTANCE_M) continue;
+
+            const greenPosition = gi + closest.greenT;
+            const routePosition = ri + closest.routeT;
+
+            // Prefer the FIRST valid reconnection encountered along the final
+            // selected green edge. Distance breaks near-ties.
+            const candidate = {
+                index: closest.routeT < 0.5 ? ri : ri + 1,
+                routeSegmentIndex: ri,
+                routeT: closest.routeT,
+                routePosition,
+                greenSegmentIndex: gi,
+                greenT: closest.greenT,
+                greenPosition,
+                routePoint: closest.routePoint,
+                greenPoint: closest.greenPoint,
+                distanceMeters: closest.distanceMeters
+            };
+
+            if (
+                !best ||
+                candidate.greenPosition < best.greenPosition - 1e-6 ||
+                (
+                    Math.abs(candidate.greenPosition - best.greenPosition) <= 1e-6 &&
+                    candidate.distanceMeters < best.distanceMeters
+                )
+            ) {
+                best = candidate;
             }
         }
     }
 
-    // A final selected trail piece should actually reach the original route.
-    // 30 m allows for OSM geometry/snap differences without guessing across a
-    // nearby but unrelated corridor.
-    if (bestIndex === null || bestDistance > 30) return null;
-    return {index: bestIndex, distanceMeters: bestDistance};
+    return best;
 }
-
 
 function routeEditDistanceMeters(a, b) {
     return map.distance(
@@ -10705,6 +10854,8 @@ async function applyRouteSectionReplacement() {
     }
 
     routeReplacementStage = "ready";
+    status.textContent =
+        `Rejoin detected ${inferredRejoin.distanceMeters.toFixed(1)} m from the red route. Replacing section...`;
     drawRouteReplacementLayers();
 
     const baseOption = lastGeneratedRoute.route_options[replacementBaseRouteIndex];
@@ -10720,10 +10871,18 @@ async function applyRouteSectionReplacement() {
         lat: Number(baseOption.route[selectedStartIndex].lat),
         lon: Number(baseOption.route[selectedStartIndex].lon)
     };
-    const selectedEnd = {
-        lat: Number(baseOption.route[selectedEndIndex].lat),
-        lon: Number(baseOption.route[selectedEndIndex].lon)
-    };
+    // V43: the final green edge can rejoin the red route in the MIDDLE of
+    // both polylines. Use the exact projected route-side rejoin point instead
+    // of forcing the edit to a stored route vertex.
+    const selectedEnd = inferredRejoin.routePoint
+        ? {
+            lat: Number(inferredRejoin.routePoint.lat),
+            lon: Number(inferredRejoin.routePoint.lon)
+        }
+        : {
+            lat: Number(baseOption.route[selectedEndIndex].lat),
+            lon: Number(baseOption.route[selectedEndIndex].lon)
+        };
 
     applyReplacementButton.disabled = true;
     replaceSectionButton.disabled = true;
@@ -10743,9 +10902,11 @@ async function applyRouteSectionReplacement() {
             lat: Number(baseOption.route[cutA].lat),
             lon: Number(baseOption.route[cutA].lon)
         };
+        // Preserve the exact mid-segment rejoin. Do not snap it back to the
+        // nearest stored red-route coordinate.
         replacement[replacement.length - 1] = {
-            lat: Number(baseOption.route[cutB].lat),
-            lon: Number(baseOption.route[cutB].lon)
+            lat: Number(selectedEnd.lat),
+            lon: Number(selectedEnd.lon)
         };
 
         const stitched = baseOption.route
@@ -10761,7 +10922,14 @@ async function applyRouteSectionReplacement() {
             }
         }
 
-        for (const p of baseOption.route.slice(cutB + 1)) {
+        const suffixStartIndex = (
+            !selectionReversed &&
+            Number.isInteger(inferredRejoin.routeSegmentIndex)
+        )
+            ? inferredRejoin.routeSegmentIndex + 1
+            : cutB + 1;
+
+        for (const p of baseOption.route.slice(suffixStartIndex)) {
             const point = {lat: Number(p.lat), lon: Number(p.lon)};
             const last = stitched[stitched.length - 1];
             if (last && routeEditDistanceMeters(last, point) < 0.15) {
