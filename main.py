@@ -90,7 +90,7 @@ ROUTING_TILE_MANIFEST_LOCK = threading.Lock()
 
 # Keep only a few decompressed tile graphs resident. Pickle files are small,
 # but NetworkX's in-memory representation is much larger than the file itself.
-MAX_ROUTING_TILE_CACHE = 2
+MAX_ROUTING_TILE_CACHE = 0
 ROUTING_TILE_CACHE = OrderedDict()
 ROUTING_TILE_CACHE_LOCK = threading.Lock()
 
@@ -100,6 +100,14 @@ ROUTING_TILE_SELECTION_BUFFER_M = 1500.0
 ROUTING_TILE_SCHEMA = "trail-routing-tile-v1"
 ROUTING_TILE_MANIFEST_SCHEMA = "trail-routing-tile-manifest-v1"
 
+# V39 lightweight map-overlay tiles. These contain only gray trail coordinates
+# and are served without ever unpickling a NetworkX routing graph.
+OVERLAY_TILE_DIR = os.path.join(BASE_DIR, "overlay_tiles")
+OVERLAY_TILE_MANIFEST_PATH = os.path.join(OVERLAY_TILE_DIR, "manifest.json")
+OVERLAY_TILE_MANIFEST = None
+OVERLAY_TILE_MANIFEST_LOCK = threading.Lock()
+OVERLAY_TILE_MANIFEST_SCHEMA = "trail-overlay-tile-manifest-v1"
+
 DEM_BOUNDS_WGS84_CACHE = None
 
 # Cache DEM values by rounded lat/lon. Graph construction already samples
@@ -108,7 +116,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 50000
 
-APP_VERSION = "2026-08-19-v38-viewport-overlay-low-memory"
+APP_VERSION = "2026-08-19-v39-static-overlay-dynamic-workspace"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -3008,9 +3016,11 @@ def _load_routing_tile_uncached(row):
 
 
 def load_routing_tile(row):
-    """Small LRU cache of decompressed runtime tile graphs."""
-    tile_id = str(row.get("id", row.get("file", "")))
+    """Load one routing tile. V39 defaults to no decompressed-tile cache."""
+    if MAX_ROUTING_TILE_CACHE <= 0:
+        return _load_routing_tile_uncached(row)
 
+    tile_id = str(row.get("id", row.get("file", "")))
     with ROUTING_TILE_CACHE_LOCK:
         cached = ROUTING_TILE_CACHE.pop(tile_id, None)
         if cached is not None:
@@ -3018,17 +3028,14 @@ def load_routing_tile(row):
             return cached
 
     G = _load_routing_tile_uncached(row)
-
     with ROUTING_TILE_CACHE_LOCK:
         existing = ROUTING_TILE_CACHE.pop(tile_id, None)
         if existing is not None:
             ROUTING_TILE_CACHE[tile_id] = existing
             return existing
-
         ROUTING_TILE_CACHE[tile_id] = G
         while len(ROUTING_TILE_CACHE) > MAX_ROUTING_TILE_CACHE:
             ROUTING_TILE_CACHE.popitem(last=False)
-
     return G
 
 
@@ -3838,13 +3845,25 @@ def add_reachable_dem_edge_elevations(G, start_lat, start_lon):
     return H, 0
 
 
-def workspace_cache_key(lat, lon):
+def workspace_cache_key(lat, lon, radius_m):
+    # Radius is bucketed so nearby target changes can reuse one workspace while
+    # a later longer route cannot accidentally reuse a workspace that is too small.
+    radius_bucket = int(math.ceil(float(radius_m) / 1000.0) * 1000)
     return (
         round(float(lat), 5),
         round(float(lon), 5),
+        radius_bucket,
         os.path.basename(DEM_PATH),
-        "start-workspace-v14",
+        "start-workspace-v39",
     )
+
+
+def dynamic_workspace_radius_m(requested_search_radius_m):
+    requested = max(1000.0, float(requested_search_radius_m or 0.0))
+    # Small safety margin for anchors/edge geometry without preparing a 25-mile
+    # workspace for every short route.
+    desired = max(3500.0, requested * 1.10 + 600.0)
+    return min(float(WORKSPACE_RADIUS_CAP_M), desired)
 
 
 def workspace_max_radius_meters(lat, lon):
@@ -3939,7 +3958,7 @@ def finalize_workspace_graph(G, start_node, start_lat, start_lon):
     return G
 
 
-def get_start_workspace(lat, lon, force_rebuild=False):
+def get_start_workspace(lat, lon, requested_radius_m=None, force_rebuild=False):
     """
     V37 start workspace backed by compact geographic routing tiles.
 
@@ -3959,7 +3978,8 @@ def get_start_workspace(lat, lon, force_rebuild=False):
             ),
         )
 
-    key = workspace_cache_key(lat, lon)
+    requested_workspace_radius_m = dynamic_workspace_radius_m(requested_radius_m)
+    key = workspace_cache_key(lat, lon, requested_workspace_radius_m)
 
     if not force_rebuild and key in WORKSPACE_CACHE:
         return WORKSPACE_CACHE[key], True
@@ -3970,7 +3990,7 @@ def get_start_workspace(lat, lon, force_rebuild=False):
 
         started = time.perf_counter()
         full_footprint_radius_m = workspace_max_radius_meters(lat, lon)
-        max_radius_m = min(full_footprint_radius_m, WORKSPACE_RADIUS_CAP_M)
+        max_radius_m = min(full_footprint_radius_m, requested_workspace_radius_m)
 
         source_G, routing_info = load_tiled_workspace_source_graph(
             float(lat),
@@ -4033,12 +4053,13 @@ def get_start_workspace(lat, lon, force_rebuild=False):
             "master_info": routing_info,
         }
 
-        if force_rebuild:
-            WORKSPACE_CACHE.pop(key, None)
-
-        while len(WORKSPACE_CACHE) >= MAX_CACHED_WORKSPACES:
-            oldest = next(iter(WORKSPACE_CACHE))
-            WORKSPACE_CACHE.pop(oldest, None)
+        # A 512 MB instance keeps exactly one merged workspace. Release the old
+        # NetworkX graph explicitly before retaining the new one.
+        for old_key in list(WORKSPACE_CACHE.keys()):
+            old_workspace = WORKSPACE_CACHE.pop(old_key, None)
+            if old_workspace is not None:
+                old_workspace.clear()
+        gc.collect()
 
         WORKSPACE_CACHE[key] = workspace
         return workspace, False
@@ -4121,6 +4142,7 @@ def download_trail_graph(lat, lon, radius_meters):
     workspace, workspace_from_cache = get_start_workspace(
         float(lat),
         float(lon),
+        requested_radius_m=float(radius_meters),
         force_rebuild=False,
     )
 
@@ -4138,9 +4160,36 @@ def download_trail_graph(lat, lon, radius_meters):
     )
 
 
+def load_overlay_tile_manifest():
+    global OVERLAY_TILE_MANIFEST
+    if OVERLAY_TILE_MANIFEST is not None:
+        return OVERLAY_TILE_MANIFEST
+    with OVERLAY_TILE_MANIFEST_LOCK:
+        if OVERLAY_TILE_MANIFEST is not None:
+            return OVERLAY_TILE_MANIFEST
+        if not os.path.exists(OVERLAY_TILE_MANIFEST_PATH):
+            raise HTTPException(
+                status_code=503,
+                detail="overlay_tiles/manifest.json is missing. Run python build_overlay_tiles.py in Codespaces.",
+            )
+        with open(OVERLAY_TILE_MANIFEST_PATH, "r", encoding="utf-8") as f:
+            manifest = json.load(f)
+        if manifest.get("schema") != OVERLAY_TILE_MANIFEST_SCHEMA:
+            raise HTTPException(status_code=503, detail="Overlay tile manifest schema is incompatible.")
+        OVERLAY_TILE_MANIFEST = manifest
+        return manifest
+
+
+def _overlay_tile_bounds(row):
+    b = row.get("bounds") or {}
+    try:
+        return (float(b["west"]), float(b["south"]), float(b["east"]), float(b["north"]))
+    except Exception:
+        return None
+
+
 def _overlay_rows_for_bounds(west, south, east, north):
-    """Select only routing tiles intersecting the browser's current viewport."""
-    manifest = load_routing_tile_manifest()
+    manifest = load_overlay_tile_manifest()
     query = (
         float(west) - TRAIL_OVERLAY_BOUNDS_PAD_DEG,
         float(south) - TRAIL_OVERLAY_BOUNDS_PAD_DEG,
@@ -4149,71 +4198,45 @@ def _overlay_rows_for_bounds(west, south, east, north):
     )
     rows = []
     for row in manifest.get("tiles", []):
-        if int(row.get("trail_edges", 0) or 0) <= 0:
+        if int(row.get("segments", 0) or 0) <= 0:
             continue
-        bounds = _tile_row_bounds(row)
+        bounds = _overlay_tile_bounds(row)
         if bounds is not None and _bounds_intersect(query, bounds):
             rows.append(row)
-
-    # The overlay is visual aid only. At very wide zoom levels, refuse to load
-    # dozens of tiles into one response. The browser will request again once the
-    # user zooms in.
     too_wide = len(rows) > TRAIL_OVERLAY_MAX_TILES
     if too_wide:
         rows = []
     return manifest, rows, too_wide
 
 
-def get_viewport_trail_overlay_json(west, south, east, north):
-    """
-    Serialize natural trails for the CURRENT MAP VIEW only.
-
-    Each selected tile is loaded uncached, converted to lightweight coordinate
-    arrays, and immediately released. No statewide segment list or statewide
-    JSON cache is ever constructed.
-    """
+def overlay_index_payload(west, south, east, north):
     manifest, rows, too_wide = _overlay_rows_for_bounds(west, south, east, north)
-    segments = []
-    seen = set()
-
-    if not too_wide:
-        with TRAIL_OVERLAY_LOCK:
-            for row in rows:
-                tile_G = _load_routing_tile_uncached(row)
-                try:
-                    for u, v, key, data in tile_G.edges(keys=True, data=True):
-                        if str(data.get("route_class", "trail")) != "trail":
-                            continue
-                        physical = (
-                            min(int(u), int(v)),
-                            max(int(u), int(v)),
-                            round(float(data.get("length", 0) or 0), 1),
-                        )
-                        if physical in seen:
-                            continue
-                        seen.add(physical)
-                        coords = oriented_edge_coords(tile_G, u, v, data)
-                        if len(coords) >= 2:
-                            segments.append([
-                                [float(lat), float(lon)]
-                                for lon, lat in coords
-                            ])
-                finally:
-                    del tile_G
-                    gc.collect()
-
-    payload = {
-        "allowed_trails": segments,
-        "allowed_trail_segments": len(segments),
+    return {
+        "overlay_tiles": [
+            {
+                "id": str(row.get("id", "")),
+                "url": "/overlay-tile/" + str(row.get("id", "")),
+                "segments": int(row.get("segments", 0) or 0),
+            }
+            for row in rows
+        ],
         "selected_tile_count": len(rows),
-        "selected_tile_ids": [str(r.get("id", "")) for r in rows],
         "viewport_too_wide": bool(too_wide),
         "max_overlay_tiles": TRAIL_OVERLAY_MAX_TILES,
-        "master_graph_file": os.path.join("routing_tiles", "manifest.json"),
-        "master_tiff": os.path.basename(DEM_PATH),
         "version": APP_VERSION,
     }
-    return json.dumps(payload, separators=(",", ":"))
+
+
+def overlay_tile_file(tile_id):
+    manifest = load_overlay_tile_manifest()
+    row = next((r for r in manifest.get("tiles", []) if str(r.get("id", "")) == str(tile_id)), None)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Overlay tile not found.")
+    filename = str(row.get("file", ""))
+    path = os.path.join(OVERLAY_TILE_DIR, filename)
+    if not filename or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Overlay tile file is missing.")
+    return path
 
 
 # ============================================================
@@ -7223,15 +7246,27 @@ def trail_overlay(
     east: float = Query(...),
     north: float = Query(...),
 ):
-    """Return only gray trail geometry intersecting the current map viewport."""
+    """Return lightweight overlay tile URLs for the current viewport."""
     if not all(math.isfinite(v) for v in (west, south, east, north)):
         raise HTTPException(status_code=400, detail="Invalid map bounds.")
     if east <= west or north <= south:
         raise HTTPException(status_code=400, detail="Invalid map bounds order.")
+    return overlay_index_payload(west, south, east, north)
+
+
+@app.get("/overlay-tile/{tile_id}")
+def overlay_tile(tile_id: str):
+    """Serve a prebuilt gzip JSON overlay tile without loading NetworkX."""
+    path = overlay_tile_file(tile_id)
+    with open(path, "rb") as f:
+        data = f.read()
     return Response(
-        content=get_viewport_trail_overlay_json(west, south, east, north),
+        content=data,
         media_type="application/json",
-        headers={"Cache-Control": "public, max-age=120"},
+        headers={
+            "Content-Encoding": "gzip",
+            "Cache-Control": "public, max-age=86400",
+        },
     )
 
 
@@ -7243,6 +7278,7 @@ def trail_network(request: TrailNetworkRequest):
         workspace, workspace_from_cache = get_start_workspace(
             request.start_lat,
             request.start_lon,
+            requested_radius_m=float(profile["search_radius_m"]),
             force_rebuild=bool(request.force_reload),
         )
 
@@ -7846,9 +7882,11 @@ def replace_route_section(request: RouteSectionReplacementRequest):
 
         # Use the full cached TIFF workspace for deliberate edits. A user may
         # choose a replacement corridor outside the normal target-radius slice.
+        edit_profile = get_route_profile(float(request.target_distance_miles))
         workspace, _ = get_start_workspace(
             float(request.start_lat),
             float(request.start_lon),
+            requested_radius_m=float(edit_profile["search_radius_m"]),
             force_rebuild=False,
         )
         G = workspace["graph"].copy()
@@ -11181,7 +11219,7 @@ async function loadMasterTrailOverlayOnce(force = false) {
         }
 
         networkLayer.clearLayers();
-        masterTrailSegments = result.allowed_trails || [];
+        masterTrailSegments = [];
 
         if (result.viewport_too_wide) {
             masterTrailOverlayLastKey = key;
@@ -11189,9 +11227,24 @@ async function loadMasterTrailOverlayOnce(force = false) {
             return result;
         }
 
-        if (masterTrailSegments.length > 0) {
+        const tileRows = result.overlay_tiles || [];
+        const tileResults = await Promise.all(
+            tileRows.map(async tile => {
+                const tileResponse = await fetch(tile.url);
+                return await readJsonResponse(tileResponse);
+            })
+        );
+
+        if (requestId !== masterTrailOverlayRequestId) {
+            return result;
+        }
+
+        for (const tileResult of tileResults) {
+            const segments = tileResult.allowed_trails || [];
+            if (segments.length === 0) continue;
+            masterTrailSegments.push(...segments);
             L.polyline(
-                masterTrailSegments,
+                segments,
                 {
                     weight: 3,
                     opacity: 0.42,
