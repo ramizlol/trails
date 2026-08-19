@@ -4,6 +4,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
 
 import math
+import gc
 import os
 import json
 import hashlib
@@ -16,6 +17,7 @@ import subprocess
 import tempfile
 import shutil
 import xml.etree.ElementTree as ET
+from collections import OrderedDict
 
 import networkx as nx
 import numpy as np
@@ -76,6 +78,28 @@ MASTER_ROUTING_GRAPHML_PATH = os.path.join(BASE_DIR, "master_routing.graphml")
 MASTER_ROUTING_PICKLE_PATH = os.path.join(BASE_DIR, "master_routing.pkl")
 ROUTING_NETWORK_SCHEMA = "trail-plus-sparse-connectors-v15-local-pbf"
 
+
+# V37 runtime geographic routing tiles. The raw OSM/PBF is NEVER parsed by the
+# production server. Codespaces prebuilds compact pickled NetworkX graphs in
+# routing_tiles/, and Render loads only tiles intersecting the requested start
+# workspace. This keeps runtime memory bounded as geographic coverage grows.
+ROUTING_TILE_DIR = os.path.join(BASE_DIR, "routing_tiles")
+ROUTING_TILE_MANIFEST_PATH = os.path.join(ROUTING_TILE_DIR, "manifest.json")
+ROUTING_TILE_MANIFEST = None
+ROUTING_TILE_MANIFEST_LOCK = threading.Lock()
+
+# Keep only a few decompressed tile graphs resident. Pickle files are small,
+# but NetworkX's in-memory representation is much larger than the file itself.
+MAX_ROUTING_TILE_CACHE = 4
+ROUTING_TILE_CACHE = OrderedDict()
+ROUTING_TILE_CACHE_LOCK = threading.Lock()
+
+# Extra graph coverage around the requested workspace prevents a route from
+# being severed exactly at a tile boundary before the final radial truncation.
+ROUTING_TILE_SELECTION_BUFFER_M = 1500.0
+ROUTING_TILE_SCHEMA = "trail-routing-tile-v1"
+ROUTING_TILE_MANIFEST_SCHEMA = "trail-routing-tile-manifest-v1"
+
 DEM_BOUNDS_WGS84_CACHE = None
 
 # Cache DEM values by rounded lat/lon. Graph construction already samples
@@ -84,7 +108,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 50000
 
-APP_VERSION = "2026-08-10-v35-direct-green-splice"
+APP_VERSION = "2026-08-19-v37-runtime-routing-tiles"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -2835,6 +2859,258 @@ def build_master_routing_graph(rebuild_trails=True, source_G=None):
     return G
 
 
+
+# ============================================================
+# V37 RUNTIME ROUTING-TILE LOADER
+# ============================================================
+
+def load_routing_tile_manifest():
+    """Load and validate routing_tiles/manifest.json once per server process."""
+    global ROUTING_TILE_MANIFEST
+
+    if ROUTING_TILE_MANIFEST is not None:
+        return ROUTING_TILE_MANIFEST
+
+    with ROUTING_TILE_MANIFEST_LOCK:
+        if ROUTING_TILE_MANIFEST is not None:
+            return ROUTING_TILE_MANIFEST
+
+        if not os.path.exists(ROUTING_TILE_MANIFEST_PATH):
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Routing tile manifest is missing. Put the prebuilt "
+                    "routing_tiles folder beside main.py. Expected: "
+                    f"{ROUTING_TILE_MANIFEST_PATH}"
+                ),
+            )
+
+        try:
+            with open(ROUTING_TILE_MANIFEST_PATH, "r", encoding="utf-8") as f:
+                manifest = json.load(f)
+        except Exception as exc:
+            raise HTTPException(
+                status_code=503,
+                detail=f"Could not read routing tile manifest: {exc}",
+            )
+
+        if str(manifest.get("schema", "")) != ROUTING_TILE_MANIFEST_SCHEMA:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Routing tile manifest schema is incompatible: "
+                    f"{manifest.get('schema')!r}"
+                ),
+            )
+
+        rows = list(manifest.get("tiles") or [])
+        if not rows:
+            raise HTTPException(status_code=503, detail="Routing tile manifest contains no tiles.")
+
+        # Reject an accidentally stale tile set built against another DEM.
+        manifest_dem = str(manifest.get("dem_signature", "") or "")
+        current_dem = str(get_dem_signature())
+        if manifest_dem and manifest_dem != current_dem:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Routing tiles were built for a different DEM. Re-run "
+                    "build_routing_tiles.py against the current output_hh.tif."
+                ),
+            )
+
+        ROUTING_TILE_MANIFEST = manifest
+        return ROUTING_TILE_MANIFEST
+
+
+def _tile_row_bounds(row):
+    bounds = row.get("nominal_bounds") or {}
+    try:
+        return (
+            float(bounds["west"]),
+            float(bounds["south"]),
+            float(bounds["east"]),
+            float(bounds["north"]),
+        )
+    except Exception:
+        return None
+
+
+def _bounds_intersect(a, b):
+    aw, as_, ae, an = a
+    bw, bs, be, bn = b
+    return not (ae < bw or be < aw or an < bs or bn < as_)
+
+
+def _workspace_bbox_wgs84(lat, lon, radius_m):
+    bbox = ox.utils_geo.bbox_from_point(
+        (float(lat), float(lon)),
+        float(radius_m),
+    )
+    # Existing codebase uses (left, bottom, right, top) from bbox_from_point.
+    left, bottom, right, top = [float(v) for v in bbox]
+    dl, db, dr, dt = get_dem_bounds_wgs84()
+    return (
+        max(left, dl),
+        max(bottom, db),
+        min(right, dr),
+        min(top, dt),
+    )
+
+
+def routing_tiles_for_workspace(lat, lon, radius_m):
+    """Return manifest rows whose nominal tile bounds intersect the workspace."""
+    manifest = load_routing_tile_manifest()
+    query_bbox = _workspace_bbox_wgs84(
+        lat,
+        lon,
+        float(radius_m) + ROUTING_TILE_SELECTION_BUFFER_M,
+    )
+
+    selected = []
+    for row in manifest.get("tiles", []):
+        if int(row.get("edges", 0) or 0) <= 0:
+            continue
+        tile_bounds = _tile_row_bounds(row)
+        if tile_bounds is None:
+            continue
+        if _bounds_intersect(query_bbox, tile_bounds):
+            selected.append(row)
+
+    selected.sort(key=lambda row: str(row.get("id", "")))
+    return selected, query_bbox
+
+
+def _load_routing_tile_uncached(row):
+    filename = str(row.get("file", "") or "")
+    if not filename:
+        raise HTTPException(status_code=503, detail="Routing tile manifest row has no filename.")
+    path = os.path.join(ROUTING_TILE_DIR, filename)
+    if not os.path.exists(path):
+        raise HTTPException(
+            status_code=503,
+            detail=f"Routing tile is missing: {filename}",
+        )
+    try:
+        with open(path, "rb") as f:
+            G = pickle.load(f)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Could not load routing tile {filename}: {exc}",
+        )
+    if not isinstance(G, nx.MultiDiGraph):
+        # OSMnx graphs are MultiDiGraph. Converting here keeps the runtime API
+        # consistent if an older builder emitted another NetworkX graph class.
+        G = nx.MultiDiGraph(G)
+    return G
+
+
+def load_routing_tile(row):
+    """Small LRU cache of decompressed runtime tile graphs."""
+    tile_id = str(row.get("id", row.get("file", "")))
+
+    with ROUTING_TILE_CACHE_LOCK:
+        cached = ROUTING_TILE_CACHE.pop(tile_id, None)
+        if cached is not None:
+            ROUTING_TILE_CACHE[tile_id] = cached
+            return cached
+
+    G = _load_routing_tile_uncached(row)
+
+    with ROUTING_TILE_CACHE_LOCK:
+        existing = ROUTING_TILE_CACHE.pop(tile_id, None)
+        if existing is not None:
+            ROUTING_TILE_CACHE[tile_id] = existing
+            return existing
+
+        ROUTING_TILE_CACHE[tile_id] = G
+        while len(ROUTING_TILE_CACHE) > MAX_ROUTING_TILE_CACHE:
+            ROUTING_TILE_CACHE.popitem(last=False)
+
+    return G
+
+
+def _merge_tile_graph_into(target, tile_G):
+    """Merge one tile in-place to avoid nx.compose_all's repeated full copies."""
+    if target.number_of_nodes() == 0:
+        target.graph.update(tile_G.graph)
+
+    # Original OSM node IDs are retained by complete_ways extracts, so adjacent
+    # tile graphs naturally stitch together on shared OSM nodes. Duplicate
+    # reverse/overlap edges with the same (u,v,key) are updated, not duplicated.
+    target.add_nodes_from(tile_G.nodes(data=True))
+    for u, v, key, data in tile_G.edges(keys=True, data=True):
+        if target.has_edge(u, v, key):
+            target[u][v][key].update(data)
+        else:
+            target.add_edge(u, v, key=key, **data)
+
+
+def tiled_routing_info(manifest, selected_rows, merged_G):
+    all_rows = list(manifest.get("tiles") or [])
+    return {
+        "nodes": int(sum(int(r.get("nodes", 0) or 0) for r in all_rows)),
+        "edges": int(sum(int(r.get("edges", 0) or 0) for r in all_rows)),
+        "physical_segments": int(sum(int(r.get("trail_edges", 0) or 0) for r in all_rows) // 2),
+        "trail_physical_segments": int(sum(int(r.get("trail_edges", 0) or 0) for r in all_rows) // 2),
+        "connector_physical_segments": int(sum(int(r.get("connector_edges", 0) or 0) for r in all_rows) // 2),
+        "filtered_edges_removed": 0,
+        "loaded_from_disk": True,
+        "elevation_precomputed": True,
+        "saved_graph": os.path.join("routing_tiles", "manifest.json"),
+        "offline_components_before": 0,
+        "offline_components_after": 0,
+        "offline_connector_queries": 0,
+        "offline_connector_count": int(sum(int(r.get("connector_count", 0) or 0) for r in selected_rows)),
+        "offline_connector_path_meters": float(sum(float(r.get("connector_path_meters", 0.0) or 0.0) for r in selected_rows)),
+        "selected_tile_count": len(selected_rows),
+        "selected_tile_ids": [str(r.get("id", "")) for r in selected_rows],
+        "selected_graph_nodes": int(merged_G.number_of_nodes()),
+        "selected_graph_edges": int(merged_G.number_of_edges()),
+    }
+
+
+def load_tiled_workspace_source_graph(lat, lon, radius_m):
+    """
+    Load/merge only routing tiles near one start, then truncate them to the
+    requested workspace before exact-start insertion makes its graph copy.
+    """
+    manifest = load_routing_tile_manifest()
+    rows, query_bbox = routing_tiles_for_workspace(lat, lon, radius_m)
+    if not rows:
+        raise HTTPException(
+            status_code=400,
+            detail="No prebuilt routing tiles cover this start/search area.",
+        )
+
+    merged = nx.MultiDiGraph()
+    merged.graph["crs"] = "EPSG:4326"
+
+    for row in rows:
+        tile_G = load_routing_tile(row)
+        _merge_tile_graph_into(merged, tile_G)
+
+    if merged.number_of_edges() == 0:
+        raise HTTPException(status_code=400, detail="Selected routing tiles contain no usable trails.")
+
+    # Limit the merged tile envelope before insert_exact_routing_point projects
+    # and copies the graph. This is the key Render-memory protection.
+    local = extract_local_master_subgraph(
+        merged,
+        float(lat),
+        float(lon),
+        float(radius_m),
+    )
+    del merged
+    gc.collect()
+
+    info = tiled_routing_info(manifest, rows, local)
+    local.graph["routing_tile_ids"] = info["selected_tile_ids"]
+    local.graph["routing_tile_count"] = len(rows)
+    local.graph["routing_tile_query_bbox"] = tuple(query_bbox)
+    return local, info
+
 def get_master_routing_graph():
     global MASTER_ROUTING_GRAPH, MASTER_ROUTING_INFO
 
@@ -3653,13 +3929,12 @@ def finalize_workspace_graph(G, start_node, start_lat, start_lon):
 
 def get_start_workspace(lat, lon, force_rebuild=False):
     """
-    Build/load a start-specific workspace with ZERO live OSM calls.
+    V37 start workspace backed by compact geographic routing tiles.
 
-    The expensive trail/connector discovery was moved into master_routing.graphml
-    during the one-time V15 build. A new start now only:
-      1) loads/reuses the in-memory production graph,
-      2) inserts the exact start point (one graph copy, not two),
-      3) computes vectorized radial distances and connectivity.
+    Production never opens the raw OSM PBF and never loads one statewide master
+    graph. Only prebuilt .pkl tiles intersecting this start's bounded workspace
+    are merged, then the exact start is inserted and existing route logic runs
+    unchanged.
     """
     if not point_inside_dem(lat, lon):
         left, bottom, right, top = get_dem_bounds_wgs84()
@@ -3682,33 +3957,25 @@ def get_start_workspace(lat, lon, force_rebuild=False):
             return WORKSPACE_CACHE[key], True
 
         started = time.perf_counter()
-        routing_G, routing_info = get_master_routing_graph()
         full_footprint_radius_m = workspace_max_radius_meters(lat, lon)
         max_radius_m = min(full_footprint_radius_m, WORKSPACE_RADIUS_CAP_M)
 
-        # V36 memory fix: truncate to a bounded radius BEFORE copying/projecting.
-        # insert_exact_routing_point always does a full graph copy of whatever
-        # it is given, so handing it the entire ~44k-node region graph for
-        # every new start point (as V15 did, when the region was tiny) is the
-        # dominant memory cost at this dataset size. Truncating first bounds
-        # both the copy and the projection step to the requested area.
-        if max_radius_m < full_footprint_radius_m:
-            source_G = extract_local_master_subgraph(
-                routing_G,
-                float(lat),
-                float(lon),
-                max_radius_m,
-            )
-        else:
-            source_G = routing_G
+        source_G, routing_info = load_tiled_workspace_source_graph(
+            float(lat),
+            float(lon),
+            float(max_radius_m),
+        )
 
-        # insert_exact_routing_point performs the single required graph copy so
-        # the shared production graph remains immutable between users/starts.
+        # One copy is still required because the exact-start helper splits the
+        # nearest trail edge. Crucially, source_G is now only the local tiled
+        # workspace rather than a statewide graph.
         G, start_node, start_info = insert_exact_routing_point(
             source_G,
             float(lat),
             float(lon),
         )
+        del source_G
+        gc.collect()
 
         G = finalize_workspace_graph(
             G,
@@ -3721,8 +3988,8 @@ def get_start_workspace(lat, lon, force_rebuild=False):
         connector_stats = {
             "attempted": False,
             "offline": True,
-            "components_before": int(routing_info.get("offline_components_before", 0) or 0),
-            "components_after": int(routing_info.get("offline_components_after", 0) or 0),
+            "components_before": 0,
+            "components_after": 0,
             "connectors_added": int(routing_info.get("offline_connector_count", 0) or 0),
             "connector_queries": 0,
             "connector_path_meters": float(routing_info.get("offline_connector_path_meters", 0.0) or 0.0),
@@ -3739,8 +4006,9 @@ def get_start_workspace(lat, lon, force_rebuild=False):
         G.graph["workspace_build_seconds"] = float(build_seconds)
         G.graph["workspace_master_file"] = routing_info.get(
             "saved_graph",
-            os.path.basename(MASTER_ROUTING_GRAPHML_PATH),
+            os.path.join("routing_tiles", "manifest.json"),
         )
+        G.graph["workspace_routing_tiles"] = list(routing_info.get("selected_tile_ids", []))
 
         workspace = {
             "graph": G,
@@ -3749,7 +4017,7 @@ def get_start_workspace(lat, lon, force_rebuild=False):
             "max_radius_m": float(max_radius_m),
             "connector_radius_m": float(max_radius_m),
             "build_seconds": float(build_seconds),
-            "filtered_edges_removed": routing_info["filtered_edges_removed"],
+            "filtered_edges_removed": 0,
             "master_info": routing_info,
         }
 
@@ -3859,7 +4127,13 @@ def download_trail_graph(lat, lon, radius_meters):
 
 
 def get_master_trail_overlay_json():
-    """Serialize the TIFF-wide gray trail overlay exactly once per process."""
+    """
+    Serialize all prebuilt natural-trail tiles without ever composing a
+    statewide NetworkX graph. Each tile is loaded and released sequentially.
+
+    This preserves the existing browser contract (/trail-overlay) while keeping
+    peak server memory far below loading master_routing.pkl.
+    """
     global MASTER_TRAIL_OVERLAY_JSON
 
     if MASTER_TRAIL_OVERLAY_JSON is not None:
@@ -3869,25 +4143,49 @@ def get_master_trail_overlay_json():
         if MASTER_TRAIL_OVERLAY_JSON is not None:
             return MASTER_TRAIL_OVERLAY_JSON
 
-        master_G, master_info = get_master_routing_graph()
-        segments = graph_debug_segments(master_G)
+        manifest = load_routing_tile_manifest()
+        segments = []
+        seen = set()
+
+        for row in manifest.get("tiles", []):
+            if int(row.get("trail_edges", 0) or 0) <= 0:
+                continue
+
+            # Do not populate the runtime tile LRU while building the map layer.
+            tile_G = _load_routing_tile_uncached(row)
+            for u, v, key, data in tile_G.edges(keys=True, data=True):
+                if str(data.get("route_class", "trail")) != "trail":
+                    continue
+                physical = (
+                    min(int(u), int(v)),
+                    max(int(u), int(v)),
+                    round(float(data.get("length", 0) or 0), 1),
+                )
+                if physical in seen:
+                    continue
+                seen.add(physical)
+                coords = oriented_edge_coords(tile_G, u, v, data)
+                if len(coords) >= 2:
+                    segments.append([
+                        [float(lat), float(lon)]
+                        for lon, lat in coords
+                    ])
+            del tile_G
+            gc.collect()
+
+        rows = list(manifest.get("tiles") or [])
         payload = {
             "allowed_trails": segments,
             "allowed_trail_segments": len(segments),
-            "master_network_nodes": master_info["nodes"],
-            "master_network_edges": master_info["edges"],
-            "master_graph_file": master_info.get(
-                "saved_graph",
-                os.path.basename(MASTER_ROUTING_GRAPHML_PATH),
-            ),
+            "master_network_nodes": int(sum(int(r.get("nodes", 0) or 0) for r in rows)),
+            "master_network_edges": int(sum(int(r.get("edges", 0) or 0) for r in rows)),
+            "master_graph_file": os.path.join("routing_tiles", "manifest.json"),
             "master_tiff": os.path.basename(DEM_PATH),
             "version": APP_VERSION,
         }
-        MASTER_TRAIL_OVERLAY_JSON = json.dumps(
-            payload,
-            separators=(",", ":"),
-        )
+        MASTER_TRAIL_OVERLAY_JSON = json.dumps(payload, separators=(",", ":"))
         return MASTER_TRAIL_OVERLAY_JSON
+
 
 # ============================================================
 # SIMPLE ROUTING GRAPH
@@ -11251,7 +11549,7 @@ document.getElementById("results").innerHTML =
 if __name__ == "__main__":
     if "--build-master" in sys.argv or "--build-routing" in sys.argv or "--build-local" in sys.argv:
         try:
-            # V15: all aliases use the already-cropped phoenix-tiff.osm.pbf.
+            # Legacy master-graph builder retained for development compatibility.
             # No Overpass/API calls are made. The command rebuilds both the
             # natural-trail master and final sparse routing graph in one pass.
             build_master_routing_graph(rebuild_trails=True)
@@ -11262,6 +11560,6 @@ if __name__ == "__main__":
 
     print(
         "This file is the FastAPI app. Start it with uvicorn. To build the "
-        "fully offline routing graph from phoenix-tiff.osm.pbf, run: "
+        "legacy monolithic offline routing graph, run: "
         "python main.py --build-routing"
     )

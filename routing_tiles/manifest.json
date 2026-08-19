@@ -1,0 +1,1862 @@
+{
+  "schema": "trail-routing-tile-manifest-v1",
+  "generated_unix": 1787135789.9107258,
+  "dem_file": "output_hh.tif",
+  "dem_signature": "output_hh.tif|-113.05208334,32.93541668,-110.75041668,34.28486112|8286x4858",
+  "tile_count": 69,
+  "nonempty_tile_count": 66,
+  "coverage_nominal": {
+    "west": -113.25,
+    "south": 32.75,
+    "east": -110.25,
+    "north": 34.75
+  },
+  "total_size_bytes": 56455804,
+  "build_elapsed_seconds": 1341.56,
+  "tiles": [
+    {
+      "id": "-113.25_32.75",
+      "file": "-113.25_32.75.pkl",
+      "source_pbf": "osm_tiles/-113.25_32.75.osm.pbf",
+      "nominal_bounds": {
+        "west": -113.25,
+        "south": 32.75,
+        "east": -112.75,
+        "north": 33.25
+      },
+      "actual_graph_bounds": {
+        "west": -113.0515253,
+        "south": 32.9370207,
+        "east": -112.7174291,
+        "north": 33.2871849
+      },
+      "nodes": 346,
+      "edges": 774,
+      "trail_edges": 698,
+      "connector_edges": 76,
+      "dem_samples": 80124,
+      "connector_count": 16,
+      "connector_path_meters": 30249.1,
+      "size_bytes": 463093,
+      "build_seconds": 12.12,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.75_32.75",
+      "file": "-112.75_32.75.pkl",
+      "source_pbf": "osm_tiles/-112.75_32.75.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.75,
+        "south": 32.75,
+        "east": -112.25,
+        "north": 33.25
+      },
+      "actual_graph_bounds": {
+        "west": -112.791032,
+        "south": 32.9371573,
+        "east": -112.2021222,
+        "north": 33.3197184
+      },
+      "nodes": 811,
+      "edges": 1680,
+      "trail_edges": 1628,
+      "connector_edges": 52,
+      "dem_samples": 163662,
+      "connector_count": 16,
+      "connector_path_meters": 3302.9,
+      "size_bytes": 784205,
+      "build_seconds": 22.44,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.25_32.75",
+      "file": "-112.25_32.75.pkl",
+      "source_pbf": "osm_tiles/-112.25_32.75.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.25,
+        "south": 32.75,
+        "east": -111.75,
+        "north": 33.25
+      },
+      "actual_graph_bounds": {
+        "west": -112.4161902,
+        "south": 32.9355553,
+        "east": -111.7376846,
+        "north": 33.3197184
+      },
+      "nodes": 1723,
+      "edges": 3374,
+      "trail_edges": 3340,
+      "connector_edges": 34,
+      "dem_samples": 186510,
+      "connector_count": 16,
+      "connector_path_meters": 797.0,
+      "size_bytes": 1155974,
+      "build_seconds": 43.76,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.75_32.75",
+      "file": "-111.75_32.75.pkl",
+      "source_pbf": "osm_tiles/-111.75_32.75.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.75,
+        "south": 32.75,
+        "east": -111.25,
+        "north": 33.25
+      },
+      "actual_graph_bounds": {
+        "west": -111.7892678,
+        "south": 32.935611,
+        "east": -111.2155579,
+        "north": 33.2724081
+      },
+      "nodes": 2769,
+      "edges": 5940,
+      "trail_edges": 5908,
+      "connector_edges": 32,
+      "dem_samples": 297570,
+      "connector_count": 16,
+      "connector_path_meters": 264.7,
+      "size_bytes": 2218849,
+      "build_seconds": 63.98,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.25_32.75",
+      "file": "-111.25_32.75.pkl",
+      "source_pbf": "osm_tiles/-111.25_32.75.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.25,
+        "south": 32.75,
+        "east": -110.75,
+        "north": 33.25
+      },
+      "actual_graph_bounds": {
+        "west": -111.318617,
+        "south": 32.9367102,
+        "east": -110.7516906,
+        "north": 33.2769517
+      },
+      "nodes": 1677,
+      "edges": 3734,
+      "trail_edges": 3698,
+      "connector_edges": 36,
+      "dem_samples": 288672,
+      "connector_count": 16,
+      "connector_path_meters": 2172.5,
+      "size_bytes": 2538442,
+      "build_seconds": 41.26,
+      "skipped_existing": false
+    },
+    {
+      "id": "-110.75_32.75",
+      "file": "-110.75_32.75.pkl",
+      "source_pbf": "osm_tiles/-110.75_32.75.osm.pbf",
+      "nominal_bounds": {
+        "west": -110.75,
+        "south": 32.75,
+        "east": -110.25,
+        "north": 33.25
+      },
+      "actual_graph_bounds": null,
+      "nodes": 0,
+      "edges": 0,
+      "trail_edges": 0,
+      "connector_edges": 0,
+      "dem_samples": 0,
+      "connector_count": 0,
+      "connector_path_meters": 0.0,
+      "size_bytes": 967,
+      "build_seconds": 2.32,
+      "skipped_existing": false
+    },
+    {
+      "id": "-113.25_33.25",
+      "file": "-113.25_33.25.pkl",
+      "source_pbf": "osm_tiles/-113.25_33.25.osm.pbf",
+      "nominal_bounds": {
+        "west": -113.25,
+        "south": 33.25,
+        "east": -112.75,
+        "north": 33.75
+      },
+      "actual_graph_bounds": {
+        "west": -113.0505661,
+        "south": 33.1952605,
+        "east": -112.7145417,
+        "north": 33.725508
+      },
+      "nodes": 1475,
+      "edges": 2644,
+      "trail_edges": 2606,
+      "connector_edges": 38,
+      "dem_samples": 163726,
+      "connector_count": 16,
+      "connector_path_meters": 1213.8,
+      "size_bytes": 1135676,
+      "build_seconds": 26.0,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.750_33.250",
+      "file": "-112.750_33.250.pkl",
+      "source_pbf": "osm_tiles/dense_small/-112.750_33.250.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.75,
+        "south": 33.25,
+        "east": -112.625,
+        "north": 33.375
+      },
+      "actual_graph_bounds": {
+        "west": -112.7483711,
+        "south": 33.2703736,
+        "east": -112.6130314,
+        "north": 33.3785163
+      },
+      "nodes": 485,
+      "edges": 1006,
+      "trail_edges": 986,
+      "connector_edges": 20,
+      "dem_samples": 38865,
+      "connector_count": 10,
+      "connector_path_meters": 180.2,
+      "size_bytes": 285797,
+      "build_seconds": 5.33,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.625_33.250",
+      "file": "-112.625_33.250.pkl",
+      "source_pbf": "osm_tiles/dense_small/-112.625_33.250.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.625,
+        "south": 33.25,
+        "east": -112.5,
+        "north": 33.375
+      },
+      "actual_graph_bounds": {
+        "west": -112.6314509,
+        "south": 33.2724413,
+        "east": -112.4999531,
+        "north": 33.3779801
+      },
+      "nodes": 411,
+      "edges": 882,
+      "trail_edges": 858,
+      "connector_edges": 24,
+      "dem_samples": 36992,
+      "connector_count": 10,
+      "connector_path_meters": 751.6,
+      "size_bytes": 324195,
+      "build_seconds": 6.4,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.500_33.250",
+      "file": "-112.500_33.250.pkl",
+      "source_pbf": "osm_tiles/dense_small/-112.500_33.250.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.5,
+        "south": 33.25,
+        "east": -112.375,
+        "north": 33.375
+      },
+      "actual_graph_bounds": {
+        "west": -112.5002287,
+        "south": 33.0720192,
+        "east": -112.2021222,
+        "north": 33.3819751
+      },
+      "nodes": 366,
+      "edges": 918,
+      "trail_edges": 824,
+      "connector_edges": 94,
+      "dem_samples": 57907,
+      "connector_count": 10,
+      "connector_path_meters": 6382.8,
+      "size_bytes": 754590,
+      "build_seconds": 11.76,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.375_33.250",
+      "file": "-112.375_33.250.pkl",
+      "source_pbf": "osm_tiles/dense_small/-112.375_33.250.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.375,
+        "south": 33.25,
+        "east": -112.25,
+        "north": 33.375
+      },
+      "actual_graph_bounds": {
+        "west": -112.4161902,
+        "south": 33.0720192,
+        "east": -112.2021222,
+        "north": 33.3820868
+      },
+      "nodes": 180,
+      "edges": 422,
+      "trail_edges": 350,
+      "connector_edges": 72,
+      "dem_samples": 30866,
+      "connector_count": 3,
+      "connector_path_meters": 4039.3,
+      "size_bytes": 295563,
+      "build_seconds": 4.77,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.250_33.250",
+      "file": "-112.250_33.250.pkl",
+      "source_pbf": "osm_tiles/phoenix_small/-112.250_33.250.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.25,
+        "south": 33.25,
+        "east": -112.125,
+        "north": 33.375
+      },
+      "actual_graph_bounds": {
+        "west": -112.2586505,
+        "south": 33.229639,
+        "east": -112.0738162,
+        "north": 33.3773222
+      },
+      "nodes": 356,
+      "edges": 780,
+      "trail_edges": 758,
+      "connector_edges": 22,
+      "dem_samples": 39093,
+      "connector_count": 10,
+      "connector_path_meters": 849.5,
+      "size_bytes": 396021,
+      "build_seconds": 8.3,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.125_33.250",
+      "file": "-112.125_33.250.pkl",
+      "source_pbf": "osm_tiles/phoenix_small/-112.125_33.250.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.125,
+        "south": 33.25,
+        "east": -112.0,
+        "north": 33.375
+      },
+      "actual_graph_bounds": {
+        "west": -112.1526896,
+        "south": 33.23541,
+        "east": -111.983973,
+        "north": 33.3766058
+      },
+      "nodes": 629,
+      "edges": 1506,
+      "trail_edges": 1292,
+      "connector_edges": 214,
+      "dem_samples": 62809,
+      "connector_count": 10,
+      "connector_path_meters": 10367.8,
+      "size_bytes": 902031,
+      "build_seconds": 14.2,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.000_33.250",
+      "file": "-112.000_33.250.pkl",
+      "source_pbf": "osm_tiles/phoenix_small/-112.000_33.250.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.0,
+        "south": 33.25,
+        "east": -111.875,
+        "north": 33.375
+      },
+      "actual_graph_bounds": {
+        "west": -112.008551,
+        "south": 33.2478804,
+        "east": -111.8739429,
+        "north": 33.3755332
+      },
+      "nodes": 502,
+      "edges": 1018,
+      "trail_edges": 726,
+      "connector_edges": 292,
+      "dem_samples": 18650,
+      "connector_count": 10,
+      "connector_path_meters": 10231.9,
+      "size_bytes": 387016,
+      "build_seconds": 35.3,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.875_33.250",
+      "file": "-111.875_33.250.pkl",
+      "source_pbf": "osm_tiles/phoenix_small/-111.875_33.250.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.875,
+        "south": 33.25,
+        "east": -111.75,
+        "north": 33.375
+      },
+      "actual_graph_bounds": {
+        "west": -111.8762068,
+        "south": 33.2508024,
+        "east": -111.759651,
+        "north": 33.379
+      },
+      "nodes": 555,
+      "edges": 1112,
+      "trail_edges": 358,
+      "connector_edges": 754,
+      "dem_samples": 5604,
+      "connector_count": 10,
+      "connector_path_meters": 22314.3,
+      "size_bytes": 321538,
+      "build_seconds": 36.31,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.750_33.250",
+      "file": "-111.750_33.250.pkl",
+      "source_pbf": "osm_tiles/dense_small/-111.750_33.250.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.75,
+        "south": 33.25,
+        "east": -111.625,
+        "north": 33.375
+      },
+      "actual_graph_bounds": {
+        "west": -111.7451735,
+        "south": 33.248988,
+        "east": -111.6176504,
+        "north": 33.3749256
+      },
+      "nodes": 486,
+      "edges": 878,
+      "trail_edges": 802,
+      "connector_edges": 76,
+      "dem_samples": 12878,
+      "connector_count": 10,
+      "connector_path_meters": 1971.9,
+      "size_bytes": 296444,
+      "build_seconds": 21.85,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.625_33.250",
+      "file": "-111.625_33.250.pkl",
+      "source_pbf": "osm_tiles/dense_small/-111.625_33.250.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.625,
+        "south": 33.25,
+        "east": -111.5,
+        "north": 33.375
+      },
+      "actual_graph_bounds": {
+        "west": -111.627096,
+        "south": 33.2490851,
+        "east": -111.4594598,
+        "north": 33.3669652
+      },
+      "nodes": 262,
+      "edges": 510,
+      "trail_edges": 408,
+      "connector_edges": 102,
+      "dem_samples": 12284,
+      "connector_count": 10,
+      "connector_path_meters": 6680.9,
+      "size_bytes": 164669,
+      "build_seconds": 8.27,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.500_33.250",
+      "file": "-111.500_33.250.pkl",
+      "source_pbf": "osm_tiles/dense_small/-111.500_33.250.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.5,
+        "south": 33.25,
+        "east": -111.375,
+        "north": 33.375
+      },
+      "actual_graph_bounds": {
+        "west": -111.528818,
+        "south": 33.2360403,
+        "east": -111.3520944,
+        "north": 33.3832441
+      },
+      "nodes": 385,
+      "edges": 932,
+      "trail_edges": 890,
+      "connector_edges": 42,
+      "dem_samples": 59254,
+      "connector_count": 10,
+      "connector_path_meters": 2557.8,
+      "size_bytes": 456268,
+      "build_seconds": 8.47,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.375_33.250",
+      "file": "-111.375_33.250.pkl",
+      "source_pbf": "osm_tiles/dense_small/-111.375_33.250.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.375,
+        "south": 33.25,
+        "east": -111.25,
+        "north": 33.375
+      },
+      "actual_graph_bounds": {
+        "west": -111.4885249,
+        "south": 33.2360403,
+        "east": -111.243031,
+        "north": 33.3815812
+      },
+      "nodes": 436,
+      "edges": 920,
+      "trail_edges": 896,
+      "connector_edges": 24,
+      "dem_samples": 53253,
+      "connector_count": 10,
+      "connector_path_meters": 1187.6,
+      "size_bytes": 454837,
+      "build_seconds": 7.59,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.25_33.25",
+      "file": "-111.25_33.25.pkl",
+      "source_pbf": "osm_tiles/-111.25_33.25.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.25,
+        "south": 33.25,
+        "east": -110.75,
+        "north": 33.75
+      },
+      "actual_graph_bounds": {
+        "west": -111.2875892,
+        "south": 33.2110775,
+        "east": -110.7507433,
+        "north": 33.7801354
+      },
+      "nodes": 2687,
+      "edges": 5328,
+      "trail_edges": 5296,
+      "connector_edges": 32,
+      "dem_samples": 393905,
+      "connector_count": 16,
+      "connector_path_meters": 333.3,
+      "size_bytes": 4139515,
+      "build_seconds": 59.67,
+      "skipped_existing": false
+    },
+    {
+      "id": "-110.75_33.25",
+      "file": "-110.75_33.25.pkl",
+      "source_pbf": "osm_tiles/-110.75_33.25.osm.pbf",
+      "nominal_bounds": {
+        "west": -110.75,
+        "south": 33.25,
+        "east": -110.25,
+        "north": 33.75
+      },
+      "actual_graph_bounds": {
+        "west": -110.771851,
+        "south": 33.2946079,
+        "east": -110.7528761,
+        "north": 33.4762186
+      },
+      "nodes": 11,
+      "edges": 14,
+      "trail_edges": 14,
+      "connector_edges": 0,
+      "dem_samples": 1773,
+      "connector_count": 0,
+      "connector_path_meters": 0.0,
+      "size_bytes": 13329,
+      "build_seconds": 2.82,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.750_33.375",
+      "file": "-112.750_33.375.pkl",
+      "source_pbf": "osm_tiles/dense_small/-112.750_33.375.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.75,
+        "south": 33.375,
+        "east": -112.625,
+        "north": 33.5
+      },
+      "actual_graph_bounds": {
+        "west": -112.7513456,
+        "south": 33.3702327,
+        "east": -112.6058534,
+        "north": 33.5269751
+      },
+      "nodes": 491,
+      "edges": 1012,
+      "trail_edges": 992,
+      "connector_edges": 20,
+      "dem_samples": 44888,
+      "connector_count": 10,
+      "connector_path_meters": 373.1,
+      "size_bytes": 290297,
+      "build_seconds": 6.64,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.625_33.375",
+      "file": "-112.625_33.375.pkl",
+      "source_pbf": "osm_tiles/dense_small/-112.625_33.375.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.625,
+        "south": 33.375,
+        "east": -112.5,
+        "north": 33.5
+      },
+      "actual_graph_bounds": {
+        "west": -112.6499189,
+        "south": 33.3725374,
+        "east": -112.4787783,
+        "north": 33.5081766
+      },
+      "nodes": 600,
+      "edges": 1258,
+      "trail_edges": 1238,
+      "connector_edges": 20,
+      "dem_samples": 47894,
+      "connector_count": 10,
+      "connector_path_meters": 154.2,
+      "size_bytes": 449663,
+      "build_seconds": 12.73,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.500_33.375",
+      "file": "-112.500_33.375.pkl",
+      "source_pbf": "osm_tiles/dense_small/-112.500_33.375.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.5,
+        "south": 33.375,
+        "east": -112.375,
+        "north": 33.5
+      },
+      "actual_graph_bounds": {
+        "west": -112.5042292,
+        "south": 33.3714501,
+        "east": -112.3750911,
+        "north": 33.493749
+      },
+      "nodes": 389,
+      "edges": 796,
+      "trail_edges": 766,
+      "connector_edges": 30,
+      "dem_samples": 28405,
+      "connector_count": 10,
+      "connector_path_meters": 555.7,
+      "size_bytes": 374191,
+      "build_seconds": 14.07,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.375_33.375",
+      "file": "-112.375_33.375.pkl",
+      "source_pbf": "osm_tiles/dense_small/-112.375_33.375.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.375,
+        "south": 33.375,
+        "east": -112.25,
+        "north": 33.5
+      },
+      "actual_graph_bounds": {
+        "west": -112.3750911,
+        "south": 33.3669801,
+        "east": -112.2361258,
+        "north": 33.5076368
+      },
+      "nodes": 245,
+      "edges": 518,
+      "trail_edges": 388,
+      "connector_edges": 130,
+      "dem_samples": 14271,
+      "connector_count": 10,
+      "connector_path_meters": 8394.0,
+      "size_bytes": 224014,
+      "build_seconds": 17.15,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.250_33.375",
+      "file": "-112.250_33.375.pkl",
+      "source_pbf": "osm_tiles/phoenix_small/-112.250_33.375.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.25,
+        "south": 33.375,
+        "east": -112.125,
+        "north": 33.5
+      },
+      "actual_graph_bounds": {
+        "west": -112.2542984,
+        "south": 33.362898,
+        "east": -112.1284547,
+        "north": 33.501218
+      },
+      "nodes": 233,
+      "edges": 450,
+      "trail_edges": 258,
+      "connector_edges": 192,
+      "dem_samples": 6372,
+      "connector_count": 10,
+      "connector_path_meters": 9763.2,
+      "size_bytes": 170255,
+      "build_seconds": 18.19,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.125_33.375",
+      "file": "-112.125_33.375.pkl",
+      "source_pbf": "osm_tiles/phoenix_small/-112.125_33.375.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.125,
+        "south": 33.375,
+        "east": -112.0,
+        "north": 33.5
+      },
+      "actual_graph_bounds": {
+        "west": -112.1148597,
+        "south": 33.3748459,
+        "east": -111.9966962,
+        "north": 33.4973579
+      },
+      "nodes": 1356,
+      "edges": 2608,
+      "trail_edges": 524,
+      "connector_edges": 2084,
+      "dem_samples": 4004,
+      "connector_count": 10,
+      "connector_path_meters": 42151.4,
+      "size_bytes": 674744,
+      "build_seconds": 51.96,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.000_33.375",
+      "file": "-112.000_33.375.pkl",
+      "source_pbf": "osm_tiles/phoenix_small/-112.000_33.375.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.0,
+        "south": 33.375,
+        "east": -111.875,
+        "north": 33.5
+      },
+      "actual_graph_bounds": {
+        "west": -112.0081659,
+        "south": 33.3746936,
+        "east": -111.8768258,
+        "north": 33.5010561
+      },
+      "nodes": 1222,
+      "edges": 2442,
+      "trail_edges": 2414,
+      "connector_edges": 28,
+      "dem_samples": 22119,
+      "connector_count": 10,
+      "connector_path_meters": 427.2,
+      "size_bytes": 709865,
+      "build_seconds": 50.38,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.875_33.375",
+      "file": "-111.875_33.375.pkl",
+      "source_pbf": "osm_tiles/phoenix_small/-111.875_33.375.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.875,
+        "south": 33.375,
+        "east": -111.75,
+        "north": 33.5
+      },
+      "actual_graph_bounds": {
+        "west": -111.8760912,
+        "south": 33.3747359,
+        "east": -111.7515059,
+        "north": 33.4922618
+      },
+      "nodes": 218,
+      "edges": 426,
+      "trail_edges": 232,
+      "connector_edges": 194,
+      "dem_samples": 2974,
+      "connector_count": 10,
+      "connector_path_meters": 11104.2,
+      "size_bytes": 117973,
+      "build_seconds": 22.36,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.750_33.375",
+      "file": "-111.750_33.375.pkl",
+      "source_pbf": "osm_tiles/dense_small/-111.750_33.375.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.75,
+        "south": 33.375,
+        "east": -111.625,
+        "north": 33.5
+      },
+      "actual_graph_bounds": {
+        "west": -111.7328963,
+        "south": 33.3812035,
+        "east": -111.6213131,
+        "north": 33.5110865
+      },
+      "nodes": 573,
+      "edges": 1510,
+      "trail_edges": 1486,
+      "connector_edges": 24,
+      "dem_samples": 20534,
+      "connector_count": 10,
+      "connector_path_meters": 377.0,
+      "size_bytes": 500633,
+      "build_seconds": 19.85,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.625_33.375",
+      "file": "-111.625_33.375.pkl",
+      "source_pbf": "osm_tiles/dense_small/-111.625_33.375.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.625,
+        "south": 33.375,
+        "east": -111.5,
+        "north": 33.5
+      },
+      "actual_graph_bounds": {
+        "west": -111.6265011,
+        "south": 33.3788004,
+        "east": -111.4759777,
+        "north": 33.5463042
+      },
+      "nodes": 848,
+      "edges": 2126,
+      "trail_edges": 2078,
+      "connector_edges": 48,
+      "dem_samples": 56165,
+      "connector_count": 10,
+      "connector_path_meters": 2772.4,
+      "size_bytes": 878913,
+      "build_seconds": 16.58,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.500_33.375",
+      "file": "-111.500_33.375.pkl",
+      "source_pbf": "osm_tiles/dense_small/-111.500_33.375.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.5,
+        "south": 33.375,
+        "east": -111.375,
+        "north": 33.5
+      },
+      "actual_graph_bounds": {
+        "west": -111.5112469,
+        "south": 33.3602332,
+        "east": -111.3353755,
+        "north": 33.5340328
+      },
+      "nodes": 904,
+      "edges": 2312,
+      "trail_edges": 2244,
+      "connector_edges": 68,
+      "dem_samples": 83628,
+      "connector_count": 10,
+      "connector_path_meters": 2994.8,
+      "size_bytes": 1391837,
+      "build_seconds": 15.52,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.375_33.375",
+      "file": "-111.375_33.375.pkl",
+      "source_pbf": "osm_tiles/dense_small/-111.375_33.375.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.375,
+        "south": 33.375,
+        "east": -111.25,
+        "north": 33.5
+      },
+      "actual_graph_bounds": {
+        "west": -111.4234223,
+        "south": 33.353439,
+        "east": -111.22068,
+        "north": 33.5261931
+      },
+      "nodes": 151,
+      "edges": 374,
+      "trail_edges": 362,
+      "connector_edges": 12,
+      "dem_samples": 42597,
+      "connector_count": 4,
+      "connector_path_meters": 2187.0,
+      "size_bytes": 633928,
+      "build_seconds": 6.63,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.750_33.500",
+      "file": "-112.750_33.500.pkl",
+      "source_pbf": "osm_tiles/dense_small/-112.750_33.500.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.75,
+        "south": 33.5,
+        "east": -112.625,
+        "north": 33.625
+      },
+      "actual_graph_bounds": {
+        "west": -112.7646048,
+        "south": 33.4806991,
+        "east": -112.5799197,
+        "north": 33.6419464
+      },
+      "nodes": 230,
+      "edges": 548,
+      "trail_edges": 458,
+      "connector_edges": 90,
+      "dem_samples": 43582,
+      "connector_count": 6,
+      "connector_path_meters": 5019.0,
+      "size_bytes": 347353,
+      "build_seconds": 6.22,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.625_33.500",
+      "file": "-112.625_33.500.pkl",
+      "source_pbf": "osm_tiles/dense_small/-112.625_33.500.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.625,
+        "south": 33.5,
+        "east": -112.5,
+        "north": 33.625
+      },
+      "actual_graph_bounds": {
+        "west": -112.6778797,
+        "south": 33.4995155,
+        "east": -112.4964641,
+        "north": 33.636636
+      },
+      "nodes": 198,
+      "edges": 456,
+      "trail_edges": 416,
+      "connector_edges": 40,
+      "dem_samples": 28796,
+      "connector_count": 3,
+      "connector_path_meters": 876.0,
+      "size_bytes": 332697,
+      "build_seconds": 5.34,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.500_33.500",
+      "file": "-112.500_33.500.pkl",
+      "source_pbf": "osm_tiles/dense_small/-112.500_33.500.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.5,
+        "south": 33.5,
+        "east": -112.375,
+        "north": 33.625
+      },
+      "actual_graph_bounds": {
+        "west": -112.5143729,
+        "south": 33.5045566,
+        "east": -112.3679253,
+        "north": 33.6383371
+      },
+      "nodes": 236,
+      "edges": 468,
+      "trail_edges": 270,
+      "connector_edges": 198,
+      "dem_samples": 12294,
+      "connector_count": 10,
+      "connector_path_meters": 21049.3,
+      "size_bytes": 209434,
+      "build_seconds": 12.33,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.375_33.500",
+      "file": "-112.375_33.500.pkl",
+      "source_pbf": "osm_tiles/dense_small/-112.375_33.500.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.375,
+        "south": 33.5,
+        "east": -112.25,
+        "north": 33.625
+      },
+      "actual_graph_bounds": {
+        "west": -112.3778648,
+        "south": 33.4790692,
+        "east": -112.2587965,
+        "north": 33.6235357
+      },
+      "nodes": 209,
+      "edges": 392,
+      "trail_edges": 220,
+      "connector_edges": 172,
+      "dem_samples": 7732,
+      "connector_count": 10,
+      "connector_path_meters": 11374.9,
+      "size_bytes": 138852,
+      "build_seconds": 16.26,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.250_33.500",
+      "file": "-112.250_33.500.pkl",
+      "source_pbf": "osm_tiles/phoenix_small/-112.250_33.500.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.25,
+        "south": 33.5,
+        "east": -112.125,
+        "north": 33.625
+      },
+      "actual_graph_bounds": {
+        "west": -112.246434,
+        "south": 33.4956632,
+        "east": -112.1245188,
+        "north": 33.610549
+      },
+      "nodes": 444,
+      "edges": 862,
+      "trail_edges": 152,
+      "connector_edges": 710,
+      "dem_samples": 2846,
+      "connector_count": 8,
+      "connector_path_meters": 28572.6,
+      "size_bytes": 259372,
+      "build_seconds": 26.46,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.125_33.500",
+      "file": "-112.125_33.500.pkl",
+      "source_pbf": "osm_tiles/phoenix_small/-112.125_33.500.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.125,
+        "south": 33.5,
+        "east": -112.0,
+        "north": 33.625
+      },
+      "actual_graph_bounds": {
+        "west": -112.125478,
+        "south": 33.5024667,
+        "east": -111.9929687,
+        "north": 33.6270341
+      },
+      "nodes": 1436,
+      "edges": 3584,
+      "trail_edges": 3584,
+      "connector_edges": 0,
+      "size_bytes": 1408519,
+      "skipped_existing": true
+    },
+    {
+      "id": "-112.000_33.500",
+      "file": "-112.000_33.500.pkl",
+      "source_pbf": "osm_tiles/phoenix_small/-112.000_33.500.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.0,
+        "south": 33.5,
+        "east": -111.875,
+        "north": 33.625
+      },
+      "actual_graph_bounds": {
+        "west": -112.0147516,
+        "south": 33.4983456,
+        "east": -111.7541792,
+        "north": 33.6249797
+      },
+      "nodes": 471,
+      "edges": 946,
+      "trail_edges": 926,
+      "connector_edges": 20,
+      "dem_samples": 25752,
+      "connector_count": 10,
+      "connector_path_meters": 336.1,
+      "size_bytes": 493472,
+      "build_seconds": 38.67,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.875_33.500",
+      "file": "-111.875_33.500.pkl",
+      "source_pbf": "osm_tiles/phoenix_small/-111.875_33.500.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.875,
+        "south": 33.5,
+        "east": -111.75,
+        "north": 33.625
+      },
+      "actual_graph_bounds": {
+        "west": -111.8916351,
+        "south": 33.5018242,
+        "east": -111.7493732,
+        "north": 33.634175
+      },
+      "nodes": 395,
+      "edges": 860,
+      "trail_edges": 818,
+      "connector_edges": 42,
+      "dem_samples": 43083,
+      "connector_count": 10,
+      "connector_path_meters": 2745.3,
+      "size_bytes": 457193,
+      "build_seconds": 11.62,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.750_33.500",
+      "file": "-111.750_33.500.pkl",
+      "source_pbf": "osm_tiles/dense_small/-111.750_33.500.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.75,
+        "south": 33.5,
+        "east": -111.625,
+        "north": 33.625
+      },
+      "actual_graph_bounds": {
+        "west": -111.7507524,
+        "south": 33.4811111,
+        "east": -111.6176734,
+        "north": 33.6348274
+      },
+      "nodes": 375,
+      "edges": 904,
+      "trail_edges": 844,
+      "connector_edges": 60,
+      "dem_samples": 43250,
+      "connector_count": 10,
+      "connector_path_meters": 7242.4,
+      "size_bytes": 577717,
+      "build_seconds": 9.58,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.625_33.500",
+      "file": "-111.625_33.500.pkl",
+      "source_pbf": "osm_tiles/dense_small/-111.625_33.500.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.625,
+        "south": 33.5,
+        "east": -111.5,
+        "north": 33.625
+      },
+      "actual_graph_bounds": {
+        "west": -111.6439989,
+        "south": 33.4810975,
+        "east": -111.4841201,
+        "north": 33.6407095
+      },
+      "nodes": 304,
+      "edges": 696,
+      "trail_edges": 634,
+      "connector_edges": 62,
+      "dem_samples": 40947,
+      "connector_count": 10,
+      "connector_path_meters": 5785.0,
+      "size_bytes": 423620,
+      "build_seconds": 5.86,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.500_33.500",
+      "file": "-111.500_33.500.pkl",
+      "source_pbf": "osm_tiles/dense_small/-111.500_33.500.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.5,
+        "south": 33.5,
+        "east": -111.375,
+        "north": 33.625
+      },
+      "actual_graph_bounds": {
+        "west": -111.5117912,
+        "south": 33.4918744,
+        "east": -111.3735532,
+        "north": 33.6372289
+      },
+      "nodes": 205,
+      "edges": 554,
+      "trail_edges": 402,
+      "connector_edges": 152,
+      "dem_samples": 30705,
+      "connector_count": 10,
+      "connector_path_meters": 24332.8,
+      "size_bytes": 381479,
+      "build_seconds": 4.52,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.375_33.500",
+      "file": "-111.375_33.500.pkl",
+      "source_pbf": "osm_tiles/dense_small/-111.375_33.500.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.375,
+        "south": 33.5,
+        "east": -111.25,
+        "north": 33.625
+      },
+      "actual_graph_bounds": {
+        "west": -111.3786744,
+        "south": 33.4930031,
+        "east": -111.228101,
+        "north": 33.6297908
+      },
+      "nodes": 81,
+      "edges": 166,
+      "trail_edges": 130,
+      "connector_edges": 36,
+      "dem_samples": 8137,
+      "connector_count": 10,
+      "connector_path_meters": 8080.0,
+      "size_bytes": 102185,
+      "build_seconds": 1.47,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.750_33.625",
+      "file": "-112.750_33.625.pkl",
+      "source_pbf": "osm_tiles/dense_small/-112.750_33.625.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.75,
+        "south": 33.625,
+        "east": -112.625,
+        "north": 33.75
+      },
+      "actual_graph_bounds": {
+        "west": -112.8185301,
+        "south": 33.5597513,
+        "east": -112.6079817,
+        "north": 33.8109476
+      },
+      "nodes": 200,
+      "edges": 406,
+      "trail_edges": 228,
+      "connector_edges": 178,
+      "dem_samples": 26378,
+      "connector_count": 10,
+      "connector_path_meters": 11010.2,
+      "size_bytes": 178317,
+      "build_seconds": 4.64,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.625_33.625",
+      "file": "-112.625_33.625.pkl",
+      "source_pbf": "osm_tiles/dense_small/-112.625_33.625.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.625,
+        "south": 33.625,
+        "east": -112.5,
+        "north": 33.75
+      },
+      "actual_graph_bounds": {
+        "west": -112.6431366,
+        "south": 33.6168863,
+        "east": -112.4871795,
+        "north": 33.7495284
+      },
+      "nodes": 260,
+      "edges": 494,
+      "trail_edges": 308,
+      "connector_edges": 186,
+      "dem_samples": 16475,
+      "connector_count": 10,
+      "connector_path_meters": 13703.8,
+      "size_bytes": 193102,
+      "build_seconds": 4.16,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.500_33.625",
+      "file": "-112.500_33.625.pkl",
+      "source_pbf": "osm_tiles/dense_small/-112.500_33.625.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.5,
+        "south": 33.625,
+        "east": -112.375,
+        "north": 33.75
+      },
+      "actual_graph_bounds": {
+        "west": -112.5480616,
+        "south": 33.5850723,
+        "east": -112.316637,
+        "north": 33.7530711
+      },
+      "nodes": 220,
+      "edges": 408,
+      "trail_edges": 204,
+      "connector_edges": 204,
+      "dem_samples": 14193,
+      "connector_count": 10,
+      "connector_path_meters": 11772.3,
+      "size_bytes": 199567,
+      "build_seconds": 14.76,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.375_33.625",
+      "file": "-112.375_33.625.pkl",
+      "source_pbf": "osm_tiles/dense_small/-112.375_33.625.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.375,
+        "south": 33.625,
+        "east": -112.25,
+        "north": 33.75
+      },
+      "actual_graph_bounds": {
+        "west": -112.4094694,
+        "south": 33.6297247,
+        "east": -112.2388881,
+        "north": 33.7639574
+      },
+      "nodes": 535,
+      "edges": 956,
+      "trail_edges": 910,
+      "connector_edges": 46,
+      "dem_samples": 28522,
+      "connector_count": 10,
+      "connector_path_meters": 1291.7,
+      "size_bytes": 461322,
+      "build_seconds": 18.93,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.250_33.625",
+      "file": "-112.250_33.625.pkl",
+      "source_pbf": "osm_tiles/phoenix_small/-112.250_33.625.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.25,
+        "south": 33.625,
+        "east": -112.125,
+        "north": 33.75
+      },
+      "actual_graph_bounds": {
+        "west": -112.2549512,
+        "south": 33.6271684,
+        "east": -112.1259677,
+        "north": 33.7710105
+      },
+      "nodes": 655,
+      "edges": 1486,
+      "trail_edges": 664,
+      "connector_edges": 822,
+      "dem_samples": 25883,
+      "connector_count": 10,
+      "connector_path_meters": 44104.5,
+      "size_bytes": 704595,
+      "build_seconds": 21.02,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.125_33.625",
+      "file": "-112.125_33.625.pkl",
+      "source_pbf": "osm_tiles/phoenix_small/-112.125_33.625.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.125,
+        "south": 33.625,
+        "east": -112.0,
+        "north": 33.75
+      },
+      "actual_graph_bounds": {
+        "west": -112.123053,
+        "south": 33.6204652,
+        "east": -111.9789447,
+        "north": 33.7634899
+      },
+      "nodes": 335,
+      "edges": 714,
+      "trail_edges": 616,
+      "connector_edges": 98,
+      "dem_samples": 17063,
+      "connector_count": 10,
+      "connector_path_meters": 3791.2,
+      "size_bytes": 270315,
+      "build_seconds": 18.8,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.000_33.625",
+      "file": "-112.000_33.625.pkl",
+      "source_pbf": "osm_tiles/phoenix_small/-112.000_33.625.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.0,
+        "south": 33.625,
+        "east": -111.875,
+        "north": 33.75
+      },
+      "actual_graph_bounds": {
+        "west": -112.0080152,
+        "south": 33.624974,
+        "east": -111.7910092,
+        "north": 33.7700456
+      },
+      "nodes": 506,
+      "edges": 1086,
+      "trail_edges": 1060,
+      "connector_edges": 26,
+      "dem_samples": 32493,
+      "connector_count": 10,
+      "connector_path_meters": 615.4,
+      "size_bytes": 553682,
+      "build_seconds": 25.49,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.875_33.625",
+      "file": "-111.875_33.625.pkl",
+      "source_pbf": "osm_tiles/phoenix_small/-111.875_33.625.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.875,
+        "south": 33.625,
+        "east": -111.75,
+        "north": 33.75
+      },
+      "actual_graph_bounds": {
+        "west": -111.8787864,
+        "south": 33.6137555,
+        "east": -111.7191997,
+        "north": 33.7704325
+      },
+      "nodes": 769,
+      "edges": 1702,
+      "trail_edges": 1674,
+      "connector_edges": 28,
+      "dem_samples": 67412,
+      "connector_count": 10,
+      "connector_path_meters": 647.6,
+      "size_bytes": 1086928,
+      "build_seconds": 17.72,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.750_33.625",
+      "file": "-111.750_33.625.pkl",
+      "source_pbf": "osm_tiles/dense_small/-111.750_33.625.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.75,
+        "south": 33.625,
+        "east": -111.625,
+        "north": 33.75
+      },
+      "actual_graph_bounds": {
+        "west": -111.8123699,
+        "south": 33.584275,
+        "east": -111.5575576,
+        "north": 33.7948677
+      },
+      "nodes": 714,
+      "edges": 1790,
+      "trail_edges": 1738,
+      "connector_edges": 52,
+      "dem_samples": 67106,
+      "connector_count": 10,
+      "connector_path_meters": 2364.7,
+      "size_bytes": 832928,
+      "build_seconds": 10.31,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.625_33.625",
+      "file": "-111.625_33.625.pkl",
+      "source_pbf": "osm_tiles/dense_small/-111.625_33.625.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.625,
+        "south": 33.625,
+        "east": -111.5,
+        "north": 33.75
+      },
+      "actual_graph_bounds": {
+        "west": -111.5937352,
+        "south": 33.5936402,
+        "east": -111.466978,
+        "north": 33.7575103
+      },
+      "nodes": 142,
+      "edges": 344,
+      "trail_edges": 344,
+      "connector_edges": 0,
+      "dem_samples": 45787,
+      "connector_count": 0,
+      "connector_path_meters": 0.0,
+      "size_bytes": 332973,
+      "build_seconds": 6.22,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.500_33.625",
+      "file": "-111.500_33.625.pkl",
+      "source_pbf": "osm_tiles/dense_small/-111.500_33.625.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.5,
+        "south": 33.625,
+        "east": -111.375,
+        "north": 33.75
+      },
+      "actual_graph_bounds": {
+        "west": -111.5339107,
+        "south": 33.5776096,
+        "east": -111.3182428,
+        "north": 33.7737969
+      },
+      "nodes": 92,
+      "edges": 206,
+      "trail_edges": 168,
+      "connector_edges": 38,
+      "dem_samples": 27607,
+      "connector_count": 8,
+      "connector_path_meters": 14188.3,
+      "size_bytes": 198983,
+      "build_seconds": 3.27,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.375_33.625",
+      "file": "-111.375_33.625.pkl",
+      "source_pbf": "osm_tiles/dense_small/-111.375_33.625.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.375,
+        "south": 33.625,
+        "east": -111.25,
+        "north": 33.75
+      },
+      "actual_graph_bounds": {
+        "west": -111.4057365,
+        "south": 33.6297908,
+        "east": -111.2409081,
+        "north": 33.7737969
+      },
+      "nodes": 37,
+      "edges": 58,
+      "trail_edges": 56,
+      "connector_edges": 2,
+      "dem_samples": 18176,
+      "connector_count": 1,
+      "connector_path_meters": 55.3,
+      "size_bytes": 148875,
+      "build_seconds": 2.31,
+      "skipped_existing": false
+    },
+    {
+      "id": "-113.25_33.75",
+      "file": "-113.25_33.75.pkl",
+      "source_pbf": "osm_tiles/-113.25_33.75.osm.pbf",
+      "nominal_bounds": {
+        "west": -113.25,
+        "south": 33.75,
+        "east": -112.75,
+        "north": 34.25
+      },
+      "actual_graph_bounds": {
+        "west": -113.0504627,
+        "south": 33.7723906,
+        "east": -112.7206425,
+        "north": 34.266255
+      },
+      "nodes": 1137,
+      "edges": 2266,
+      "trail_edges": 2206,
+      "connector_edges": 60,
+      "dem_samples": 149292,
+      "connector_count": 16,
+      "connector_path_meters": 3534.0,
+      "size_bytes": 1344449,
+      "build_seconds": 26.38,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.75_33.75",
+      "file": "-112.75_33.75.pkl",
+      "source_pbf": "osm_tiles/-112.75_33.75.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.75,
+        "south": 33.75,
+        "east": -112.25,
+        "north": 34.25
+      },
+      "actual_graph_bounds": {
+        "west": -112.766522,
+        "south": 33.738517,
+        "east": -112.2184122,
+        "north": 34.28026
+      },
+      "nodes": 3347,
+      "edges": 7134,
+      "trail_edges": 7102,
+      "connector_edges": 32,
+      "dem_samples": 406771,
+      "connector_count": 16,
+      "connector_path_meters": 755.9,
+      "size_bytes": 4067846,
+      "build_seconds": 64.69,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.25_33.75",
+      "file": "-112.25_33.75.pkl",
+      "source_pbf": "osm_tiles/-112.25_33.75.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.25,
+        "south": 33.75,
+        "east": -111.75,
+        "north": 34.25
+      },
+      "actual_graph_bounds": {
+        "west": -112.287671,
+        "south": 33.7352093,
+        "east": -111.6651372,
+        "north": 34.2748495
+      },
+      "nodes": 6842,
+      "edges": 17798,
+      "trail_edges": 17762,
+      "connector_edges": 36,
+      "dem_samples": 605263,
+      "connector_count": 16,
+      "connector_path_meters": 738.0,
+      "size_bytes": 9037682,
+      "build_seconds": 113.79,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.75_33.75",
+      "file": "-111.75_33.75.pkl",
+      "source_pbf": "osm_tiles/-111.75_33.75.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.75,
+        "south": 33.75,
+        "east": -111.25,
+        "north": 34.25
+      },
+      "actual_graph_bounds": {
+        "west": -111.7863253,
+        "south": 33.681511,
+        "east": -111.217563,
+        "north": 34.280637
+      },
+      "nodes": 2639,
+      "edges": 6634,
+      "trail_edges": 6596,
+      "connector_edges": 38,
+      "dem_samples": 398877,
+      "connector_count": 16,
+      "connector_path_meters": 1344.4,
+      "size_bytes": 4567389,
+      "build_seconds": 59.09,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.25_33.75",
+      "file": "-111.25_33.75.pkl",
+      "source_pbf": "osm_tiles/-111.25_33.75.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.25,
+        "south": 33.75,
+        "east": -110.75,
+        "north": 34.25
+      },
+      "actual_graph_bounds": {
+        "west": -111.2855195,
+        "south": 33.7043296,
+        "east": -110.7517511,
+        "north": 34.2815101
+      },
+      "nodes": 1140,
+      "edges": 2254,
+      "trail_edges": 2216,
+      "connector_edges": 38,
+      "dem_samples": 337796,
+      "connector_count": 16,
+      "connector_path_meters": 3004.3,
+      "size_bytes": 2350676,
+      "build_seconds": 45.9,
+      "skipped_existing": false
+    },
+    {
+      "id": "-110.75_33.75",
+      "file": "-110.75_33.75.pkl",
+      "source_pbf": "osm_tiles/-110.75_33.75.osm.pbf",
+      "nominal_bounds": {
+        "west": -110.75,
+        "south": 33.75,
+        "east": -110.25,
+        "north": 34.25
+      },
+      "actual_graph_bounds": null,
+      "nodes": 0,
+      "edges": 0,
+      "trail_edges": 0,
+      "connector_edges": 0,
+      "dem_samples": 0,
+      "connector_count": 0,
+      "connector_path_meters": 0.0,
+      "size_bytes": 967,
+      "build_seconds": 2.19,
+      "skipped_existing": false
+    },
+    {
+      "id": "-113.25_34.25",
+      "file": "-113.25_34.25.pkl",
+      "source_pbf": "osm_tiles/-113.25_34.25.osm.pbf",
+      "nominal_bounds": {
+        "west": -113.25,
+        "south": 34.25,
+        "east": -112.75,
+        "north": 34.75
+      },
+      "actual_graph_bounds": {
+        "west": -113.045106,
+        "south": 34.2271473,
+        "east": -112.7695646,
+        "north": 34.2847047
+      },
+      "nodes": 21,
+      "edges": 32,
+      "trail_edges": 32,
+      "connector_edges": 0,
+      "dem_samples": 4676,
+      "connector_count": 0,
+      "connector_path_meters": 0.0,
+      "size_bytes": 22616,
+      "build_seconds": 2.1,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.75_34.25",
+      "file": "-112.75_34.25.pkl",
+      "source_pbf": "osm_tiles/-112.75_34.25.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.75,
+        "south": 34.25,
+        "east": -112.25,
+        "north": 34.75
+      },
+      "actual_graph_bounds": {
+        "west": -112.7439753,
+        "south": 34.22649,
+        "east": -112.2331445,
+        "north": 34.2847838
+      },
+      "nodes": 86,
+      "edges": 180,
+      "trail_edges": 122,
+      "connector_edges": 58,
+      "dem_samples": 13947,
+      "connector_count": 12,
+      "connector_path_meters": 18957.5,
+      "size_bytes": 98954,
+      "build_seconds": 8.06,
+      "skipped_existing": false
+    },
+    {
+      "id": "-112.25_34.25",
+      "file": "-112.25_34.25.pkl",
+      "source_pbf": "osm_tiles/-112.25_34.25.osm.pbf",
+      "nominal_bounds": {
+        "west": -112.25,
+        "south": 34.25,
+        "east": -111.75,
+        "north": 34.75
+      },
+      "actual_graph_bounds": {
+        "west": -112.2641398,
+        "south": 34.1948564,
+        "east": -111.723886,
+        "north": 34.284719
+      },
+      "nodes": 224,
+      "edges": 450,
+      "trail_edges": 408,
+      "connector_edges": 42,
+      "dem_samples": 37644,
+      "connector_count": 9,
+      "connector_path_meters": 6664.8,
+      "size_bytes": 429737,
+      "build_seconds": 9.29,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.75_34.25",
+      "file": "-111.75_34.25.pkl",
+      "source_pbf": "osm_tiles/-111.75_34.25.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.75,
+        "south": 34.25,
+        "east": -111.25,
+        "north": 34.75
+      },
+      "actual_graph_bounds": {
+        "west": -111.7909393,
+        "south": 34.196597,
+        "east": -111.241794,
+        "north": 34.2847455
+      },
+      "nodes": 129,
+      "edges": 330,
+      "trail_edges": 100,
+      "connector_edges": 230,
+      "dem_samples": 16520,
+      "connector_count": 4,
+      "connector_path_meters": 13117.6,
+      "size_bytes": 149861,
+      "build_seconds": 8.14,
+      "skipped_existing": false
+    },
+    {
+      "id": "-111.25_34.25",
+      "file": "-111.25_34.25.pkl",
+      "source_pbf": "osm_tiles/-111.25_34.25.osm.pbf",
+      "nominal_bounds": {
+        "west": -111.25,
+        "south": 34.25,
+        "east": -110.75,
+        "north": 34.75
+      },
+      "actual_graph_bounds": {
+        "west": -111.273406,
+        "south": 34.2143652,
+        "east": -110.7507048,
+        "north": 34.2847807
+      },
+      "nodes": 94,
+      "edges": 184,
+      "trail_edges": 156,
+      "connector_edges": 28,
+      "dem_samples": 25648,
+      "connector_count": 4,
+      "connector_path_meters": 13905.1,
+      "size_bytes": 185848,
+      "build_seconds": 9.51,
+      "skipped_existing": false
+    },
+    {
+      "id": "-110.75_34.25",
+      "file": "-110.75_34.25.pkl",
+      "source_pbf": "osm_tiles/-110.75_34.25.osm.pbf",
+      "nominal_bounds": {
+        "west": -110.75,
+        "south": 34.25,
+        "east": -110.25,
+        "north": 34.75
+      },
+      "actual_graph_bounds": null,
+      "nodes": 0,
+      "edges": 0,
+      "trail_edges": 0,
+      "connector_edges": 0,
+      "dem_samples": 0,
+      "connector_count": 0,
+      "connector_path_meters": 0.0,
+      "size_bytes": 967,
+      "build_seconds": 3.79,
+      "skipped_existing": false
+    }
+  ]
+}
