@@ -116,7 +116,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 50000
 
-APP_VERSION = "2026-08-19-v39-static-overlay-dynamic-workspace"
+APP_VERSION = "2026-08-19-v40-static-overlay-dynamic-workspace"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -8438,6 +8438,7 @@ def route_map():
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Trail Running Creator</title>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.css">
 
 <style>
 * {
@@ -8547,11 +8548,65 @@ button:disabled {
     background: white;
 }
 
-#map {
+#map-wrap {
+    position: relative;
     flex: 0 0 80%;
     width: 100%;
     height: 80%;
     min-height: 0;
+    overflow: hidden;
+}
+
+#map,
+#map3d {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    min-height: 0;
+}
+
+#map3d {
+    display: none;
+}
+
+#map-mode-control {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    z-index: 1000;
+    display: flex;
+    gap: 4px;
+    padding: 4px;
+    border-radius: 8px;
+    background: rgba(255,255,255,0.94);
+    box-shadow: 0 1px 5px rgba(0,0,0,0.28);
+}
+
+#map-mode-control button {
+    margin: 0;
+    padding: 7px 11px;
+    min-width: 46px;
+    font-size: 13px;
+    border-radius: 6px;
+    background: #444;
+}
+
+#map-mode-control button.active {
+    background: #111;
+}
+
+#terrain-status {
+    position: absolute;
+    left: 10px;
+    bottom: 10px;
+    z-index: 1000;
+    display: none;
+    padding: 5px 8px;
+    border-radius: 6px;
+    background: rgba(255,255,255,0.92);
+    color: #333;
+    font-size: 11px;
 }
 
 #elevation-profile-panel {
@@ -9220,7 +9275,15 @@ input[type="range"] {
 </div>
 
 <div id="visual-panel">
-    <div id="map"></div>
+    <div id="map-wrap">
+        <div id="map"></div>
+        <div id="map3d"></div>
+        <div id="map-mode-control" aria-label="Map view">
+            <button id="map2dButton" type="button" class="active">2D</button>
+            <button id="map3dButton" type="button" title="3D terrain preview">3D</button>
+        </div>
+        <div id="terrain-status">3D terrain preview · use 2D for route editing</div>
+    </div>
     <div id="elevation-profile-panel">
         <div id="elevation-profile-title">Elevation profile · select a route</div>
         <svg id="elevationProfileSvg" role="img" aria-label="Elevation profile of selected route"></svg>
@@ -9228,6 +9291,7 @@ input[type="range"] {
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://unpkg.com/maplibre-gl@5.24.0/dist/maplibre-gl.js"></script>
 
 <script>
 const map = L.map("map", {preferCanvas: true}).setView(
@@ -9242,6 +9306,288 @@ L.tileLayer(
         attribution: "&copy; OpenStreetMap contributors"
     }
 ).addTo(map);
+
+// ============================================================
+// V40 OPTIONAL 3D MAP PREVIEW
+// ============================================================
+//
+// Routing/editing remains on the proven Leaflet map. The 3D view is a fast
+// MapLibre preview using a hosted raster DEM. This avoids changing any backend
+// routing behavior and can be removed later if we switch to self-hosted terrain.
+//
+// Terrain source follows MapLibre's current 3D terrain example.
+let map3d = null;
+let map3dReady = false;
+let map3dActive = false;
+
+const map2dButton = document.getElementById("map2dButton");
+const map3dButton = document.getElementById("map3dButton");
+const map2dContainer = document.getElementById("map");
+const map3dContainer = document.getElementById("map3d");
+const terrainStatus = document.getElementById("terrain-status");
+
+function emptyFeatureCollection() {
+    return {type: "FeatureCollection", features: []};
+}
+
+function lineFeatureCollectionFromLatLonSegments(segments) {
+    const features = [];
+    for (const segment of (segments || [])) {
+        if (!segment || segment.length < 2) continue;
+        const coords = segment
+            .map(p => [Number(p[1]), Number(p[0])])
+            .filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1]));
+        if (coords.length >= 2) {
+            features.push({
+                type: "Feature",
+                properties: {},
+                geometry: {type: "LineString", coordinates: coords}
+            });
+        }
+    }
+    return {type: "FeatureCollection", features};
+}
+
+function selectedRoute3DGeoJSON() {
+    if (!lastGeneratedRoute || !lastGeneratedRoute.route_options) {
+        return emptyFeatureCollection();
+    }
+    const option = lastGeneratedRoute.route_options[selectedRouteOptionIndex];
+    if (!option || !Array.isArray(option.route) || option.route.length < 2) {
+        return emptyFeatureCollection();
+    }
+    const coords = option.route
+        .map(p => [Number(p.lon), Number(p.lat)])
+        .filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1]));
+    if (coords.length < 2) return emptyFeatureCollection();
+    return {
+        type: "FeatureCollection",
+        features: [{
+            type: "Feature",
+            properties: {},
+            geometry: {type: "LineString", coordinates: coords}
+        }]
+    };
+}
+
+function plannerPoints3DGeoJSON() {
+    const features = [];
+
+    const slat = Number(document.getElementById("start_lat").value);
+    const slon = Number(document.getElementById("start_lon").value);
+    if (Number.isFinite(slat) && Number.isFinite(slon)) {
+        features.push({
+            type: "Feature",
+            properties: {kind: "start"},
+            geometry: {type: "Point", coordinates: [slon, slat]}
+        });
+    }
+
+    for (const point of (passPoints || [])) {
+        if (Number.isFinite(Number(point.lat)) && Number.isFinite(Number(point.lon))) {
+            features.push({
+                type: "Feature",
+                properties: {kind: "pass"},
+                geometry: {type: "Point", coordinates: [Number(point.lon), Number(point.lat)]}
+            });
+        }
+    }
+
+    for (const area of (avoidAreas || [])) {
+        if (Number.isFinite(Number(area.lat)) && Number.isFinite(Number(area.lon))) {
+            features.push({
+                type: "Feature",
+                properties: {kind: "avoid"},
+                geometry: {type: "Point", coordinates: [Number(area.lon), Number(area.lat)]}
+            });
+        }
+    }
+
+    return {type: "FeatureCollection", features};
+}
+
+function set3DSourceData(id, data) {
+    if (!map3d || !map3dReady) return;
+    const source = map3d.getSource(id);
+    if (source && typeof source.setData === "function") {
+        source.setData(data);
+    }
+}
+
+function refresh3DMapData() {
+    if (!map3d || !map3dReady) return;
+    set3DSourceData("trail-overlay", lineFeatureCollectionFromLatLonSegments(masterTrailSegments));
+    set3DSourceData("selected-route", selectedRoute3DGeoJSON());
+    set3DSourceData("planner-points", plannerPoints3DGeoJSON());
+}
+
+function initialize3DMap() {
+    if (map3d) return;
+
+    const center = map.getCenter();
+    map3d = new maplibregl.Map({
+        container: "map3d",
+        center: [center.lng, center.lat],
+        zoom: map.getZoom(),
+        pitch: 67,
+        bearing: -18,
+        maxPitch: 85,
+        maxZoom: 18,
+        style: {
+            version: 8,
+            sources: {
+                osm: {
+                    type: "raster",
+                    tiles: ["https://tile.openstreetmap.org/{z}/{x}/{y}.png"],
+                    tileSize: 256,
+                    maxzoom: 19,
+                    attribution: "&copy; OpenStreetMap contributors"
+                },
+                terrainSource: {
+                    type: "raster-dem",
+                    url: "https://tiles.mapterhorn.com/tilejson.json"
+                },
+                hillshadeSource: {
+                    type: "raster-dem",
+                    url: "https://tiles.mapterhorn.com/tilejson.json"
+                }
+            },
+            layers: [
+                {
+                    id: "osm-base",
+                    type: "raster",
+                    source: "osm"
+                },
+                {
+                    id: "terrain-hillshade",
+                    type: "hillshade",
+                    source: "hillshadeSource",
+                    paint: {
+                        "hillshade-exaggeration": 0.35
+                    }
+                }
+            ],
+            terrain: {
+                source: "terrainSource",
+                exaggeration: 1.15
+            }
+        }
+    });
+
+    map3d.addControl(
+        new maplibregl.NavigationControl({
+            visualizePitch: true,
+            showZoom: true,
+            showCompass: true
+        }),
+        "top-left"
+    );
+
+    map3d.on("load", () => {
+        map3d.addSource("trail-overlay", {
+            type: "geojson",
+            data: emptyFeatureCollection()
+        });
+        map3d.addLayer({
+            id: "trail-overlay-line",
+            type: "line",
+            source: "trail-overlay",
+            paint: {
+                "line-color": "#666666",
+                "line-width": 2.4,
+                "line-opacity": 0.62
+            }
+        });
+
+        map3d.addSource("selected-route", {
+            type: "geojson",
+            data: emptyFeatureCollection()
+        });
+        map3d.addLayer({
+            id: "selected-route-line",
+            type: "line",
+            source: "selected-route",
+            paint: {
+                "line-color": "#d60000",
+                "line-width": 5.5,
+                "line-opacity": 0.98
+            }
+        });
+
+        map3d.addSource("planner-points", {
+            type: "geojson",
+            data: emptyFeatureCollection()
+        });
+        map3d.addLayer({
+            id: "planner-point-layer",
+            type: "circle",
+            source: "planner-points",
+            paint: {
+                "circle-radius": [
+                    "match", ["get", "kind"],
+                    "start", 7,
+                    "pass", 6,
+                    "avoid", 6,
+                    5
+                ],
+                "circle-color": [
+                    "match", ["get", "kind"],
+                    "start", "#1565c0",
+                    "pass", "#7b1fa2",
+                    "avoid", "#ef6c00",
+                    "#222222"
+                ],
+                "circle-stroke-color": "#ffffff",
+                "circle-stroke-width": 1.5
+            }
+        });
+
+        map3dReady = true;
+        refresh3DMapData();
+    });
+}
+
+function show3DMap() {
+    initialize3DMap();
+
+    const center = map.getCenter();
+    map3dContainer.style.display = "block";
+    map2dContainer.style.visibility = "hidden";
+    map3dActive = true;
+    map3dButton.classList.add("active");
+    map2dButton.classList.remove("active");
+    terrainStatus.style.display = "block";
+
+    // MapLibre must resize after its previously hidden container becomes visible.
+    requestAnimationFrame(() => {
+        map3d.resize();
+        map3d.jumpTo({
+            center: [center.lng, center.lat],
+            zoom: Math.max(0, map.getZoom() - 0.2),
+            pitch: 67
+        });
+        refresh3DMapData();
+    });
+}
+
+function show2DMap() {
+    if (map3d && map3dActive) {
+        const center = map3d.getCenter();
+        const zoom = map3d.getZoom();
+        map.setView([center.lat, center.lng], zoom, {animate: false});
+    }
+
+    map3dContainer.style.display = "none";
+    map2dContainer.style.visibility = "visible";
+    map3dActive = false;
+    map2dButton.classList.add("active");
+    map3dButton.classList.remove("active");
+    terrainStatus.style.display = "none";
+    requestAnimationFrame(() => map.invalidateSize());
+}
+
+map2dButton.addEventListener("click", show2DMap);
+map3dButton.addEventListener("click", show3DMap);
 
 let routeLine = null;
 let routeOptionLines = [];
@@ -10291,6 +10637,7 @@ function setStartPoint(latlng, statusText = "Start selected. Generate a route or
     document.getElementById("results").innerHTML =
         '<span class="success">Start selected from map. Drag the marker to fine-tune it.</span>';
     commitPlannerState();
+    refresh3DMapData();
 }
 
 
@@ -11014,6 +11361,7 @@ function selectRouteOption(index, fitMap = true) {
     const selected = options[index];
     renderSelectedRouteDetails(selected);
     renderElevationProfile(selected);
+    refresh3DMapData();
     downloadGpxButton.disabled = false;
     editRouteButton.disabled = false;
     replaceSectionButton.disabled = false;
@@ -11256,6 +11604,7 @@ async function loadMasterTrailOverlayOnce(force = false) {
 
         masterTrailOverlayLastKey = key;
         updateNetworkVisibility();
+        refresh3DMapData();
         return result;
     })();
 
