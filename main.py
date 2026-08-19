@@ -116,7 +116,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 50000
 
-APP_VERSION = "2026-08-19-v40-static-overlay-dynamic-workspace"
+APP_VERSION = "2026-08-19-v41-exact-edge-replacement"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -259,14 +259,16 @@ class AvoidArea(BaseModel):
 
 
 class TrailSegmentPoint(BaseModel):
-    # Point projected onto the trail segment chosen in the browser. Using a
-    # point instead of persistent OSM node IDs keeps the selection valid when
-    # the request graph temporarily splits an edge at the exact start/pass point.
     lat: float
     lon: float
-    # V32 replacement edits also send the full gray-overlay geometry. Avoid/prefer
-    # controls can continue sending only lat/lon.
     geometry: list[list[float]] = Field(default_factory=list)
+
+    # V41 replacement selections carry the exact edge drawn in the gray overlay.
+    # These stay optional so existing avoid/prefer segment controls still work.
+    tile_id: str | None = None
+    edge_u: int | None = None
+    edge_v: int | None = None
+    edge_key: str | None = None
 
 
 class RouteRequest(BaseModel):
@@ -7510,6 +7512,116 @@ def _append_route_coords(target, incoming):
     return target
 
 
+
+def _resolve_exact_overlay_edge(G, selected, selected_index=None):
+    """Resolve a green selection by tile/u/v/key instead of nearest-edge guessing."""
+    u = getattr(selected, "edge_u", None)
+    v = getattr(selected, "edge_v", None)
+    wanted_key = getattr(selected, "edge_key", None)
+    label = (
+        f"Replacement trail segment {selected_index + 1}"
+        if selected_index is not None
+        else "Replacement trail segment"
+    )
+
+    if u is None or v is None or wanted_key is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{label} does not contain an exact edge ID. "
+                "Rebuild overlay_tiles using build_overlay_tiles_v41.py, refresh the browser, "
+                "then start the replacement selection again."
+            ),
+        )
+
+    u = int(u)
+    v = int(v)
+    wanted_key = str(wanted_key)
+
+    candidates = []
+    for a, b in ((u, v), (v, u)):
+        bundle = G.get_edge_data(a, b) or {}
+        for key, data in bundle.items():
+            if str(key) != wanted_key:
+                continue
+            if str(data.get("route_class", "trail")) != "trail":
+                continue
+            coords = oriented_edge_coords(G, a, b, data)
+            if len(coords) >= 2:
+                candidates.append((a, b, key, data, coords))
+
+    # Exact cut-point insertion can split the first/last chosen edge. In that
+    # case, find the split child with the same original edge key and geometry.
+    if not candidates:
+        raw_geometry = [
+            (float(point[1]), float(point[0]))
+            for point in (selected.geometry or [])
+            if isinstance(point, (list, tuple)) and len(point) >= 2
+        ]
+        if len(raw_geometry) >= 2:
+            mid_lon, mid_lat = raw_geometry[len(raw_geometry) // 2]
+            split_candidates = []
+            for a, b, key, data in G.edges(keys=True, data=True):
+                if str(key) != wanted_key:
+                    continue
+                if str(data.get("route_class", "trail")) != "trail":
+                    continue
+                if (
+                    a not in (u, v)
+                    and b not in (u, v)
+                    and not bool(data.get("virtual_split_edge", False))
+                ):
+                    continue
+                coords = oriented_edge_coords(G, a, b, data)
+                nearest = nearest_position_on_polyline(coords, mid_lon, mid_lat)
+                if nearest is None:
+                    continue
+                split_candidates.append(
+                    (float(nearest["distance_m"]), a, b, key, data, coords)
+                )
+            split_candidates.sort(key=lambda item: item[0])
+            if split_candidates and split_candidates[0][0] <= 8.0:
+                _, a, b, key, data, coords = split_candidates[0]
+                candidates.append((a, b, key, data, coords))
+
+    if not candidates:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{label} ({getattr(selected, 'tile_id', '')}:{u}->{v}:{wanted_key}) "
+                "is not present in this routing workspace. Refresh the gray trails "
+                "and select the replacement corridor again."
+            ),
+        )
+
+    # If both directions exist, pick the copy nearest the exact browser click.
+    ranked = []
+    for a, b, key, data, coords in candidates:
+        nearest = nearest_position_on_polyline(
+            coords, float(selected.lon), float(selected.lat)
+        )
+        distance = float(nearest["distance_m"]) if nearest else 1e12
+        ranked.append((distance, a, b, key, data, coords))
+    ranked.sort(key=lambda item: item[0])
+    distance, a, b, key, data, coords = ranked[0]
+
+    return {
+        "u": a,
+        "v": b,
+        "key": key,
+        "physical_key": undirected_edge_key(a, b),
+        "distance_m": distance,
+        "routing_lat": float(selected.lat),
+        "routing_lon": float(selected.lon),
+        "tile_id": getattr(selected, "tile_id", None),
+        "selected_geometry": [
+            [float(point[0]), float(point[1])]
+            for point in (selected.geometry or [])
+            if isinstance(point, (list, tuple)) and len(point) >= 2
+        ],
+    }
+
+
 def _exact_directed_edge_choice(G, required, enter, leave):
     """Return the exact graph edge that corresponds to the selected green trail.
 
@@ -7883,10 +7995,25 @@ def replace_route_section(request: RouteSectionReplacementRequest):
         # Use the full cached TIFF workspace for deliberate edits. A user may
         # choose a replacement corridor outside the normal target-radius slice.
         edit_profile = get_route_profile(float(request.target_distance_miles))
+        replacement_reach_m = 0.0
+        for selected in request.replacement_segments:
+            replacement_reach_m = max(
+                replacement_reach_m,
+                haversine_meters(
+                    float(request.start_lat),
+                    float(request.start_lon),
+                    float(selected.lat),
+                    float(selected.lon),
+                ),
+            )
+        edit_radius_m = max(
+            float(edit_profile["search_radius_m"]),
+            replacement_reach_m + 1.25 * METERS_PER_MILE,
+        )
         workspace, _ = get_start_workspace(
             float(request.start_lat),
             float(request.start_lon),
-            requested_radius_m=float(edit_profile["search_radius_m"]),
+            requested_radius_m=edit_radius_m,
             force_rebuild=False,
         )
         G = workspace["graph"].copy()
@@ -7930,28 +8057,17 @@ def replace_route_section(request: RouteSectionReplacementRequest):
         required_edges = []
         resolved_segments = []
         for index, selected in enumerate(request.replacement_segments):
-            match = _nearest_natural_edge_to_selected_point(
-                G, float(selected.lat), float(selected.lon)
-            )
-            if match is None:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Replacement trail segment {index + 1} is not available in the routing graph or is blocked by an avoid setting.",
-                )
-            match = dict(match)
-            match["selected_geometry"] = [
-                [float(point[0]), float(point[1])]
-                for point in (selected.geometry or [])
-                if isinstance(point, (list, tuple)) and len(point) >= 2
-            ]
+            match = _resolve_exact_overlay_edge(G, selected, selected_index=index)
             required_edges.append(match)
             resolved_segments.append({
                 "index": index,
+                "tile_id": match.get("tile_id"),
                 "lat": float(match["routing_lat"]),
                 "lon": float(match["routing_lon"]),
                 "snap_distance_m": round(float(match["distance_m"]), 2),
                 "edge_u": int(match["u"]),
                 "edge_v": int(match["v"]),
+                "edge_key": str(match["key"]),
             })
 
         # Make the old orange corridor effectively unavailable, but NEVER
@@ -7970,13 +8086,10 @@ def replace_route_section(request: RouteSectionReplacementRequest):
         # Re-resolve against the penalized graph, but carry the browser's exact
         # highlighted geometry forward. This is what gets spliced into the route.
         forced_edges = []
-        for selected, original_match in zip(request.replacement_segments, required_edges):
-            match = _nearest_natural_edge_to_selected_point(
-                G, float(selected.lat), float(selected.lon)
-            )
-            if match is None:
-                raise HTTPException(status_code=400, detail="A selected green trail disappeared after applying route constraints.")
-            match = dict(match)
+        for index, (selected, original_match) in enumerate(
+            zip(request.replacement_segments, required_edges)
+        ):
+            match = _resolve_exact_overlay_edge(G, selected, selected_index=index)
             match["selected_geometry"] = list(original_match.get("selected_geometry") or [])
             forced_edges.append(match)
 
@@ -9604,6 +9717,7 @@ let masterTrailOverlayRequestId = 0;
 let masterTrailOverlayLastKey = "";
 let masterTrailOverlayTimer = null;
 let masterTrailSegments = [];
+let masterTrailRecords = [];
 const MIN_TRAIL_OVERLAY_ZOOM = 11;
 let startPointPlacementMode = true;
 let passPoints = [];
@@ -10178,7 +10292,11 @@ function addReplacementTrailSegment(latlng) {
     replacementTrailSegments.push({
         lat: Number(nearest.lat.toFixed(7)),
         lon: Number(nearest.lon.toFixed(7)),
-        geometry: nearest.geometry
+        geometry: nearest.geometry,
+        tile_id: nearest.tile_id,
+        edge_u: nearest.edge_u,
+        edge_v: nearest.edge_v,
+        edge_key: nearest.edge_key
     });
     updateRouteReplacementControls();
     drawRouteReplacementLayers();
@@ -10282,7 +10400,11 @@ async function applyRouteSectionReplacement() {
         replacement_segments: replacementTrailSegments.map(item => ({
             lat: Number(item.lat),
             lon: Number(item.lon),
-            geometry: (item.geometry || []).map(point => [Number(point[0]), Number(point[1])])
+            geometry: (item.geometry || []).map(point => [Number(point[0]), Number(point[1])]),
+            tile_id: item.tile_id ?? null,
+            edge_u: item.edge_u ?? null,
+            edge_v: item.edge_v ?? null,
+            edge_key: item.edge_key ?? null
         })),
         avoid_areas: input.avoid_areas,
         avoid_segments: input.avoid_segments,
@@ -10642,12 +10764,25 @@ function setStartPoint(latlng, statusText = "Start selected. Generate a route or
 
 
 function findNearestOverlayTrailSegment(latlng) {
-    if (!masterTrailSegments || masterTrailSegments.length === 0) return null;
+    const records = (masterTrailRecords && masterTrailRecords.length)
+        ? masterTrailRecords
+        : (masterTrailSegments || []).map(segment => ({
+            tile_id: null,
+            u: null,
+            v: null,
+            key: null,
+            geometry: segment
+        }));
+
+    if (!records.length) return null;
+
     const clickPoint = map.latLngToLayerPoint(latlng);
     let best = null;
 
-    for (const segment of masterTrailSegments) {
+    for (const record of records) {
+        const segment = record.geometry || [];
         if (!segment || segment.length < 2) continue;
+
         for (let i = 0; i < segment.length - 1; i++) {
             const aLL = L.latLng(Number(segment[i][0]), Number(segment[i][1]));
             const bLL = L.latLng(Number(segment[i + 1][0]), Number(segment[i + 1][1]));
@@ -10656,24 +10791,31 @@ function findNearestOverlayTrailSegment(latlng) {
             const dx = b.x - a.x;
             const dy = b.y - a.y;
             const denom = dx * dx + dy * dy;
-            let t = denom > 0 ? ((clickPoint.x - a.x) * dx + (clickPoint.y - a.y) * dy) / denom : 0;
+            let t = denom > 0
+                ? ((clickPoint.x - a.x) * dx + (clickPoint.y - a.y) * dy) / denom
+                : 0;
             t = Math.max(0, Math.min(1, t));
+
             const px = a.x + t * dx;
             const py = a.y + t * dy;
             const distPx = Math.hypot(clickPoint.x - px, clickPoint.y - py);
+
             if (!best || distPx < best.distancePx) {
                 best = {
                     distancePx: distPx,
                     lat: aLL.lat + (bLL.lat - aLL.lat) * t,
                     lon: aLL.lng + (bLL.lng - aLL.lng) * t,
-                    geometry: segment.map(point => [Number(point[0]), Number(point[1])])
+                    geometry: segment.map(point => [Number(point[0]), Number(point[1])]),
+                    tile_id: record.tile_id ?? null,
+                    edge_u: record.u === null || record.u === undefined ? null : Number(record.u),
+                    edge_v: record.v === null || record.v === undefined ? null : Number(record.v),
+                    edge_key: record.key === null || record.key === undefined ? null : String(record.key)
                 };
             }
         }
     }
     return best;
 }
-
 
 function trailGeometrySignature(geometry) {
     if (!geometry || geometry.length < 2) return "";
@@ -11539,6 +11681,7 @@ async function loadMasterTrailOverlayOnce(force = false) {
     if (map.getZoom() < MIN_TRAIL_OVERLAY_ZOOM) {
         networkLayer.clearLayers();
         masterTrailSegments = [];
+        masterTrailRecords = [];
         masterTrailOverlayLastKey = "";
         return null;
     }
@@ -11568,6 +11711,7 @@ async function loadMasterTrailOverlayOnce(force = false) {
 
         networkLayer.clearLayers();
         masterTrailSegments = [];
+        masterTrailRecords = [];
 
         if (result.viewport_too_wide) {
             masterTrailOverlayLastKey = key;
@@ -11589,8 +11733,22 @@ async function loadMasterTrailOverlayOnce(force = false) {
 
         for (const tileResult of tileResults) {
             const segments = tileResult.allowed_trails || [];
+            const records = tileResult.trail_records || [];
             if (segments.length === 0) continue;
+
             masterTrailSegments.push(...segments);
+            if (records.length) {
+                masterTrailRecords.push(...records);
+            } else {
+                masterTrailRecords.push(...segments.map(segment => ({
+                    tile_id: tileResult.tile_id || null,
+                    u: null,
+                    v: null,
+                    key: null,
+                    geometry: segment
+                })));
+            }
+
             L.polyline(
                 segments,
                 {

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build lightweight gray-trail overlay tiles from processed routing tiles.
+"""Build V41 gray-trail overlay tiles with exact routing-edge identities.
 
 Run beside main.py:
     python build_overlay_tiles.py
@@ -93,12 +93,13 @@ def main():
         print(f"[{index}/{len(rows)}] {tile_id}")
 
         if int(row.get("trail_edges", 0) or 0) <= 0 or not source.exists():
-            payload = {"tile_id": tile_id, "allowed_trails": [], "allowed_trail_segments": 0}
+            payload = {"tile_id": tile_id, "allowed_trails": [], "trail_records": [], "allowed_trail_segments": 0}
         else:
             with source.open("rb") as f:
                 G = pickle.load(f)
 
             segments = []
+            trail_records = []
             seen = set()
             for u, v, key, data in G.edges(keys=True, data=True):
                 if str(data.get("route_class", "trail")) != "trail":
@@ -113,11 +114,20 @@ def main():
                 seen.add(physical)
                 coords = oriented_edge_coords(G, u, v, data)
                 if len(coords) >= 2:
-                    segments.append([[float(lat), float(lon)] for lon, lat in coords])
+                    geometry = [[float(lat), float(lon)] for lon, lat in coords]
+                    segments.append(geometry)
+                    trail_records.append({
+                        "tile_id": tile_id,
+                        "u": int(u),
+                        "v": int(v),
+                        "key": str(key),
+                        "geometry": geometry,
+                    })
 
             payload = {
                 "tile_id": tile_id,
                 "allowed_trails": segments,
+                "trail_records": trail_records,
                 "allowed_trail_segments": len(segments),
             }
 

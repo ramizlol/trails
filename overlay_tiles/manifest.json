@@ -3,7 +3,7 @@
   "routing_manifest_schema": "trail-routing-tile-manifest-v1",
   "tile_count": 69,
   "total_segments": 49219,
-  "total_size_bytes": 7448187,
+  "total_size_bytes": 15374824,
   "coverage_nominal": {
     "west": -113.25,
     "south": 32.75,
@@ -21,7 +21,7 @@
         "north": 33.25
       },
       "segments": 346,
-      "size_bytes": 67505
+      "size_bytes": 138553
     },
     {
       "id": "-112.75_32.75",
@@ -33,7 +33,7 @@
         "north": 33.25
       },
       "segments": 814,
-      "size_bytes": 103403
+      "size_bytes": 215271
     },
     {
       "id": "-112.25_32.75",
@@ -45,7 +45,7 @@
         "north": 33.25
       },
       "segments": 1668,
-      "size_bytes": 110239
+      "size_bytes": 237142
     },
     {
       "id": "-111.75_32.75",
@@ -57,7 +57,7 @@
         "north": 33.25
       },
       "segments": 2953,
-      "size_bytes": 241267
+      "size_bytes": 511799
     },
     {
       "id": "-111.25_32.75",
@@ -69,7 +69,7 @@
         "north": 33.25
       },
       "segments": 1849,
-      "size_bytes": 394834
+      "size_bytes": 809077
     },
     {
       "id": "-110.75_32.75",
@@ -81,7 +81,7 @@
         "north": 33.25
       },
       "segments": 0,
-      "size_bytes": 97
+      "size_bytes": 110
     },
     {
       "id": "-113.25_33.25",
@@ -93,7 +93,7 @@
         "north": 33.75
       },
       "segments": 1303,
-      "size_bytes": 135946
+      "size_bytes": 285203
     },
     {
       "id": "-112.750_33.250",
@@ -105,7 +105,7 @@
         "north": 33.375
       },
       "segments": 493,
-      "size_bytes": 21824
+      "size_bytes": 48107
     },
     {
       "id": "-112.625_33.250",
@@ -117,7 +117,7 @@
         "north": 33.375
       },
       "segments": 429,
-      "size_bytes": 32823
+      "size_bytes": 69628
     },
     {
       "id": "-112.500_33.250",
@@ -129,7 +129,7 @@
         "north": 33.375
       },
       "segments": 412,
-      "size_bytes": 115527
+      "size_bytes": 235274
     },
     {
       "id": "-112.375_33.250",
@@ -141,7 +141,7 @@
         "north": 33.375
       },
       "segments": 175,
-      "size_bytes": 45530
+      "size_bytes": 92648
     },
     {
       "id": "-112.250_33.250",
@@ -153,7 +153,7 @@
         "north": 33.375
       },
       "segments": 377,
-      "size_bytes": 53143
+      "size_bytes": 110082
     },
     {
       "id": "-112.125_33.250",
@@ -165,7 +165,7 @@
         "north": 33.375
       },
       "segments": 645,
-      "size_bytes": 121674
+      "size_bytes": 249909
     },
     {
       "id": "-112.000_33.250",
@@ -177,7 +177,7 @@
         "north": 33.375
       },
       "segments": 361,
-      "size_bytes": 33857
+      "size_bytes": 71660
     },
     {
       "id": "-111.875_33.250",
@@ -189,7 +189,7 @@
         "north": 33.375
       },
       "segments": 179,
-      "size_bytes": 11057
+      "size_bytes": 23937
     },
     {
       "id": "-111.750_33.250",
@@ -201,7 +201,7 @@
         "north": 33.375
       },
       "segments": 401,
-      "size_bytes": 23722
+      "size_bytes": 51297
     },
     {
       "id": "-111.625_33.250",
@@ -213,7 +213,7 @@
         "north": 33.375
       },
       "segments": 204,
-      "size_bytes": 13923
+      "size_bytes": 29824
     },
     {
       "id": "-111.500_33.250",
@@ -225,7 +225,7 @@
         "north": 33.375
       },
       "segments": 445,
-      "size_bytes": 59740
+      "size_bytes": 123711
     },
     {
       "id": "-111.375_33.250",
@@ -237,7 +237,7 @@
         "north": 33.375
       },
       "segments": 448,
-      "size_bytes": 60370
+      "size_bytes": 125277
     },
     {
       "id": "-111.25_33.25",
@@ -249,7 +249,7 @@
         "north": 33.75
       },
       "segments": 2648,
-      "size_bytes": 663548
+      "size_bytes": 1355131
     },
     {
       "id": "-110.75_33.25",
@@ -261,7 +261,7 @@
         "north": 33.75
       },
       "segments": 7,
-      "size_bytes": 2167
+      "size_bytes": 2440
     },
     {
       "id": "-112.750_33.375",
@@ -273,7 +273,7 @@
         "north": 33.5
       },
       "segments": 496,
-      "size_bytes": 21463
+      "size_bytes": 47444
     },
     {
       "id": "-112.625_33.375",
@@ -285,7 +285,7 @@
         "north": 33.5
       },
       "segments": 619,
-      "size_bytes": 43469
+      "size_bytes": 92795
     },
     {
       "id": "-112.500_33.375",
@@ -297,7 +297,7 @@
         "north": 33.5
       },
       "segments": 383,
-      "size_bytes": 45419
+      "size_bytes": 94733
     },
     {
       "id": "-112.375_33.375",
@@ -309,7 +309,7 @@
         "north": 33.5
       },
       "segments": 194,
-      "size_bytes": 24218
+      "size_bytes": 50320
     },
     {
       "id": "-112.250_33.375",
@@ -321,7 +321,7 @@
         "north": 33.5
       },
       "segments": 129,
-      "size_bytes": 14035
+      "size_bytes": 29406
     },
     {
       "id": "-112.125_33.375",
@@ -333,7 +333,7 @@
         "north": 33.5
       },
       "segments": 262,
-      "size_bytes": 11120
+      "size_bytes": 25075
     },
     {
       "id": "-112.000_33.375",
@@ -345,7 +345,7 @@
         "north": 33.5
       },
       "segments": 1207,
-      "size_bytes": 48245
+      "size_bytes": 108035
     },
     {
       "id": "-111.875_33.375",
@@ -357,7 +357,7 @@
         "north": 33.5
       },
       "segments": 116,
-      "size_bytes": 4848
+      "size_bytes": 6765
     },
     {
       "id": "-111.750_33.375",
@@ -369,7 +369,7 @@
         "north": 33.5
       },
       "segments": 586,
-      "size_bytes": 46657
+      "size_bytes": 98943
     },
     {
       "id": "-111.625_33.375",
@@ -381,7 +381,7 @@
         "north": 33.5
       },
       "segments": 1039,
-      "size_bytes": 96771
+      "size_bytes": 203021
     },
     {
       "id": "-111.500_33.375",
@@ -393,7 +393,7 @@
         "north": 33.5
       },
       "segments": 1122,
-      "size_bytes": 197978
+      "size_bytes": 407009
     },
     {
       "id": "-111.375_33.375",
@@ -405,7 +405,7 @@
         "north": 33.5
       },
       "segments": 181,
-      "size_bytes": 122627
+      "size_bytes": 247235
     },
     {
       "id": "-112.750_33.500",
@@ -417,7 +417,7 @@
         "north": 33.625
       },
       "segments": 229,
-      "size_bytes": 51337
+      "size_bytes": 104848
     },
     {
       "id": "-112.625_33.500",
@@ -429,7 +429,7 @@
         "north": 33.625
       },
       "segments": 208,
-      "size_bytes": 50607
+      "size_bytes": 103422
     },
     {
       "id": "-112.500_33.500",
@@ -441,7 +441,7 @@
         "north": 33.625
       },
       "segments": 135,
-      "size_bytes": 18005
+      "size_bytes": 37375
     },
     {
       "id": "-112.375_33.500",
@@ -453,7 +453,7 @@
         "north": 33.625
       },
       "segments": 110,
-      "size_bytes": 10112
+      "size_bytes": 21506
     },
     {
       "id": "-112.250_33.500",
@@ -465,7 +465,7 @@
         "north": 33.625
       },
       "segments": 76,
-      "size_bytes": 7395
+      "size_bytes": 10704
     },
     {
       "id": "-112.125_33.500",
@@ -477,7 +477,7 @@
         "north": 33.625
       },
       "segments": 1791,
-      "size_bytes": 141419
+      "size_bytes": 300344
     },
     {
       "id": "-112.000_33.500",
@@ -489,7 +489,7 @@
         "north": 33.625
       },
       "segments": 463,
-      "size_bytes": 63486
+      "size_bytes": 131874
     },
     {
       "id": "-111.875_33.500",
@@ -501,7 +501,7 @@
         "north": 33.625
       },
       "segments": 409,
-      "size_bytes": 59592
+      "size_bytes": 123305
     },
     {
       "id": "-111.750_33.500",
@@ -513,7 +513,7 @@
         "north": 33.625
       },
       "segments": 422,
-      "size_bytes": 83130
+      "size_bytes": 170455
     },
     {
       "id": "-111.625_33.500",
@@ -525,7 +525,7 @@
         "north": 33.625
       },
       "segments": 317,
-      "size_bytes": 60696
+      "size_bytes": 124615
     },
     {
       "id": "-111.500_33.500",
@@ -537,7 +537,7 @@
         "north": 33.625
       },
       "segments": 201,
-      "size_bytes": 53535
+      "size_bytes": 109037
     },
     {
       "id": "-111.375_33.500",
@@ -549,7 +549,7 @@
         "north": 33.625
       },
       "segments": 65,
-      "size_bytes": 13707
+      "size_bytes": 28028
     },
     {
       "id": "-112.750_33.625",
@@ -561,7 +561,7 @@
         "north": 33.75
       },
       "segments": 114,
-      "size_bytes": 21018
+      "size_bytes": 43219
     },
     {
       "id": "-112.625_33.625",
@@ -573,7 +573,7 @@
         "north": 33.75
       },
       "segments": 154,
-      "size_bytes": 16266
+      "size_bytes": 34140
     },
     {
       "id": "-112.500_33.625",
@@ -585,7 +585,7 @@
         "north": 33.75
       },
       "segments": 102,
-      "size_bytes": 22254
+      "size_bytes": 45623
     },
     {
       "id": "-112.375_33.625",
@@ -597,7 +597,7 @@
         "north": 33.75
       },
       "segments": 455,
-      "size_bytes": 58045
+      "size_bytes": 120853
     },
     {
       "id": "-112.250_33.625",
@@ -609,7 +609,7 @@
         "north": 33.75
       },
       "segments": 331,
-      "size_bytes": 66476
+      "size_bytes": 136367
     },
     {
       "id": "-112.125_33.625",
@@ -621,7 +621,7 @@
         "north": 33.75
       },
       "segments": 308,
-      "size_bytes": 26185
+      "size_bytes": 55413
     },
     {
       "id": "-112.000_33.625",
@@ -633,7 +633,7 @@
         "north": 33.75
       },
       "segments": 530,
-      "size_bytes": 70648
+      "size_bytes": 146598
     },
     {
       "id": "-111.875_33.625",
@@ -645,7 +645,7 @@
         "north": 33.75
       },
       "segments": 837,
-      "size_bytes": 152229
+      "size_bytes": 313141
     },
     {
       "id": "-111.750_33.625",
@@ -657,7 +657,7 @@
         "north": 33.75
       },
       "segments": 869,
-      "size_bytes": 100917
+      "size_bytes": 209770
     },
     {
       "id": "-111.625_33.625",
@@ -669,7 +669,7 @@
         "north": 33.75
       },
       "segments": 172,
-      "size_bytes": 61763
+      "size_bytes": 125148
     },
     {
       "id": "-111.500_33.625",
@@ -681,7 +681,7 @@
         "north": 33.75
       },
       "segments": 84,
-      "size_bytes": 32580
+      "size_bytes": 65991
     },
     {
       "id": "-111.375_33.625",
@@ -693,7 +693,7 @@
         "north": 33.75
       },
       "segments": 28,
-      "size_bytes": 29667
+      "size_bytes": 59586
     },
     {
       "id": "-113.25_33.75",
@@ -705,7 +705,7 @@
         "north": 34.25
       },
       "segments": 1077,
-      "size_bytes": 192921
+      "size_bytes": 396996
     },
     {
       "id": "-112.75_33.75",
@@ -717,7 +717,7 @@
         "north": 34.25
       },
       "segments": 3550,
-      "size_bytes": 571623
+      "size_bytes": 1179693
     },
     {
       "id": "-112.25_33.75",
@@ -729,7 +729,7 @@
         "north": 34.25
       },
       "segments": 8877,
-      "size_bytes": 1154010
+      "size_bytes": 2394264
     },
     {
       "id": "-111.75_33.75",
@@ -741,7 +741,7 @@
         "north": 34.25
       },
       "segments": 3297,
-      "size_bytes": 703860
+      "size_bytes": 1441091
     },
     {
       "id": "-111.25_33.75",
@@ -753,7 +753,7 @@
         "north": 34.25
       },
       "segments": 1108,
-      "size_bytes": 425596
+      "size_bytes": 863806
     },
     {
       "id": "-110.75_33.75",
@@ -765,7 +765,7 @@
         "north": 34.25
       },
       "segments": 0,
-      "size_bytes": 97
+      "size_bytes": 110
     },
     {
       "id": "-113.25_34.25",
@@ -777,7 +777,7 @@
         "north": 34.75
       },
       "segments": 16,
-      "size_bytes": 3701
+      "size_bytes": 4171
     },
     {
       "id": "-112.75_34.25",
@@ -789,7 +789,7 @@
         "north": 34.75
       },
       "segments": 61,
-      "size_bytes": 12957
+      "size_bytes": 26470
     },
     {
       "id": "-112.25_34.25",
@@ -801,7 +801,7 @@
         "north": 34.75
       },
       "segments": 204,
-      "size_bytes": 70111
+      "size_bytes": 142525
     },
     {
       "id": "-111.75_34.25",
@@ -813,7 +813,7 @@
         "north": 34.75
       },
       "segments": 50,
-      "size_bytes": 19933
+      "size_bytes": 40288
     },
     {
       "id": "-111.25_34.25",
@@ -825,7 +825,7 @@
         "north": 34.75
       },
       "segments": 78,
-      "size_bytes": 33164
+      "size_bytes": 67076
     },
     {
       "id": "-110.75_34.25",
@@ -837,7 +837,7 @@
         "north": 34.75
       },
       "segments": 0,
-      "size_bytes": 99
+      "size_bytes": 111
     }
   ]
 }
