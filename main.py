@@ -1854,6 +1854,8 @@ def get_dem_bounds_wgs84():
     if DEM_BOUNDS_WGS84_CACHE is not None:
         return DEM_BOUNDS_WGS84_CACHE
 
+    _ensure_data_file_downloaded(DEM_PATH, "DEM_TIF_URL")
+
     if not os.path.exists(DEM_PATH):
         raise HTTPException(
             status_code=500,
@@ -7001,6 +7003,8 @@ def trail_network(request: TrailNetworkRequest):
 
 @app.get("/dem-info")
 def dem_info():
+    _ensure_data_file_downloaded(DEM_PATH, "DEM_TIF_URL")
+
     if not os.path.exists(DEM_PATH):
         raise HTTPException(
             status_code=404,
