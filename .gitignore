@@ -1,2 +1,12 @@
 master_trails.graphml
 master_routing.graphml
+
+# Local geospatial build inputs
+__pycache__/
+osm_tiles/
+arizona-260817.osm.pbf
+central-az.osm.pbf
+output_hh.tif
+arizona_tile_grid.geojson
+tile-*.osm.pbf
+main_new.py
