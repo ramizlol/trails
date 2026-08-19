@@ -189,7 +189,7 @@ DEFAULT_ROUTE_DIVERSITY = 50.0
 # contains the TIFF-wide trail graph plus the small selective connector set.
 # Changing distance/gain reuses this workspace and only creates a cheap in-memory
 # radius subgraph for the actual route search.
-MAX_CACHED_WORKSPACES = 3
+MAX_CACHED_WORKSPACES = 1
 WORKSPACE_CACHE = {}
 WORKSPACE_CACHE_LOCK = threading.Lock()
 
