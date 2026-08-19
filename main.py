@@ -1678,6 +1678,8 @@ def sample_dem_points(points):
     DEM source and precision while avoiding repeated raster reads during
     finalist scoring.
     """
+    _ensure_data_file_downloaded(DEM_PATH, "DEM_TIF_URL")
+
     if not os.path.exists(DEM_PATH):
         raise HTTPException(
             status_code=500,
@@ -2021,6 +2023,34 @@ def _validate_offline_master_graph(G):
     return True
 
 
+def _ensure_data_file_downloaded(local_path, env_var_name):
+    """
+    If local_path is missing, try downloading it from the URL in the given
+    environment variable (set this on Render to a GitHub Release asset URL).
+    No-ops if the file already exists locally, or if the env var isn't set --
+    so local/dev behavior with the file already present is unchanged.
+    """
+    if os.path.exists(local_path):
+        return
+
+    url = os.environ.get(env_var_name)
+    if not url:
+        return
+
+    import urllib.request
+
+    print(f"{os.path.basename(local_path)} not found locally; downloading from {env_var_name}...")
+    tmp = local_path + ".downloading"
+    try:
+        urllib.request.urlretrieve(url, tmp)
+        os.replace(tmp, local_path)
+        print(f"  saved {local_path} ({os.path.getsize(local_path) / (1024*1024):.1f} MB)")
+    except Exception as exc:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        print(f"  download failed: {exc}")
+
+
 def try_load_saved_master_graph():
     """
     Load the prebuilt TIFF-wide graph without contacting OpenStreetMap.
@@ -2029,6 +2059,9 @@ def try_load_saved_master_graph():
     by an incompatible Python/library version, fall back to the portable
     GraphML committed to the repo and refresh the local pickle automatically.
     """
+    _ensure_data_file_downloaded(MASTER_GRAPH_PICKLE_PATH, "MASTER_TRAILS_PICKLE_URL")
+    _ensure_data_file_downloaded(MASTER_GRAPH_GRAPHML_PATH, "MASTER_TRAILS_GRAPHML_URL")
+
     if os.path.exists(MASTER_GRAPH_PICKLE_PATH):
         try:
             with open(MASTER_GRAPH_PICKLE_PATH, "rb") as f:
@@ -2504,6 +2537,9 @@ def _normalize_loaded_routing_graph(G):
 
 def try_load_saved_routing_graph():
     """Load the sparse trail+connector production graph entirely from disk."""
+    _ensure_data_file_downloaded(MASTER_ROUTING_PICKLE_PATH, "MASTER_ROUTING_PICKLE_URL")
+    _ensure_data_file_downloaded(MASTER_ROUTING_GRAPHML_PATH, "MASTER_ROUTING_GRAPHML_URL")
+
     if os.path.exists(MASTER_ROUTING_PICKLE_PATH):
         try:
             with open(MASTER_ROUTING_PICKLE_PATH, "rb") as f:
