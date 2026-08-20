@@ -117,7 +117,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 50000
 
-APP_VERSION = "2026-08-19-v44-rustworkx-hybrid-runtime"
+APP_VERSION = "2026-08-19-v45-rustworkx-pathmapping-fix"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -4354,7 +4354,13 @@ def fast_shortest_path(S, source, target, weight="routing_cost", edge_use_counts
         target=target_rx,
         weight_fn=weight_fn,
     )
-    rx_path = paths.get(target_rx)
+    # rustworkx returns a PathMapping, which supports indexed lookup but
+    # intentionally does not implement dict.get().
+    try:
+        rx_path = paths[target_rx]
+    except (KeyError, IndexError):
+        raise nx.NetworkXNoPath(f"No path between {source} and {target}")
+
     if not rx_path:
         raise nx.NetworkXNoPath(f"No path between {source} and {target}")
 
