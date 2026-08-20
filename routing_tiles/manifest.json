@@ -1,8 +1,8 @@
 {
   "schema": "trail-routing-tile-manifest-v1",
-  "generated_unix": 1787135789.9107258,
+  "generated_unix": 1787201882.0711567,
   "dem_file": "output_hh.tif",
-  "dem_signature": "output_hh.tif|-113.05208334,32.93541668,-110.75041668,34.28486112|8286x4858",
+  "dem_signature": "output_hh.tif|-113.05212427,32.93545984,-110.75045742,34.28490439|24858x14574",
   "tile_count": 69,
   "nonempty_tile_count": 66,
   "coverage_nominal": {
@@ -11,8 +11,8 @@
     "east": -110.25,
     "north": 34.75
   },
-  "total_size_bytes": 56455804,
-  "build_elapsed_seconds": 1341.56,
+  "total_size_bytes": 56477889,
+  "build_elapsed_seconds": 1270.76,
   "tiles": [
     {
       "id": "-113.25_32.75",
@@ -34,11 +34,11 @@
       "edges": 774,
       "trail_edges": 698,
       "connector_edges": 76,
-      "dem_samples": 80124,
+      "dem_samples": 42230,
       "connector_count": 16,
       "connector_path_meters": 30249.1,
-      "size_bytes": 463093,
-      "build_seconds": 12.12,
+      "size_bytes": 463013,
+      "build_seconds": 10.79,
       "skipped_existing": false
     },
     {
@@ -61,11 +61,11 @@
       "edges": 1680,
       "trail_edges": 1628,
       "connector_edges": 52,
-      "dem_samples": 163662,
+      "dem_samples": 85443,
       "connector_count": 16,
       "connector_path_meters": 3302.9,
-      "size_bytes": 784205,
-      "build_seconds": 22.44,
+      "size_bytes": 783963,
+      "build_seconds": 17.25,
       "skipped_existing": false
     },
     {
@@ -88,11 +88,11 @@
       "edges": 3374,
       "trail_edges": 3340,
       "connector_edges": 34,
-      "dem_samples": 186510,
+      "dem_samples": 96655,
       "connector_count": 16,
       "connector_path_meters": 797.0,
-      "size_bytes": 1155974,
-      "build_seconds": 43.76,
+      "size_bytes": 1155738,
+      "build_seconds": 38.47,
       "skipped_existing": false
     },
     {
@@ -115,11 +115,11 @@
       "edges": 5940,
       "trail_edges": 5908,
       "connector_edges": 32,
-      "dem_samples": 297570,
+      "dem_samples": 156289,
       "connector_count": 16,
       "connector_path_meters": 264.7,
-      "size_bytes": 2218849,
-      "build_seconds": 63.98,
+      "size_bytes": 2218451,
+      "build_seconds": 55.71,
       "skipped_existing": false
     },
     {
@@ -142,11 +142,11 @@
       "edges": 3734,
       "trail_edges": 3698,
       "connector_edges": 36,
-      "dem_samples": 288672,
+      "dem_samples": 157130,
       "connector_count": 16,
       "connector_path_meters": 2172.5,
-      "size_bytes": 2538442,
-      "build_seconds": 41.26,
+      "size_bytes": 2538094,
+      "build_seconds": 34.25,
       "skipped_existing": false
     },
     {
@@ -167,8 +167,8 @@
       "dem_samples": 0,
       "connector_count": 0,
       "connector_path_meters": 0.0,
-      "size_bytes": 967,
-      "build_seconds": 2.32,
+      "size_bytes": 969,
+      "build_seconds": 2.35,
       "skipped_existing": false
     },
     {
@@ -191,11 +191,11 @@
       "edges": 2644,
       "trail_edges": 2606,
       "connector_edges": 38,
-      "dem_samples": 163726,
+      "dem_samples": 86196,
       "connector_count": 16,
       "connector_path_meters": 1213.8,
-      "size_bytes": 1135676,
-      "build_seconds": 26.0,
+      "size_bytes": 1135478,
+      "build_seconds": 20.6,
       "skipped_existing": false
     },
     {
@@ -218,11 +218,11 @@
       "edges": 1006,
       "trail_edges": 986,
       "connector_edges": 20,
-      "dem_samples": 38865,
+      "dem_samples": 20093,
       "connector_count": 10,
       "connector_path_meters": 180.2,
-      "size_bytes": 285797,
-      "build_seconds": 5.33,
+      "size_bytes": 285777,
+      "build_seconds": 3.96,
       "skipped_existing": false
     },
     {
@@ -245,11 +245,11 @@
       "edges": 882,
       "trail_edges": 858,
       "connector_edges": 24,
-      "dem_samples": 36992,
+      "dem_samples": 19545,
       "connector_count": 10,
       "connector_path_meters": 751.6,
-      "size_bytes": 324195,
-      "build_seconds": 6.4,
+      "size_bytes": 324163,
+      "build_seconds": 5.35,
       "skipped_existing": false
     },
     {
@@ -272,11 +272,11 @@
       "edges": 918,
       "trail_edges": 824,
       "connector_edges": 94,
-      "dem_samples": 57907,
+      "dem_samples": 33654,
       "connector_count": 10,
       "connector_path_meters": 6382.8,
-      "size_bytes": 754590,
-      "build_seconds": 11.76,
+      "size_bytes": 754528,
+      "build_seconds": 10.53,
       "skipped_existing": false
     },
     {
@@ -299,11 +299,11 @@
       "edges": 422,
       "trail_edges": 350,
       "connector_edges": 72,
-      "dem_samples": 30866,
+      "dem_samples": 17260,
       "connector_count": 3,
       "connector_path_meters": 4039.3,
-      "size_bytes": 295563,
-      "build_seconds": 4.77,
+      "size_bytes": 295541,
+      "build_seconds": 3.27,
       "skipped_existing": false
     },
     {
@@ -326,11 +326,11 @@
       "edges": 780,
       "trail_edges": 758,
       "connector_edges": 22,
-      "dem_samples": 39093,
+      "dem_samples": 21277,
       "connector_count": 10,
       "connector_path_meters": 849.5,
-      "size_bytes": 396021,
-      "build_seconds": 8.3,
+      "size_bytes": 395979,
+      "build_seconds": 7.56,
       "skipped_existing": false
     },
     {
@@ -353,11 +353,11 @@
       "edges": 1506,
       "trail_edges": 1292,
       "connector_edges": 214,
-      "dem_samples": 62809,
+      "dem_samples": 35592,
       "connector_count": 10,
       "connector_path_meters": 10367.8,
-      "size_bytes": 902031,
-      "build_seconds": 14.2,
+      "size_bytes": 901957,
+      "build_seconds": 13.41,
       "skipped_existing": false
     },
     {
@@ -380,11 +380,11 @@
       "edges": 1018,
       "trail_edges": 726,
       "connector_edges": 292,
-      "dem_samples": 18650,
+      "dem_samples": 10523,
       "connector_count": 10,
       "connector_path_meters": 10231.9,
-      "size_bytes": 387016,
-      "build_seconds": 35.3,
+      "size_bytes": 386998,
+      "build_seconds": 35.95,
       "skipped_existing": false
     },
     {
@@ -407,11 +407,11 @@
       "edges": 1112,
       "trail_edges": 358,
       "connector_edges": 754,
-      "dem_samples": 5604,
+      "dem_samples": 3140,
       "connector_count": 10,
       "connector_path_meters": 22314.3,
-      "size_bytes": 321538,
-      "build_seconds": 36.31,
+      "size_bytes": 321534,
+      "build_seconds": 36.74,
       "skipped_existing": false
     },
     {
@@ -434,11 +434,11 @@
       "edges": 878,
       "trail_edges": 802,
       "connector_edges": 76,
-      "dem_samples": 12878,
+      "dem_samples": 7293,
       "connector_count": 10,
       "connector_path_meters": 1971.9,
-      "size_bytes": 296444,
-      "build_seconds": 21.85,
+      "size_bytes": 296442,
+      "build_seconds": 22.19,
       "skipped_existing": false
     },
     {
@@ -461,11 +461,11 @@
       "edges": 510,
       "trail_edges": 408,
       "connector_edges": 102,
-      "dem_samples": 12284,
+      "dem_samples": 6589,
       "connector_count": 10,
       "connector_path_meters": 6680.9,
-      "size_bytes": 164669,
-      "build_seconds": 8.27,
+      "size_bytes": 164661,
+      "build_seconds": 8.21,
       "skipped_existing": false
     },
     {
@@ -488,11 +488,11 @@
       "edges": 932,
       "trail_edges": 890,
       "connector_edges": 42,
-      "dem_samples": 59254,
+      "dem_samples": 31516,
       "connector_count": 10,
       "connector_path_meters": 2557.8,
-      "size_bytes": 456268,
-      "build_seconds": 8.47,
+      "size_bytes": 456190,
+      "build_seconds": 6.97,
       "skipped_existing": false
     },
     {
@@ -515,11 +515,11 @@
       "edges": 920,
       "trail_edges": 896,
       "connector_edges": 24,
-      "dem_samples": 53253,
+      "dem_samples": 28552,
       "connector_count": 10,
       "connector_path_meters": 1187.6,
-      "size_bytes": 454837,
-      "build_seconds": 7.59,
+      "size_bytes": 454781,
+      "build_seconds": 6.31,
       "skipped_existing": false
     },
     {
@@ -542,11 +542,11 @@
       "edges": 5328,
       "trail_edges": 5296,
       "connector_edges": 32,
-      "dem_samples": 393905,
+      "dem_samples": 218304,
       "connector_count": 16,
       "connector_path_meters": 333.3,
-      "size_bytes": 4139515,
-      "build_seconds": 59.67,
+      "size_bytes": 4139091,
+      "build_seconds": 50.19,
       "skipped_existing": false
     },
     {
@@ -569,11 +569,11 @@
       "edges": 14,
       "trail_edges": 14,
       "connector_edges": 0,
-      "dem_samples": 1773,
+      "dem_samples": 957,
       "connector_count": 0,
       "connector_path_meters": 0.0,
       "size_bytes": 13329,
-      "build_seconds": 2.82,
+      "build_seconds": 2.97,
       "skipped_existing": false
     },
     {
@@ -596,11 +596,11 @@
       "edges": 1012,
       "trail_edges": 992,
       "connector_edges": 20,
-      "dem_samples": 44888,
+      "dem_samples": 23106,
       "connector_count": 10,
       "connector_path_meters": 373.1,
-      "size_bytes": 290297,
-      "build_seconds": 6.64,
+      "size_bytes": 290247,
+      "build_seconds": 5.12,
       "skipped_existing": false
     },
     {
@@ -623,11 +623,11 @@
       "edges": 1258,
       "trail_edges": 1238,
       "connector_edges": 20,
-      "dem_samples": 47894,
+      "dem_samples": 25310,
       "connector_count": 10,
       "connector_path_meters": 154.2,
-      "size_bytes": 449663,
-      "build_seconds": 12.73,
+      "size_bytes": 449623,
+      "build_seconds": 11.55,
       "skipped_existing": false
     },
     {
@@ -650,11 +650,11 @@
       "edges": 796,
       "trail_edges": 766,
       "connector_edges": 30,
-      "dem_samples": 28405,
+      "dem_samples": 16237,
       "connector_count": 10,
       "connector_path_meters": 555.7,
-      "size_bytes": 374191,
-      "build_seconds": 14.07,
+      "size_bytes": 374173,
+      "build_seconds": 14.01,
       "skipped_existing": false
     },
     {
@@ -677,11 +677,11 @@
       "edges": 518,
       "trail_edges": 388,
       "connector_edges": 130,
-      "dem_samples": 14271,
+      "dem_samples": 8050,
       "connector_count": 10,
       "connector_path_meters": 8394.0,
-      "size_bytes": 224014,
-      "build_seconds": 17.15,
+      "size_bytes": 224002,
+      "build_seconds": 17.41,
       "skipped_existing": false
     },
     {
@@ -704,11 +704,11 @@
       "edges": 450,
       "trail_edges": 258,
       "connector_edges": 192,
-      "dem_samples": 6372,
+      "dem_samples": 3775,
       "connector_count": 10,
       "connector_path_meters": 9763.2,
-      "size_bytes": 170255,
-      "build_seconds": 18.19,
+      "size_bytes": 170251,
+      "build_seconds": 18.57,
       "skipped_existing": false
     },
     {
@@ -731,11 +731,11 @@
       "edges": 2608,
       "trail_edges": 524,
       "connector_edges": 2084,
-      "dem_samples": 4004,
+      "dem_samples": 2468,
       "connector_count": 10,
       "connector_path_meters": 42151.4,
-      "size_bytes": 674744,
-      "build_seconds": 51.96,
+      "size_bytes": 674746,
+      "build_seconds": 52.89,
       "skipped_existing": false
     },
     {
@@ -758,11 +758,11 @@
       "edges": 2442,
       "trail_edges": 2414,
       "connector_edges": 28,
-      "dem_samples": 22119,
+      "dem_samples": 12643,
       "connector_count": 10,
       "connector_path_meters": 427.2,
-      "size_bytes": 709865,
-      "build_seconds": 50.38,
+      "size_bytes": 709859,
+      "build_seconds": 50.17,
       "skipped_existing": false
     },
     {
@@ -785,11 +785,11 @@
       "edges": 426,
       "trail_edges": 232,
       "connector_edges": 194,
-      "dem_samples": 2974,
+      "dem_samples": 1639,
       "connector_count": 10,
       "connector_path_meters": 11104.2,
-      "size_bytes": 117973,
-      "build_seconds": 22.36,
+      "size_bytes": 117975,
+      "build_seconds": 22.16,
       "skipped_existing": false
     },
     {
@@ -812,11 +812,11 @@
       "edges": 1510,
       "trail_edges": 1486,
       "connector_edges": 24,
-      "dem_samples": 20534,
+      "dem_samples": 12165,
       "connector_count": 10,
       "connector_path_meters": 377.0,
-      "size_bytes": 500633,
-      "build_seconds": 19.85,
+      "size_bytes": 500613,
+      "build_seconds": 19.61,
       "skipped_existing": false
     },
     {
@@ -839,11 +839,11 @@
       "edges": 2126,
       "trail_edges": 2078,
       "connector_edges": 48,
-      "dem_samples": 56165,
+      "dem_samples": 31200,
       "connector_count": 10,
       "connector_path_meters": 2772.4,
-      "size_bytes": 878913,
-      "build_seconds": 16.58,
+      "size_bytes": 878883,
+      "build_seconds": 14.84,
       "skipped_existing": false
     },
     {
@@ -866,11 +866,11 @@
       "edges": 2312,
       "trail_edges": 2244,
       "connector_edges": 68,
-      "dem_samples": 83628,
+      "dem_samples": 47915,
       "connector_count": 10,
       "connector_path_meters": 2994.8,
-      "size_bytes": 1391837,
-      "build_seconds": 15.52,
+      "size_bytes": 1391763,
+      "build_seconds": 13.25,
       "skipped_existing": false
     },
     {
@@ -893,11 +893,11 @@
       "edges": 374,
       "trail_edges": 362,
       "connector_edges": 12,
-      "dem_samples": 42597,
+      "dem_samples": 24984,
       "connector_count": 4,
       "connector_path_meters": 2187.0,
-      "size_bytes": 633928,
-      "build_seconds": 6.63,
+      "size_bytes": 633898,
+      "build_seconds": 5.22,
       "skipped_existing": false
     },
     {
@@ -920,11 +920,11 @@
       "edges": 548,
       "trail_edges": 458,
       "connector_edges": 90,
-      "dem_samples": 43582,
+      "dem_samples": 23523,
       "connector_count": 6,
       "connector_path_meters": 5019.0,
-      "size_bytes": 347353,
-      "build_seconds": 6.22,
+      "size_bytes": 347295,
+      "build_seconds": 5.03,
       "skipped_existing": false
     },
     {
@@ -947,11 +947,11 @@
       "edges": 456,
       "trail_edges": 416,
       "connector_edges": 40,
-      "dem_samples": 28796,
+      "dem_samples": 16099,
       "connector_count": 3,
       "connector_path_meters": 876.0,
-      "size_bytes": 332697,
-      "build_seconds": 5.34,
+      "size_bytes": 332667,
+      "build_seconds": 4.72,
       "skipped_existing": false
     },
     {
@@ -974,11 +974,11 @@
       "edges": 468,
       "trail_edges": 270,
       "connector_edges": 198,
-      "dem_samples": 12294,
+      "dem_samples": 6767,
       "connector_count": 10,
       "connector_path_meters": 21049.3,
-      "size_bytes": 209434,
-      "build_seconds": 12.33,
+      "size_bytes": 209420,
+      "build_seconds": 11.93,
       "skipped_existing": false
     },
     {
@@ -1001,11 +1001,11 @@
       "edges": 392,
       "trail_edges": 220,
       "connector_edges": 172,
-      "dem_samples": 7732,
+      "dem_samples": 4220,
       "connector_count": 10,
       "connector_path_meters": 11374.9,
-      "size_bytes": 138852,
-      "build_seconds": 16.26,
+      "size_bytes": 138844,
+      "build_seconds": 15.99,
       "skipped_existing": false
     },
     {
@@ -1028,11 +1028,11 @@
       "edges": 862,
       "trail_edges": 152,
       "connector_edges": 710,
-      "dem_samples": 2846,
+      "dem_samples": 1735,
       "connector_count": 8,
       "connector_path_meters": 28572.6,
-      "size_bytes": 259372,
-      "build_seconds": 26.46,
+      "size_bytes": 259374,
+      "build_seconds": 26.65,
       "skipped_existing": false
     },
     {
@@ -1051,12 +1051,16 @@
         "east": -111.9929687,
         "north": 33.6270341
       },
-      "nodes": 1436,
-      "edges": 3584,
+      "nodes": 1472,
+      "edges": 3686,
       "trail_edges": 3584,
-      "connector_edges": 0,
-      "size_bytes": 1408519,
-      "skipped_existing": true
+      "connector_edges": 102,
+      "dem_samples": 32428,
+      "connector_count": 10,
+      "connector_path_meters": 1975.3,
+      "size_bytes": 1434530,
+      "build_seconds": 45.35,
+      "skipped_existing": false
     },
     {
       "id": "-112.000_33.500",
@@ -1078,11 +1082,11 @@
       "edges": 946,
       "trail_edges": 926,
       "connector_edges": 20,
-      "dem_samples": 25752,
+      "dem_samples": 15487,
       "connector_count": 10,
       "connector_path_meters": 336.1,
-      "size_bytes": 493472,
-      "build_seconds": 38.67,
+      "size_bytes": 493452,
+      "build_seconds": 38.11,
       "skipped_existing": false
     },
     {
@@ -1105,11 +1109,11 @@
       "edges": 860,
       "trail_edges": 818,
       "connector_edges": 42,
-      "dem_samples": 43083,
+      "dem_samples": 23551,
       "connector_count": 10,
       "connector_path_meters": 2745.3,
-      "size_bytes": 457193,
-      "build_seconds": 11.62,
+      "size_bytes": 457139,
+      "build_seconds": 10.65,
       "skipped_existing": false
     },
     {
@@ -1132,11 +1136,11 @@
       "edges": 904,
       "trail_edges": 844,
       "connector_edges": 60,
-      "dem_samples": 43250,
+      "dem_samples": 24300,
       "connector_count": 10,
       "connector_path_meters": 7242.4,
-      "size_bytes": 577717,
-      "build_seconds": 9.58,
+      "size_bytes": 577667,
+      "build_seconds": 8.43,
       "skipped_existing": false
     },
     {
@@ -1159,11 +1163,11 @@
       "edges": 696,
       "trail_edges": 634,
       "connector_edges": 62,
-      "dem_samples": 40947,
+      "dem_samples": 22468,
       "connector_count": 10,
       "connector_path_meters": 5785.0,
-      "size_bytes": 423620,
-      "build_seconds": 5.86,
+      "size_bytes": 423584,
+      "build_seconds": 4.62,
       "skipped_existing": false
     },
     {
@@ -1186,11 +1190,11 @@
       "edges": 554,
       "trail_edges": 402,
       "connector_edges": 152,
-      "dem_samples": 30705,
+      "dem_samples": 17065,
       "connector_count": 10,
       "connector_path_meters": 24332.8,
-      "size_bytes": 381479,
-      "build_seconds": 4.52,
+      "size_bytes": 381437,
+      "build_seconds": 3.69,
       "skipped_existing": false
     },
     {
@@ -1213,11 +1217,11 @@
       "edges": 166,
       "trail_edges": 130,
       "connector_edges": 36,
-      "dem_samples": 8137,
+      "dem_samples": 4508,
       "connector_count": 10,
       "connector_path_meters": 8080.0,
-      "size_bytes": 102185,
-      "build_seconds": 1.47,
+      "size_bytes": 102177,
+      "build_seconds": 1.28,
       "skipped_existing": false
     },
     {
@@ -1240,11 +1244,11 @@
       "edges": 406,
       "trail_edges": 228,
       "connector_edges": 178,
-      "dem_samples": 26378,
+      "dem_samples": 13890,
       "connector_count": 10,
       "connector_path_meters": 11010.2,
-      "size_bytes": 178317,
-      "build_seconds": 4.64,
+      "size_bytes": 178289,
+      "build_seconds": 3.56,
       "skipped_existing": false
     },
     {
@@ -1267,11 +1271,11 @@
       "edges": 494,
       "trail_edges": 308,
       "connector_edges": 186,
-      "dem_samples": 16475,
+      "dem_samples": 8762,
       "connector_count": 10,
       "connector_path_meters": 13703.8,
-      "size_bytes": 193102,
-      "build_seconds": 4.16,
+      "size_bytes": 193074,
+      "build_seconds": 3.74,
       "skipped_existing": false
     },
     {
@@ -1294,11 +1298,11 @@
       "edges": 408,
       "trail_edges": 204,
       "connector_edges": 204,
-      "dem_samples": 14193,
+      "dem_samples": 7853,
       "connector_count": 10,
       "connector_path_meters": 11772.3,
-      "size_bytes": 199567,
-      "build_seconds": 14.76,
+      "size_bytes": 199543,
+      "build_seconds": 14.31,
       "skipped_existing": false
     },
     {
@@ -1321,11 +1325,11 @@
       "edges": 956,
       "trail_edges": 910,
       "connector_edges": 46,
-      "dem_samples": 28522,
+      "dem_samples": 16333,
       "connector_count": 10,
       "connector_path_meters": 1291.7,
-      "size_bytes": 461322,
-      "build_seconds": 18.93,
+      "size_bytes": 461298,
+      "build_seconds": 18.28,
       "skipped_existing": false
     },
     {
@@ -1348,11 +1352,11 @@
       "edges": 1486,
       "trail_edges": 664,
       "connector_edges": 822,
-      "dem_samples": 25883,
+      "dem_samples": 15790,
       "connector_count": 10,
       "connector_path_meters": 44104.5,
-      "size_bytes": 704595,
-      "build_seconds": 21.02,
+      "size_bytes": 704557,
+      "build_seconds": 20.32,
       "skipped_existing": false
     },
     {
@@ -1375,11 +1379,11 @@
       "edges": 714,
       "trail_edges": 616,
       "connector_edges": 98,
-      "dem_samples": 17063,
+      "dem_samples": 9325,
       "connector_count": 10,
       "connector_path_meters": 3791.2,
-      "size_bytes": 270315,
-      "build_seconds": 18.8,
+      "size_bytes": 270301,
+      "build_seconds": 18.41,
       "skipped_existing": false
     },
     {
@@ -1402,11 +1406,11 @@
       "edges": 1086,
       "trail_edges": 1060,
       "connector_edges": 26,
-      "dem_samples": 32493,
+      "dem_samples": 18491,
       "connector_count": 10,
       "connector_path_meters": 615.4,
-      "size_bytes": 553682,
-      "build_seconds": 25.49,
+      "size_bytes": 553636,
+      "build_seconds": 23.81,
       "skipped_existing": false
     },
     {
@@ -1429,11 +1433,11 @@
       "edges": 1702,
       "trail_edges": 1674,
       "connector_edges": 28,
-      "dem_samples": 67412,
+      "dem_samples": 38851,
       "connector_count": 10,
       "connector_path_meters": 647.6,
-      "size_bytes": 1086928,
-      "build_seconds": 17.72,
+      "size_bytes": 1086846,
+      "build_seconds": 14.86,
       "skipped_existing": false
     },
     {
@@ -1456,11 +1460,11 @@
       "edges": 1790,
       "trail_edges": 1738,
       "connector_edges": 52,
-      "dem_samples": 67106,
+      "dem_samples": 36770,
       "connector_count": 10,
       "connector_path_meters": 2364.7,
-      "size_bytes": 832928,
-      "build_seconds": 10.31,
+      "size_bytes": 832864,
+      "build_seconds": 8.69,
       "skipped_existing": false
     },
     {
@@ -1483,11 +1487,11 @@
       "edges": 344,
       "trail_edges": 344,
       "connector_edges": 0,
-      "dem_samples": 45787,
+      "dem_samples": 24986,
       "connector_count": 0,
       "connector_path_meters": 0.0,
-      "size_bytes": 332973,
-      "build_seconds": 6.22,
+      "size_bytes": 332921,
+      "build_seconds": 4.77,
       "skipped_existing": false
     },
     {
@@ -1510,11 +1514,11 @@
       "edges": 206,
       "trail_edges": 168,
       "connector_edges": 38,
-      "dem_samples": 27607,
+      "dem_samples": 14932,
       "connector_count": 8,
       "connector_path_meters": 14188.3,
-      "size_bytes": 198983,
-      "build_seconds": 3.27,
+      "size_bytes": 198965,
+      "build_seconds": 2.96,
       "skipped_existing": false
     },
     {
@@ -1537,11 +1541,11 @@
       "edges": 58,
       "trail_edges": 56,
       "connector_edges": 2,
-      "dem_samples": 18176,
+      "dem_samples": 10081,
       "connector_count": 1,
       "connector_path_meters": 55.3,
-      "size_bytes": 148875,
-      "build_seconds": 2.31,
+      "size_bytes": 148869,
+      "build_seconds": 1.95,
       "skipped_existing": false
     },
     {
@@ -1564,11 +1568,11 @@
       "edges": 2266,
       "trail_edges": 2206,
       "connector_edges": 60,
-      "dem_samples": 149292,
+      "dem_samples": 81151,
       "connector_count": 16,
       "connector_path_meters": 3534.0,
-      "size_bytes": 1344449,
-      "build_seconds": 26.38,
+      "size_bytes": 1344263,
+      "build_seconds": 20.67,
       "skipped_existing": false
     },
     {
@@ -1591,11 +1595,11 @@
       "edges": 7134,
       "trail_edges": 7102,
       "connector_edges": 32,
-      "dem_samples": 406771,
+      "dem_samples": 222257,
       "connector_count": 16,
       "connector_path_meters": 755.9,
-      "size_bytes": 4067846,
-      "build_seconds": 64.69,
+      "size_bytes": 4067364,
+      "build_seconds": 52.3,
       "skipped_existing": false
     },
     {
@@ -1618,11 +1622,11 @@
       "edges": 17798,
       "trail_edges": 17762,
       "connector_edges": 36,
-      "dem_samples": 605263,
+      "dem_samples": 339427,
       "connector_count": 16,
       "connector_path_meters": 738.0,
-      "size_bytes": 9037682,
-      "build_seconds": 113.79,
+      "size_bytes": 9037094,
+      "build_seconds": 97.99,
       "skipped_existing": false
     },
     {
@@ -1645,11 +1649,11 @@
       "edges": 6634,
       "trail_edges": 6596,
       "connector_edges": 38,
-      "dem_samples": 398877,
+      "dem_samples": 222151,
       "connector_count": 16,
       "connector_path_meters": 1344.4,
-      "size_bytes": 4567389,
-      "build_seconds": 59.09,
+      "size_bytes": 4567027,
+      "build_seconds": 49.18,
       "skipped_existing": false
     },
     {
@@ -1672,11 +1676,11 @@
       "edges": 2254,
       "trail_edges": 2216,
       "connector_edges": 38,
-      "dem_samples": 337796,
+      "dem_samples": 183912,
       "connector_count": 16,
       "connector_path_meters": 3004.3,
-      "size_bytes": 2350676,
-      "build_seconds": 45.9,
+      "size_bytes": 2350318,
+      "build_seconds": 34.73,
       "skipped_existing": false
     },
     {
@@ -1697,8 +1701,8 @@
       "dem_samples": 0,
       "connector_count": 0,
       "connector_path_meters": 0.0,
-      "size_bytes": 967,
-      "build_seconds": 2.19,
+      "size_bytes": 969,
+      "build_seconds": 2.08,
       "skipped_existing": false
     },
     {
@@ -1721,11 +1725,11 @@
       "edges": 32,
       "trail_edges": 32,
       "connector_edges": 0,
-      "dem_samples": 4676,
+      "dem_samples": 2461,
       "connector_count": 0,
       "connector_path_meters": 0.0,
-      "size_bytes": 22616,
-      "build_seconds": 2.1,
+      "size_bytes": 22610,
+      "build_seconds": 1.85,
       "skipped_existing": false
     },
     {
@@ -1744,15 +1748,15 @@
         "east": -112.2331445,
         "north": 34.2847838
       },
-      "nodes": 86,
-      "edges": 180,
-      "trail_edges": 122,
-      "connector_edges": 58,
-      "dem_samples": 13947,
-      "connector_count": 12,
-      "connector_path_meters": 18957.5,
-      "size_bytes": 98954,
-      "build_seconds": 8.06,
+      "nodes": 87,
+      "edges": 184,
+      "trail_edges": 124,
+      "connector_edges": 60,
+      "dem_samples": 7612,
+      "connector_count": 13,
+      "connector_path_meters": 19135.1,
+      "size_bytes": 100432,
+      "build_seconds": 7.48,
       "skipped_existing": false
     },
     {
@@ -1775,11 +1779,11 @@
       "edges": 450,
       "trail_edges": 408,
       "connector_edges": 42,
-      "dem_samples": 37644,
+      "dem_samples": 21100,
       "connector_count": 9,
       "connector_path_meters": 6664.8,
-      "size_bytes": 429737,
-      "build_seconds": 9.29,
+      "size_bytes": 429711,
+      "build_seconds": 8.16,
       "skipped_existing": false
     },
     {
@@ -1802,11 +1806,11 @@
       "edges": 330,
       "trail_edges": 100,
       "connector_edges": 230,
-      "dem_samples": 16520,
+      "dem_samples": 8906,
       "connector_count": 4,
       "connector_path_meters": 13117.6,
-      "size_bytes": 149861,
-      "build_seconds": 8.14,
+      "size_bytes": 149841,
+      "build_seconds": 7.75,
       "skipped_existing": false
     },
     {
@@ -1829,11 +1833,11 @@
       "edges": 184,
       "trail_edges": 156,
       "connector_edges": 28,
-      "dem_samples": 25648,
+      "dem_samples": 13942,
       "connector_count": 4,
       "connector_path_meters": 13905.1,
-      "size_bytes": 185848,
-      "build_seconds": 9.51,
+      "size_bytes": 185832,
+      "build_seconds": 8.85,
       "skipped_existing": false
     },
     {
@@ -1854,8 +1858,8 @@
       "dem_samples": 0,
       "connector_count": 0,
       "connector_path_meters": 0.0,
-      "size_bytes": 967,
-      "build_seconds": 3.79,
+      "size_bytes": 969,
+      "build_seconds": 3.68,
       "skipped_existing": false
     }
   ]

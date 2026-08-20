@@ -50,7 +50,7 @@ DEFAULT_LON = -112.083341
 
 # Sample along trail/GPX geometry every 5 m.
 # The source DEM is ~10 m resolution.
-ELEVATION_SAMPLE_SPACING_M = 5.0
+ELEVATION_SAMPLE_SPACING_M = 10.0
 
 # GPX points within this distance of an allowed trail count as covered.
 GPX_TRAIL_MATCH_TOLERANCE_M = 25.0
