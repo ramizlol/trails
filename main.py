@@ -2,6 +2,7 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Query
 from fastapi.responses import HTMLResponse, Response
 from fastapi.middleware.gzip import GZipMiddleware
 from pydantic import BaseModel, Field
+from array import array
 
 import math
 import gc
@@ -117,7 +118,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 50000
 
-APP_VERSION = "2026-08-20-v51-memory-safe-tile-merge"
+APP_VERSION = "2026-08-20-v52-compact-elevation-profiles"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -726,24 +727,29 @@ def edge_attributes_for_split_part(original_data, coords):
     if len(samples) < 2:
         samples = list(coords)
 
-    original_coords = list(original_data.get("dem_sample_coords") or [])
-    original_elev = list(original_data.get("dem_raw_elevations_m") or [])
+    original_coords, original_elev = baked_edge_profile(
+        H,
+        original_u,
+        original_v,
+        original_data,
+    )
 
     if original_coords and original_elev and len(original_coords) == len(original_elev):
-        # Interpolate elevation from the baked edge profile at each split-part
-        # sample. No runtime raster access.
-        baked = [
-            (float(lon), float(lat))
-            for lon, lat in original_coords
-        ]
         elevations = []
         for lon, lat in samples:
-            nearest = nearest_position_on_polyline(baked, float(lon), float(lat))
+            nearest = nearest_position_on_polyline(
+                original_coords,
+                float(lon),
+                float(lat),
+            )
             if nearest is None:
                 elevations.append(float(original_elev[0]))
                 continue
             total_m = max(float(nearest.get("total_m", 0.0)), 1e-9)
-            frac = max(0.0, min(1.0, float(nearest["along_m"]) / total_m))
+            frac = max(
+                0.0,
+                min(1.0, float(nearest["along_m"]) / total_m),
+            )
             pos = frac * (len(original_elev) - 1)
             lo = int(math.floor(pos))
             hi = min(lo + 1, len(original_elev) - 1)
@@ -753,7 +759,6 @@ def edge_attributes_for_split_part(original_data, coords):
                 + float(original_elev[hi]) * t
             )
     else:
-        # Compatibility fallback for an older tile set.
         eu = original_data.get("elevation_start_m")
         ev = original_data.get("elevation_end_m")
         if eu is None:
@@ -761,14 +766,16 @@ def edge_attributes_for_split_part(original_data, coords):
         if ev is None:
             ev = eu
         elevations = [
-            float(eu) + (float(ev) - float(eu)) * (i / max(len(samples) - 1, 1))
+            float(eu) + (float(ev) - float(eu))
+            * (i / max(len(samples) - 1, 1))
             for i in range(len(samples))
         ]
 
-    attrs["dem_sample_coords"] = [
-        (float(lon), float(lat)) for lon, lat in samples
-    ]
-    attrs["dem_raw_elevations_m"] = [float(v) for v in elevations]
+    attrs["dem_elevations_f32"] = array(
+        "f",
+        (float(value) for value in elevations),
+    )
+    attrs["dem_sample_spacing_m"] = float(ELEVATION_SAMPLE_SPACING_M)
 
     smoothed = smooth_elevations(
         elevations,
@@ -886,12 +893,16 @@ def insert_exact_routing_point(G, lat, lon):
     while virtual_node in H:
         virtual_node -= 1
 
-    source_profile_coords = list(selected_data.get("dem_sample_coords") or [])
-    source_profile_elev = list(selected_data.get("dem_raw_elevations_m") or [])
+    source_profile_coords, source_profile_elev = baked_edge_profile(
+        H,
+        selected_u,
+        selected_v,
+        selected_data,
+    )
     elevation = 0.0
-    if source_profile_coords and source_profile_elev and len(source_profile_coords) == len(source_profile_elev):
+    if source_profile_coords and source_profile_elev:
         nearest_profile = nearest_position_on_polyline(
-            [(float(a), float(b)) for a, b in source_profile_coords],
+            source_profile_coords,
             split_lon,
             split_lat,
         )
@@ -1446,12 +1457,16 @@ def insert_required_pass_point(G, lat, lon, tolerance_meters):
 
     H = G.copy()
     virtual_node = _next_virtual_node_id(H)
-    source_profile_coords = list(selected_data.get("dem_sample_coords") or [])
-    source_profile_elev = list(selected_data.get("dem_raw_elevations_m") or [])
+    source_profile_coords, source_profile_elev = baked_edge_profile(
+        H,
+        selected_u,
+        selected_v,
+        selected_data,
+    )
     elevation = 0.0
-    if source_profile_coords and source_profile_elev and len(source_profile_coords) == len(source_profile_elev):
+    if source_profile_coords and source_profile_elev:
         nearest_profile = nearest_position_on_polyline(
-            [(float(a), float(b)) for a, b in source_profile_coords],
+            source_profile_coords,
             split_lon,
             split_lat,
         )
@@ -1980,14 +1995,17 @@ def add_local_dem_edge_elevations(G):
             for lon, lat in samples
         ]
 
-        # V47 stores the build-time DEM profile directly on the edge so Render
-        # never needs the 1.1 GB TIFF.
-        G[u][v][key]["dem_sample_coords"] = [
-            (float(lon), float(lat)) for lon, lat in samples
-        ]
-        G[u][v][key]["dem_raw_elevations_m"] = [
-            float(value) for value in raw_elevations
-        ]
+        # V52: keep only compact float32 elevations. Sample coordinates are
+        # reconstructed from the edge geometry at runtime using the same
+        # ELEVATION_SAMPLE_SPACING_M. This avoids millions of Python
+        # lon/lat tuples and float objects in production memory.
+        G[u][v][key]["dem_elevations_f32"] = array(
+            "f",
+            (float(value) for value in raw_elevations),
+        )
+        G[u][v][key]["dem_sample_spacing_m"] = float(
+            ELEVATION_SAMPLE_SPACING_M
+        )
 
         elevations = smooth_elevations(
             raw_elevations,
@@ -5214,14 +5232,49 @@ def big_loop_shape_penalty(
 
 
 def baked_edge_profile(G, u, v, edge):
-    """Return oriented (lon,lat) samples + raw elevations stored on one edge."""
-    coords = list(edge.get("dem_sample_coords") or [])
-    elevations = list(edge.get("dem_raw_elevations_m") or [])
-    if not coords or not elevations or len(coords) != len(elevations):
-        return [], []
+    """Return oriented reconstructed sample coords + compact elevations."""
+    packed = edge.get("dem_elevations_f32")
+    if packed is None:
+        # Compatibility with v47 tiles during a rolling/local transition.
+        legacy_coords = list(edge.get("dem_sample_coords") or [])
+        legacy_elev = list(edge.get("dem_raw_elevations_m") or [])
+        if legacy_coords and legacy_elev and len(legacy_coords) == len(legacy_elev):
+            coords = [(float(lon), float(lat)) for lon, lat in legacy_coords]
+            elevations = [float(value) for value in legacy_elev]
+        else:
+            return [], []
+    else:
+        elevations = [float(value) for value in packed]
+        if not elevations:
+            return [], []
 
-    coords = [(float(lon), float(lat)) for lon, lat in coords]
-    elevations = [float(value) for value in elevations]
+        edge_coords = oriented_edge_coords(G, u, v, edge)
+        if len(edge_coords) < 2:
+            return [], []
+
+        spacing = float(
+            edge.get("dem_sample_spacing_m", ELEVATION_SAMPLE_SPACING_M)
+            or ELEVATION_SAMPLE_SPACING_M
+        )
+        coords = densify_polyline(edge_coords, spacing)
+        if len(coords) < 2:
+            coords = list(edge_coords)
+
+        # Floating point/polyline reconstruction can occasionally differ by a
+        # sample at a segment boundary. Resample positions to exactly match
+        # the stored elevation count without touching the DEM.
+        if len(coords) != len(elevations):
+            dense = densify_polyline(edge_coords, max(spacing / 2.0, 1.0))
+            if not dense:
+                return [], []
+            if len(elevations) == 1:
+                coords = [dense[0]]
+            else:
+                coords = []
+                last = len(dense) - 1
+                for i in range(len(elevations)):
+                    idx = int(round(i * last / (len(elevations) - 1)))
+                    coords.append(dense[idx])
 
     u_lon = float(G.nodes[u]["x"])
     u_lat = float(G.nodes[u]["y"])
@@ -5235,7 +5288,6 @@ def baked_edge_profile(G, u, v, edge):
         elevations.reverse()
 
     return coords, elevations
-
 
 def route_baked_elevation_metrics(G, route_nodes):
     """Build continuous route elevation metrics without opening a DEM TIFF."""

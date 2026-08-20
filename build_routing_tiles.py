@@ -235,7 +235,7 @@ def normalize_tile_metadata(app, G, source_path, tile_id, dem_samples, connector
     G.graph["dem_signature"] = app.get_dem_signature()
     G.graph["master_elevation_precomputed"] = "1"
     G.graph["tile_elevation_unique_samples"] = int(dem_samples)
-    G.graph["embedded_dem_edge_profiles"] = "1"
+    G.graph["embedded_dem_edge_profiles"] = "compact-float32-v52"
     G.graph["offline_connectors_prebuilt"] = "1"
     G.graph["offline_connector_count"] = int(connector_info["connector_count"])
     G.graph["offline_connector_checks"] = int(connector_info["connector_checks"])
@@ -341,7 +341,7 @@ def write_manifest(app, rows, started):
         }
     manifest = {
         "schema": "trail-routing-tile-manifest-v1",
-        "elevation_storage": "edge-samples-v47",
+        "elevation_storage": "compact-float32-v52",
         "generated_unix": time.time(),
         "dem_file": os.path.basename(app.DEM_PATH),
         "dem_signature": app.get_dem_signature(),
