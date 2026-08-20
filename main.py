@@ -895,8 +895,8 @@ def insert_exact_routing_point(G, lat, lon):
 
     source_profile_coords, source_profile_elev = baked_edge_profile(
         H,
-        selected_u,
-        selected_v,
+        u,
+        v,
         selected_data,
     )
     elevation = 0.0
@@ -1459,8 +1459,8 @@ def insert_required_pass_point(G, lat, lon, tolerance_meters):
     virtual_node = _next_virtual_node_id(H)
     source_profile_coords, source_profile_elev = baked_edge_profile(
         H,
-        selected_u,
-        selected_v,
+        u,
+        v,
         selected_data,
     )
     elevation = 0.0
