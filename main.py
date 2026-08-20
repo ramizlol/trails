@@ -20,6 +20,7 @@ import xml.etree.ElementTree as ET
 from collections import OrderedDict
 
 import networkx as nx
+import rustworkx as rx
 import numpy as np
 import osmnx as ox
 import rasterio
@@ -116,7 +117,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 50000
 
-APP_VERSION = "2026-08-19-v43-segment-rejoin-detection"
+APP_VERSION = "2026-08-19-v44-rustworkx-hybrid-runtime"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -336,6 +337,7 @@ def home():
     return {
         "status": "Trail Running Creator API is running",
         "version": APP_VERSION,
+        "routing_engine": FAST_ROUTING_ENGINE,
         "map": "/map",
         "docs": "/docs",
         "dem_info": "/dem-info",
@@ -4253,6 +4255,162 @@ def overlay_tile_file(tile_id):
 
 
 # ============================================================
+# RUSTWORKX FAST RUNTIME ROUTING
+# ============================================================
+
+FAST_ROUTING_ENGINE = "rustworkx"
+
+
+def _build_rustworkx_runtime(S):
+    """Convert one request-local NetworkX DiGraph into a lightweight PyDiGraph.
+
+    NetworkX remains the source of geometry and attributes. Rustworkx is used
+    only for repeated pathfinding. The conversion is cached on S itself, so a
+    waypoint search pays this cost once rather than once per leg.
+    """
+    cached = S.graph.get("_rustworkx_runtime")
+    if cached is not None:
+        return cached
+
+    nx_nodes = list(S.nodes())
+    rx_graph = rx.PyDiGraph(
+        multigraph=False,
+        node_count_hint=len(nx_nodes),
+        edge_count_hint=S.number_of_edges(),
+    )
+    rx_indices = list(rx_graph.add_nodes_from(nx_nodes))
+    nx_to_rx = {node: int(index) for node, index in zip(nx_nodes, rx_indices)}
+    rx_to_nx = {int(index): node for node, index in zip(nx_nodes, rx_indices)}
+
+    edge_rows = []
+    for u, v, data in S.edges(data=True):
+        if u not in nx_to_rx or v not in nx_to_rx:
+            continue
+        routing_cost = max(
+            0.0,
+            float(data.get("routing_cost", data.get("length", 1.0)) or 0.0),
+        )
+        length = max(0.0, float(data.get("length", 0.0) or 0.0))
+        # Tuple payload is intentionally tiny:
+        # (routing_cost, length, original_u, original_v)
+        payload = (routing_cost, length, u, v)
+        edge_rows.append((nx_to_rx[u], nx_to_rx[v], payload))
+
+    if edge_rows:
+        rx_graph.add_edges_from(edge_rows)
+
+    runtime = {
+        "graph": rx_graph,
+        "nx_to_rx": nx_to_rx,
+        "rx_to_nx": rx_to_nx,
+    }
+    S.graph["_rustworkx_runtime"] = runtime
+    return runtime
+
+
+def _rx_weight_fn_for(weight):
+    if weight == "length":
+        return lambda edge: float(edge[1])
+    return lambda edge: float(edge[0])
+
+
+def fast_shortest_path(S, source, target, weight="routing_cost", edge_use_counts=None, bridge_edges=None):
+    """Return a NetworkX-node path while executing Dijkstra in rustworkx."""
+    runtime = _build_rustworkx_runtime(S)
+    nx_to_rx = runtime["nx_to_rx"]
+    rx_to_nx = runtime["rx_to_nx"]
+    graph = runtime["graph"]
+
+    if source not in nx_to_rx or target not in nx_to_rx:
+        raise nx.NodeNotFound(f"Source or target is not present in routing graph: {source}, {target}")
+
+    source_rx = nx_to_rx[source]
+    target_rx = nx_to_rx[target]
+
+    if edge_use_counts:
+        bridge_edges = bridge_edges if bridge_edges is not None else routing_bridge_edge_keys(S)
+
+        def weight_fn(edge):
+            base = float(edge[0])
+            u = edge[2]
+            v = edge[3]
+            physical = undirected_edge_key(u, v)
+            prior_count = int(edge_use_counts.get(physical, 0))
+            if prior_count <= 0:
+                return base
+            if physical in bridge_edges:
+                if prior_count == 1:
+                    return base * NECESSARY_REUSED_EDGE_SECOND_COST_MULTIPLIER
+                return base * NECESSARY_REUSED_EDGE_THIRD_PLUS_COST_MULTIPLIER
+            if prior_count == 1:
+                return base * REUSED_EDGE_SECOND_COST_MULTIPLIER
+            return base * REUSED_EDGE_THIRD_PLUS_COST_MULTIPLIER
+    else:
+        weight_fn = _rx_weight_fn_for(weight)
+
+    paths = rx.dijkstra_shortest_paths(
+        graph,
+        source_rx,
+        target=target_rx,
+        weight_fn=weight_fn,
+    )
+    rx_path = paths.get(target_rx)
+    if not rx_path:
+        raise nx.NetworkXNoPath(f"No path between {source} and {target}")
+
+    return [rx_to_nx[int(index)] for index in rx_path]
+
+
+def fast_single_source_paths(S, source, weight="routing_cost"):
+    """Return {networkx_node: [networkx path]} using one rustworkx Dijkstra run."""
+    runtime = _build_rustworkx_runtime(S)
+    nx_to_rx = runtime["nx_to_rx"]
+    rx_to_nx = runtime["rx_to_nx"]
+    graph = runtime["graph"]
+
+    if source not in nx_to_rx:
+        raise nx.NodeNotFound(f"Source is not present in routing graph: {source}")
+
+    source_rx = nx_to_rx[source]
+    paths = rx.dijkstra_shortest_paths(
+        graph,
+        source_rx,
+        weight_fn=_rx_weight_fn_for(weight),
+    )
+
+    result = {}
+    for destination_rx, path in paths.items():
+        destination = rx_to_nx[int(destination_rx)]
+        result[destination] = [rx_to_nx[int(index)] for index in path]
+    result[source] = [source]
+    return result
+
+
+def fast_single_source_lengths(S, source, weight="routing_cost"):
+    """Return {networkx_node: cost} using rustworkx Dijkstra path lengths."""
+    runtime = _build_rustworkx_runtime(S)
+    nx_to_rx = runtime["nx_to_rx"]
+    rx_to_nx = runtime["rx_to_nx"]
+    graph = runtime["graph"]
+
+    if source not in nx_to_rx:
+        raise nx.NodeNotFound(f"Source is not present in routing graph: {source}")
+
+    source_rx = nx_to_rx[source]
+    lengths = rx.dijkstra_shortest_path_lengths(
+        graph,
+        source_rx,
+        _rx_weight_fn_for(weight),
+    )
+    result = {
+        rx_to_nx[int(destination_rx)]: float(cost)
+        for destination_rx, cost in lengths.items()
+    }
+    result[source] = 0.0
+    return result
+
+
+# ============================================================
 # SIMPLE ROUTING GRAPH
 # ============================================================
 
@@ -5395,7 +5553,7 @@ def beam_search_short_loop(
     reverse_S = S.reverse(copy=False)
 
     try:
-        return_distance = nx.single_source_dijkstra_path_length(
+        return_distance = fast_single_source_lengths(
             reverse_S,
             start_node,
             weight="length",
@@ -5843,23 +6001,11 @@ def waypoint_path(S, source, target, edge_use_counts, leg_cache=None, cache_stat
             if cache_stats is not None:
                 cache_stats["blocked"] = cache_stats.get("blocked", 0) + 1
 
-    def heuristic(a, b):
-        try:
-            return haversine_meters(
-                float(S.nodes[a]["y"]),
-                float(S.nodes[a]["x"]),
-                float(S.nodes[b]["y"]),
-                float(S.nodes[b]["x"]),
-            )
-        except Exception:
-            return 0.0
-
     if not used_edge_keys:
-        path = nx.astar_path(
+        path = fast_shortest_path(
             S,
             source,
             target,
-            heuristic=heuristic,
             weight="routing_cost",
         )
         if leg_cache is not None and len(leg_cache) < WAYPOINT_LEG_CACHE_MAX:
@@ -5870,26 +6016,13 @@ def waypoint_path(S, source, target, edge_use_counts, leg_cache=None, cache_stat
 
     bridge_edges = bridge_edges if bridge_edges is not None else routing_bridge_edge_keys(S)
 
-    def weight(u, v, data):
-        cost = float(data.get("routing_cost", data.get("length", 1.0)))
-        edge_key = undirected_edge_key(u, v)
-        prior_count = int((edge_use_counts or {}).get(edge_key, 0))
-        if prior_count <= 0:
-            return cost
-        if edge_key in bridge_edges:
-            if prior_count == 1:
-                return cost * NECESSARY_REUSED_EDGE_SECOND_COST_MULTIPLIER
-            return cost * NECESSARY_REUSED_EDGE_THIRD_PLUS_COST_MULTIPLIER
-        if prior_count == 1:
-            return cost * REUSED_EDGE_SECOND_COST_MULTIPLIER
-        return cost * REUSED_EDGE_THIRD_PLUS_COST_MULTIPLIER
-
-    path = nx.astar_path(
+    path = fast_shortest_path(
         S,
         source,
         target,
-        heuristic=heuristic,
-        weight=weight,
+        weight="routing_cost",
+        edge_use_counts=edge_use_counts,
+        bridge_edges=bridge_edges,
     )
     if cache_stats is not None:
         cache_stats["penalized_searches"] = cache_stats.get("penalized_searches", 0) + 1
@@ -6131,13 +6264,13 @@ def generate_waypoint_loop(
     leg_cache = {}
     leg_cache_stats = {"hits": 0, "misses": 0, "blocked": 0, "penalized_searches": 0}
     try:
-        _, start_paths = nx.single_source_dijkstra(
+        start_paths = fast_single_source_paths(
             S,
             start_node,
             weight="routing_cost",
         )
         reverse_S = S.reverse(copy=False)
-        _, reverse_start_paths = nx.single_source_dijkstra(
+        reverse_start_paths = fast_single_source_paths(
             reverse_S,
             start_node,
             weight="routing_cost",
@@ -6809,7 +6942,7 @@ def replay_trace_hard_rules(
 
     S = make_simple_routing_graph(G)
     reverse_S = S.reverse(copy=False)
-    return_distance = nx.single_source_dijkstra_path_length(
+    return_distance = fast_single_source_lengths(
         reverse_S,
         start_node,
         weight="length",
@@ -7714,7 +7847,7 @@ def shortest_path_forcing_selected_edges_exact(G, S, start_node, end_node, requi
     connections.  This matches the visual editing model in the browser.
     """
     if not required_edges:
-        nodes = nx.shortest_path(S, start_node, end_node, weight="routing_cost")
+        nodes = fast_shortest_path(S, start_node, end_node, weight="routing_cost")
         return nodes, route_coordinates(G, nodes)
 
     current = start_node
@@ -7735,7 +7868,7 @@ def shortest_path_forcing_selected_edges_exact(G, S, start_node, end_node, requi
             if exact is None:
                 continue
             try:
-                leg_nodes = nx.shortest_path(S, current, enter, weight="routing_cost")
+                leg_nodes = fast_shortest_path(S, current, enter, weight="routing_cost")
                 leg_cost = (
                     nx.path_weight(S, leg_nodes, weight="routing_cost")
                     if len(leg_nodes) > 1 else 0.0
@@ -7771,7 +7904,7 @@ def shortest_path_forcing_selected_edges_exact(G, S, start_node, end_node, requi
         current = leave
 
     try:
-        leg_nodes = nx.shortest_path(S, current, end_node, weight="routing_cost")
+        leg_nodes = fast_shortest_path(S, current, end_node, weight="routing_cost")
     except (nx.NetworkXNoPath, nx.NodeNotFound):
         raise nx.NetworkXNoPath("Replacement corridor cannot reconnect to the route.")
 
@@ -8463,7 +8596,7 @@ def generate_route(request: RouteRequest):
             current = start_node
             try:
                 for destination in destinations:
-                    leg = nx.shortest_path(S, current, destination, weight="routing_cost")
+                    leg = fast_shortest_path(S, current, destination, weight="routing_cost")
                     route_nodes.extend(leg[1:])
                     current = destination
             except nx.NetworkXNoPath:

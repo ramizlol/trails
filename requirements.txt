@@ -7,3 +7,4 @@ rasterio
 numpy
 python-multipart
 shapely
+rustworkx>=0.17,<0.18
