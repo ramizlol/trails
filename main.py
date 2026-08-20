@@ -117,7 +117,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 50000
 
-APP_VERSION = "2026-08-20-v49-dem-free-bounds-fix"
+APP_VERSION = "2026-08-20-v51-memory-safe-tile-merge"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -3216,6 +3216,76 @@ def clear_routing_tile_cache():
     gc.collect()
 
 
+def _edge_maybe_intersects_bbox(tile_G, u, v, data, bbox):
+    """Cheap edge/bbox test used before copying a tile edge into the workspace.
+
+    This prevents a request that barely touches a large 0.5-degree tile from
+    materializing that entire NetworkX tile in the merged graph.
+    """
+    west, south, east, north = bbox
+
+    geom = data.get("geometry")
+    if geom is not None:
+        try:
+            gwest, gsouth, geast, gnorth = geom.bounds
+            return not (
+                float(geast) < west
+                or float(gwest) > east
+                or float(gnorth) < south
+                or float(gsouth) > north
+            )
+        except Exception:
+            pass
+
+    try:
+        ux = float(tile_G.nodes[u]["x"])
+        uy = float(tile_G.nodes[u]["y"])
+        vx = float(tile_G.nodes[v]["x"])
+        vy = float(tile_G.nodes[v]["y"])
+    except Exception:
+        return False
+
+    edge_west = min(ux, vx)
+    edge_east = max(ux, vx)
+    edge_south = min(uy, vy)
+    edge_north = max(uy, vy)
+
+    return not (
+        edge_east < west
+        or edge_west > east
+        or edge_north < south
+        or edge_south > north
+    )
+
+
+def _merge_tile_graph_into_bbox(target, tile_G, bbox):
+    """Stream only bbox-relevant edges from one tile into the merged workspace."""
+    if target.number_of_nodes() == 0:
+        target.graph.update(tile_G.graph)
+
+    kept_edges = 0
+    kept_nodes = set()
+
+    for u, v, key, data in tile_G.edges(keys=True, data=True):
+        if not _edge_maybe_intersects_bbox(tile_G, u, v, data, bbox):
+            continue
+
+        if u not in kept_nodes:
+            target.add_node(u, **tile_G.nodes[u])
+            kept_nodes.add(u)
+        if v not in kept_nodes:
+            target.add_node(v, **tile_G.nodes[v])
+            kept_nodes.add(v)
+
+        if target.has_edge(u, v, key):
+            target[u][v][key].update(data)
+        else:
+            target.add_edge(u, v, key=key, **data)
+        kept_edges += 1
+
+    return kept_edges
+
+
 def _merge_tile_graph_into(target, tile_G):
     """Merge one tile in-place to avoid nx.compose_all's repeated full copies."""
     if target.number_of_nodes() == 0:
@@ -3272,12 +3342,45 @@ def load_tiled_workspace_source_graph(lat, lon, radius_m):
     merged = nx.MultiDiGraph()
     merged.graph["crs"] = "EPSG:4326"
 
+    selected_tile_debug = []
     for row in rows:
         tile_G = load_routing_tile(row)
-        _merge_tile_graph_into(merged, tile_G)
+        source_edges = int(tile_G.number_of_edges())
+        kept_edges = _merge_tile_graph_into_bbox(
+            merged,
+            tile_G,
+            query_bbox,
+        )
+        selected_tile_debug.append(
+            {
+                "id": str(row.get("id", "")),
+                "source_edges": source_edges,
+                "kept_edges": int(kept_edges),
+                "size_mb": round(
+                    float(row.get("size_bytes", 0) or 0) / (1024.0 * 1024.0),
+                    2,
+                ),
+            }
+        )
+
+        # MAX_ROUTING_TILE_CACHE is currently zero, but explicitly release the
+        # local reference before loading the next tile to minimize peak memory.
+        del tile_G
+        gc.collect()
+
+    print(
+        "Routing tiles selected:",
+        ", ".join(
+            f"{row['id']}[{row['size_mb']:.2f}MB:{row['kept_edges']}/{row['source_edges']} edges]"
+            for row in selected_tile_debug
+        ),
+    )
 
     if merged.number_of_edges() == 0:
-        raise HTTPException(status_code=400, detail="Selected routing tiles contain no usable trails.")
+        raise HTTPException(
+            status_code=400,
+            detail="Selected routing tiles contain no usable trails inside this search area.",
+        )
 
     # Limit the merged tile envelope before insert_exact_routing_point projects
     # and copies the graph. This is the key Render-memory protection.
@@ -3298,6 +3401,7 @@ def load_tiled_workspace_source_graph(lat, lon, radius_m):
     local.graph["routing_tile_ids"] = info["selected_tile_ids"]
     local.graph["routing_tile_count"] = len(rows)
     local.graph["routing_tile_query_bbox"] = tuple(query_bbox)
+    local.graph["routing_tile_debug"] = selected_tile_debug
     return local, info
 
 def get_master_routing_graph():
@@ -9030,6 +9134,18 @@ def generate_route(request: RouteRequest):
             )
         _v46_mark("Final option payload / elevation", _v46_t)
 
+        # V50: route choices are presented from lowest mileage to highest.
+        route_options.sort(
+            key=lambda option: (
+                float(option.get("actual_distance_miles", 0.0)),
+                float(option.get("actual_gain_ft", 0.0)),
+                float(option.get("route_score", 0.0)),
+            )
+        )
+        for option_index, option in enumerate(route_options):
+            option["index"] = option_index
+            option["name"] = f"Route {option_index + 1}"
+
         # Build the no-elevation COROS GPX track only after the winning route
         # has been selected. This is geometry-only and performs no extra DEM
         # raster sampling.
@@ -9950,19 +10066,11 @@ input[type="range"] {
     </div>
 </details>
 
-<details class="control-section">
-    <summary>Map & network</summary>
-    <div class="section-content">
-        <div class="network-control toggle-row simple-toggle-row">
-            <span>Show TIFF-wide trail network</span>
-            <label class="switch">
-                <input id="showNetwork" type="checkbox" checked>
-                <span class="slider"></span>
-            </label>
-        </div>
-        <button id="networkButton" class="secondary-button">Load / Refresh Start Area</button>
-    </div>
-</details>
+<!-- V50: network overlay/workspace preparation is automatic. -->
+<div style="display:none">
+    <input id="showNetwork" type="checkbox" checked>
+    <button id="networkButton" type="button"></button>
+</div>
 
 <div class="primary-actions">
     <button id="generateButton">Generate Trail Route</button>
@@ -12697,7 +12805,10 @@ async function readJsonResponse(response) {
     const text = await response.text();
 
     if (!text) {
-        throw new Error("Server returned an empty response.");
+        throw new Error(
+            "Server connection closed before a response was returned. " +
+            "This usually means the server worker restarted or ran out of memory."
+        );
     }
 
     let result;
@@ -13034,8 +13145,25 @@ function ensureRouteOptions(result) {
             required_pass_points: result.required_pass_points || []
         }];
     }
+    sortRouteOptionsByDistance(result.route_options || []);
     reindexRouteOptions(result.route_options || []);
     return result.route_options || [];
+}
+
+
+function sortRouteOptionsByDistance(options) {
+    options.sort((a, b) => {
+        const da = Number(a.actual_distance_miles || 0);
+        const db = Number(b.actual_distance_miles || 0);
+        if (da !== db) return da - db;
+
+        const ga = Number(a.actual_gain_ft || 0);
+        const gb = Number(b.actual_gain_ft || 0);
+        if (ga !== gb) return ga - gb;
+
+        return Number(a.route_score || 0) - Number(b.route_score || 0);
+    });
+    return options;
 }
 
 
@@ -13086,6 +13214,22 @@ function routeChoiceCardHtml(option, index) {
 function renderRouteResults(statusMessage = "Route search complete") {
     if (!lastGeneratedRoute) return;
     const results = document.getElementById("results");
+
+    const selectedSignatureBeforeSort =
+        lastGeneratedRoute.route_options?.[selectedRouteOptionIndex]
+            ? browserRouteSignature(lastGeneratedRoute.route_options[selectedRouteOptionIndex])
+            : null;
+
+    sortRouteOptionsByDistance(lastGeneratedRoute.route_options || []);
+    reindexRouteOptions(lastGeneratedRoute.route_options || []);
+
+    if (selectedSignatureBeforeSort) {
+        const movedIndex = (lastGeneratedRoute.route_options || []).findIndex(
+            option => browserRouteSignature(option) === selectedSignatureBeforeSort
+        );
+        if (movedIndex >= 0) selectedRouteOptionIndex = movedIndex;
+    }
+
     const options = lastGeneratedRoute.route_options || [];
     const visibleEntries = options
         .map((option, index) => ({option, index}))
@@ -13228,14 +13372,30 @@ async function findMoreRoutes() {
             added += 1;
         }
 
+        const selectedSignatureBeforeSort =
+            lastGeneratedRoute.route_options?.[priorSelected]
+                ? browserRouteSignature(lastGeneratedRoute.route_options[priorSelected])
+                : null;
+
+        sortRouteOptionsByDistance(lastGeneratedRoute.route_options);
         reindexRouteOptions(lastGeneratedRoute.route_options);
         lastGeneratedRoute.route_options_count = lastGeneratedRoute.route_options.length;
+
+        let sortedSelectedIndex = 0;
+        if (selectedSignatureBeforeSort) {
+            const movedIndex = lastGeneratedRoute.route_options.findIndex(
+                option => browserRouteSignature(option) === selectedSignatureBeforeSort
+            );
+            if (movedIndex >= 0) sortedSelectedIndex = movedIndex;
+        }
+        selectedRouteOptionIndex = sortedSelectedIndex;
+
         renderRouteResults(
             added > 0
                 ? `Added ${added} new route${added === 1 ? "" : "s"} · ${lastGeneratedRoute.route_options.length} total`
                 : `No new distinct routes in this batch · ${priorCount} kept`
         );
-        drawRouteOptions(lastGeneratedRoute, priorSelected, false);
+        drawRouteOptions(lastGeneratedRoute, sortedSelectedIndex, false);
     } catch (error) {
         const status = document.getElementById("findMoreStatus");
         if (status) status.outerHTML = '<span class="error"><b>Find More error:</b> ' + error.message + '</span>';
