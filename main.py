@@ -117,7 +117,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 50000
 
-APP_VERSION = "2026-08-19-v45-rustworkx-pathmapping-fix"
+APP_VERSION = "2026-08-19-v46-performance-timing"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -8404,6 +8404,49 @@ def replace_route_section(request: RouteSectionReplacementRequest):
 
 @app.post("/generate-route")
 def generate_route(request: RouteRequest):
+    _v46_total_started = time.perf_counter()
+    _v46_timings = {}
+
+    def _v46_mark(name, started):
+        _v46_timings[name] = _v46_timings.get(name, 0.0) + (
+            time.perf_counter() - started
+        )
+
+    def _v46_report():
+        total = time.perf_counter() - _v46_total_started
+        measured = sum(_v46_timings.values())
+        print("")
+        print("=" * 72)
+        print(
+            f"V46 TIMING — {float(request.target_distance_miles):.1f} mi / "
+            f"{float(request.target_gain_ft):.0f} ft"
+        )
+        print("=" * 72)
+        for name, seconds in sorted(
+            _v46_timings.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        ):
+            pct = 100.0 * seconds / total if total else 0.0
+            print(f"{name:38s} {seconds:8.2f}s  {pct:6.1f}%")
+        other = max(0.0, total - measured)
+        print(
+            f"{'Other / orchestration':38s} {other:8.2f}s  "
+            f"{(100.0 * other / total if total else 0.0):6.1f}%"
+        )
+        print("-" * 72)
+        print(f"{'TOTAL':38s} {total:8.2f}s")
+        print("=" * 72)
+        print("")
+        return {
+            "total_seconds": round(total, 3),
+            "sections": {
+                key: round(value, 3)
+                for key, value in _v46_timings.items()
+            },
+            "other_seconds": round(other, 3),
+        }
+
     try:
         if request.target_distance_miles <= 0:
             raise HTTPException(
@@ -8442,6 +8485,7 @@ def generate_route(request: RouteRequest):
             request.target_gain_ft,
         )
 
+        _v46_t = time.perf_counter()
         (
             G,
             filtered_edges_removed,
@@ -8452,6 +8496,7 @@ def generate_route(request: RouteRequest):
             request.start_lon,
             profile["search_radius_m"],
         )
+        _v46_mark("Workspace / tile loading", _v46_t)
 
         same_point = (
             abs(request.start_lat - request.end_lat) < 0.0001
@@ -8475,16 +8520,19 @@ def generate_route(request: RouteRequest):
         # request graph. Avoided segments are removed; preferred segments get a
         # soft path/scoring bonus. This happens before pass-through edge splits
         # so preference attributes propagate into any temporary split pieces.
+        _v46_t = time.perf_counter()
         G, resolved_avoid_segments, resolved_prefer_segments = apply_trail_segment_controls(
             G,
             request.avoid_segments,
             request.prefer_segments,
             start_node=start_node,
         )
+        _v46_mark("Trail preference / avoid controls", _v46_t)
 
         # V25: avoid areas are hard exclusions. Remove intersecting routing
         # edges before selecting the end node or inserting required pass-through
         # points, so every returned candidate automatically respects them.
+        _v46_t = time.perf_counter()
         G, resolved_avoid_areas = apply_avoid_areas_to_graph(
             G,
             request.avoid_areas,
@@ -8494,6 +8542,7 @@ def generate_route(request: RouteRequest):
             end_lat=None if same_point else request.end_lat,
             end_lon=None if same_point else request.end_lon,
         )
+        _v46_mark("Avoid-area graph filtering", _v46_t)
 
         if same_point:
             end_node = start_node
@@ -8509,10 +8558,13 @@ def generate_route(request: RouteRequest):
         # edit handles stay visually separate in the browser, but routing treats
         # them as additional hard corridor requirements.
         combined_pass_points = list(request.pass_points or []) + list(request.route_edit_points or [])
+        _v46_t = time.perf_counter()
         G, required_pass_points = resolve_required_pass_points(G, combined_pass_points)
+        _v46_mark("Pass-point resolution", _v46_t)
         if start_node not in G:
             raise HTTPException(status_code=500, detail="Start node was lost while inserting required pass-through points.")
 
+        _v46_search_started = time.perf_counter()
         if same_point:
             if required_pass_points:
                 constrained_profile = required_waypoint_profile(
@@ -8626,6 +8678,8 @@ def generate_route(request: RouteRequest):
             search_method = "required-point-to-point" if required_pass_points else "point-to-point"
             route_type = "trail point-to-point with required pass-through" if required_pass_points else "trail point-to-point"
 
+        _v46_mark("Core route search", _v46_search_started)
+
         route_distance_miles = (
             metrics["total_distance_meters"] / METERS_PER_MILE
         )
@@ -8660,6 +8714,7 @@ def generate_route(request: RouteRequest):
             }
         ]
 
+        _v46_t = time.perf_counter()
         route_options = []
         for option_index, option in enumerate(internal_options[:MAX_ROUTE_OPTIONS]):
             route_options.append(
@@ -8671,11 +8726,16 @@ def generate_route(request: RouteRequest):
                     option_index,
                 )
             )
+        _v46_mark("Final option payload / elevation", _v46_t)
 
         # Build the no-elevation COROS GPX track only after the winning route
         # has been selected. This is geometry-only and performs no extra DEM
         # raster sampling.
+        _v46_t = time.perf_counter()
         gpx_export_points = build_gpx_export_points(coords)
+        _v46_mark("GPX geometry preparation", _v46_t)
+
+        _v46_profile = _v46_report()
 
         return {
             "requested_distance_miles": request.target_distance_miles,
@@ -8747,11 +8807,14 @@ def generate_route(request: RouteRequest):
             "start_trail_offset_m": float(start_info["trail_offset_m"]),
             "start_source_edge": start_info.get("source_edge"),
             "status": "Route generated",
+            "timing_profile": _v46_profile,
         }
 
     except HTTPException:
+        _v46_report()
         raise
     except Exception as exc:
+        _v46_report()
         raise HTTPException(
             status_code=500,
             detail=str(exc),
