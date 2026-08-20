@@ -50,7 +50,7 @@ DEFAULT_LON = -112.083341
 
 # Sample along trail/GPX geometry every 5 m.
 # The source DEM is ~10 m resolution.
-ELEVATION_SAMPLE_SPACING_M = 10.0
+ELEVATION_SAMPLE_SPACING_M = 5.0
 
 # GPX points within this distance of an allowed trail count as covered.
 GPX_TRAIL_MATCH_TOLERANCE_M = 25.0
@@ -117,7 +117,7 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 50000
 
-APP_VERSION = "2026-08-19-v46-performance-timing"
+APP_VERSION = "2026-08-20-v49-dem-free-bounds-fix"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
 ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
@@ -726,7 +726,50 @@ def edge_attributes_for_split_part(original_data, coords):
     if len(samples) < 2:
         samples = list(coords)
 
-    elevations = elevations_for_coords(samples)
+    original_coords = list(original_data.get("dem_sample_coords") or [])
+    original_elev = list(original_data.get("dem_raw_elevations_m") or [])
+
+    if original_coords and original_elev and len(original_coords) == len(original_elev):
+        # Interpolate elevation from the baked edge profile at each split-part
+        # sample. No runtime raster access.
+        baked = [
+            (float(lon), float(lat))
+            for lon, lat in original_coords
+        ]
+        elevations = []
+        for lon, lat in samples:
+            nearest = nearest_position_on_polyline(baked, float(lon), float(lat))
+            if nearest is None:
+                elevations.append(float(original_elev[0]))
+                continue
+            total_m = max(float(nearest.get("total_m", 0.0)), 1e-9)
+            frac = max(0.0, min(1.0, float(nearest["along_m"]) / total_m))
+            pos = frac * (len(original_elev) - 1)
+            lo = int(math.floor(pos))
+            hi = min(lo + 1, len(original_elev) - 1)
+            t = pos - lo
+            elevations.append(
+                float(original_elev[lo]) * (1.0 - t)
+                + float(original_elev[hi]) * t
+            )
+    else:
+        # Compatibility fallback for an older tile set.
+        eu = original_data.get("elevation_start_m")
+        ev = original_data.get("elevation_end_m")
+        if eu is None:
+            eu = 0.0
+        if ev is None:
+            ev = eu
+        elevations = [
+            float(eu) + (float(ev) - float(eu)) * (i / max(len(samples) - 1, 1))
+            for i in range(len(samples))
+        ]
+
+    attrs["dem_sample_coords"] = [
+        (float(lon), float(lat)) for lon, lat in samples
+    ]
+    attrs["dem_raw_elevations_m"] = [float(v) for v in elevations]
+
     smoothed = smooth_elevations(
         elevations,
         radius=ELEVATION_SMOOTHING_RADIUS,
@@ -843,7 +886,32 @@ def insert_exact_routing_point(G, lat, lon):
     while virtual_node in H:
         virtual_node -= 1
 
-    elevation = elevations_for_coords([(split_lon, split_lat)])[0]
+    source_profile_coords = list(selected_data.get("dem_sample_coords") or [])
+    source_profile_elev = list(selected_data.get("dem_raw_elevations_m") or [])
+    elevation = 0.0
+    if source_profile_coords and source_profile_elev and len(source_profile_coords) == len(source_profile_elev):
+        nearest_profile = nearest_position_on_polyline(
+            [(float(a), float(b)) for a, b in source_profile_coords],
+            split_lon,
+            split_lat,
+        )
+        if nearest_profile is not None:
+            frac = max(
+                0.0,
+                min(
+                    1.0,
+                    float(nearest_profile["along_m"])
+                    / max(float(nearest_profile.get("total_m", 0.0)), 1e-9),
+                ),
+            )
+            pos = frac * (len(source_profile_elev) - 1)
+            lo = int(math.floor(pos))
+            hi = min(lo + 1, len(source_profile_elev) - 1)
+            t = pos - lo
+            elevation = (
+                float(source_profile_elev[lo]) * (1.0 - t)
+                + float(source_profile_elev[hi]) * t
+            )
     H.add_node(
         virtual_node,
         x=float(split_lon),
@@ -1378,7 +1446,32 @@ def insert_required_pass_point(G, lat, lon, tolerance_meters):
 
     H = G.copy()
     virtual_node = _next_virtual_node_id(H)
-    elevation = elevations_for_coords([(split_lon, split_lat)])[0]
+    source_profile_coords = list(selected_data.get("dem_sample_coords") or [])
+    source_profile_elev = list(selected_data.get("dem_raw_elevations_m") or [])
+    elevation = 0.0
+    if source_profile_coords and source_profile_elev and len(source_profile_coords) == len(source_profile_elev):
+        nearest_profile = nearest_position_on_polyline(
+            [(float(a), float(b)) for a, b in source_profile_coords],
+            split_lon,
+            split_lat,
+        )
+        if nearest_profile is not None:
+            frac = max(
+                0.0,
+                min(
+                    1.0,
+                    float(nearest_profile["along_m"])
+                    / max(float(nearest_profile.get("total_m", 0.0)), 1e-9),
+                ),
+            )
+            pos = frac * (len(source_profile_elev) - 1)
+            lo = int(math.floor(pos))
+            hi = min(lo + 1, len(source_profile_elev) - 1)
+            t = pos - lo
+            elevation = (
+                float(source_profile_elev[lo]) * (1.0 - t)
+                + float(source_profile_elev[hi]) * t
+            )
     H.add_node(
         virtual_node,
         x=split_lon,
@@ -1882,8 +1975,24 @@ def add_local_dem_edge_elevations(G):
         all_points.extend(samples)
     lookup = sample_dem_points(all_points) if all_points else {}
     for (u, v, key), samples in edge_samples.items():
-        elevations = [float(lookup[(round(float(lat), 7), round(float(lon), 7))]) for lon, lat in samples]
-        elevations = smooth_elevations(elevations, radius=ELEVATION_SMOOTHING_RADIUS)
+        raw_elevations = [
+            float(lookup[(round(float(lat), 7), round(float(lon), 7))])
+            for lon, lat in samples
+        ]
+
+        # V47 stores the build-time DEM profile directly on the edge so Render
+        # never needs the 1.1 GB TIFF.
+        G[u][v][key]["dem_sample_coords"] = [
+            (float(lon), float(lat)) for lon, lat in samples
+        ]
+        G[u][v][key]["dem_raw_elevations_m"] = [
+            float(value) for value in raw_elevations
+        ]
+
+        elevations = smooth_elevations(
+            raw_elevations,
+            radius=ELEVATION_SMOOTHING_RADIUS,
+        )
         ascent, descent = calculate_ascent_descent(elevations)
         G[u][v][key]["ascent_m"] = float(ascent)
         G[u][v][key]["descent_m"] = float(descent)
@@ -1896,48 +2005,76 @@ def add_local_dem_edge_elevations(G):
 # ============================================================
 
 def get_dem_bounds_wgs84():
-    """Return the TIFF footprint as (left, bottom, right, top) in EPSG:4326."""
+    """Return coverage bounds in EPSG:4326.
+
+    Build machines use the real TIFF. V49 production can run without the TIFF
+    and falls back to the routing-tile manifest coverage baked from that DEM.
+    """
     global DEM_BOUNDS_WGS84_CACHE
 
     if DEM_BOUNDS_WGS84_CACHE is not None:
         return DEM_BOUNDS_WGS84_CACHE
 
-    _ensure_data_file_downloaded(DEM_PATH, "DEM_TIF_URL")
+    if os.path.exists(DEM_PATH):
+        with rasterio.open(DEM_PATH) as src:
+            if src.crs is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail="DEM has no CRS information.",
+                )
 
-    if not os.path.exists(DEM_PATH):
-        raise HTTPException(
-            status_code=500,
-            detail=f"DEM file not found: {DEM_PATH}",
-        )
-
-    with rasterio.open(DEM_PATH) as src:
-        if src.crs is None:
-            raise HTTPException(
-                status_code=500,
-                detail="DEM has no CRS information.",
+            left, bottom, right, top = rio_transform_bounds(
+                src.crs,
+                "EPSG:4326",
+                src.bounds.left,
+                src.bounds.bottom,
+                src.bounds.right,
+                src.bounds.top,
+                densify_pts=21,
             )
 
-        left, bottom, right, top = rio_transform_bounds(
-            src.crs,
-            "EPSG:4326",
-            src.bounds.left,
-            src.bounds.bottom,
-            src.bounds.right,
-            src.bounds.top,
-            densify_pts=21,
+        DEM_BOUNDS_WGS84_CACHE = (
+            float(left),
+            float(bottom),
+            float(right),
+            float(top),
+        )
+        return DEM_BOUNDS_WGS84_CACHE
+
+    # DEM-free production fallback.
+    manifest = load_routing_tile_manifest()
+    coverage = manifest.get("coverage_nominal") or {}
+    try:
+        DEM_BOUNDS_WGS84_CACHE = (
+            float(coverage["west"]),
+            float(coverage["south"]),
+            float(coverage["east"]),
+            float(coverage["north"]),
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "DEM is not present and routing_tiles/manifest.json does not "
+                "contain usable coverage_nominal bounds."
+            ),
         )
 
-    DEM_BOUNDS_WGS84_CACHE = (
-        float(left),
-        float(bottom),
-        float(right),
-        float(top),
-    )
     return DEM_BOUNDS_WGS84_CACHE
 
 
 def get_dem_signature():
-    """Stable signature used to reject a stale saved master graph."""
+    """Return the build DEM signature without requiring the TIFF at runtime."""
+    if not os.path.exists(DEM_PATH):
+        try:
+            manifest = load_routing_tile_manifest()
+            signature = str(manifest.get("dem_signature", "") or "")
+            if signature:
+                return signature
+        except Exception:
+            pass
+        return "dem-free-runtime"
+
     bounds = get_dem_bounds_wgs84()
 
     with rasterio.open(DEM_PATH) as src:
@@ -1953,10 +2090,23 @@ def get_dem_signature():
 
 
 def point_inside_dem(lat, lon):
-    left, bottom, right, top = get_dem_bounds_wgs84()
     lat = float(lat)
     lon = float(lon)
-    return left <= lon <= right and bottom <= lat <= top
+
+    if os.path.exists(DEM_PATH):
+        left, bottom, right, top = get_dem_bounds_wgs84()
+        return left <= lon <= right and bottom <= lat <= top
+
+    try:
+        manifest = load_routing_tile_manifest()
+        coverage = manifest.get("coverage_nominal") or {}
+        left = float(coverage["west"])
+        bottom = float(coverage["south"])
+        right = float(coverage["east"])
+        top = float(coverage["north"])
+        return left <= lon <= right and bottom <= lat <= top
+    except Exception:
+        return True
 
 
 def edge_fully_inside_dem(G, u, v, data):
@@ -2931,16 +3081,13 @@ def load_routing_tile_manifest():
         if not rows:
             raise HTTPException(status_code=503, detail="Routing tile manifest contains no tiles.")
 
-        # Reject an accidentally stale tile set built against another DEM.
+        # V47: production runtime is DEM-free. The routing tiles are the
+        # authoritative elevation product and carry the build-time DEM signature.
         manifest_dem = str(manifest.get("dem_signature", "") or "")
-        current_dem = str(get_dem_signature())
-        if manifest_dem and manifest_dem != current_dem:
+        if not manifest_dem:
             raise HTTPException(
                 status_code=503,
-                detail=(
-                    "Routing tiles were built for a different DEM. Re-run "
-                    "build_routing_tiles.py against the current output_hh.tif."
-                ),
+                detail="Routing tile manifest has no DEM signature.",
             )
 
         ROUTING_TILE_MANIFEST = manifest
@@ -2971,15 +3118,23 @@ def _workspace_bbox_wgs84(lat, lon, radius_m):
         (float(lat), float(lon)),
         float(radius_m),
     )
-    # Existing codebase uses (left, bottom, right, top) from bbox_from_point.
     left, bottom, right, top = [float(v) for v in bbox]
-    dl, db, dr, dt = get_dem_bounds_wgs84()
-    return (
-        max(left, dl),
-        max(bottom, db),
-        min(right, dr),
-        min(top, dt),
-    )
+
+    manifest = load_routing_tile_manifest()
+    coverage = manifest.get("coverage_nominal") or {}
+    try:
+        dl = float(coverage["west"])
+        db = float(coverage["south"])
+        dr = float(coverage["east"])
+        dt = float(coverage["north"])
+        return (
+            max(left, dl),
+            max(bottom, db),
+            min(right, dr),
+            min(top, dt),
+        )
+    except Exception:
+        return (left, bottom, right, top)
 
 
 def routing_tiles_for_workspace(lat, lon, radius_m):
@@ -3193,7 +3348,7 @@ def extract_local_master_subgraph(master_G, lat, lon, radius_meters):
         raise HTTPException(
             status_code=400,
             detail=(
-                "Start coordinate is outside TIFF coverage: "
+                "Start coordinate is outside routing coverage: "
                 f"west={left:.6f}, east={right:.6f}, "
                 f"south={bottom:.6f}, north={top:.6f}."
             ),
@@ -3213,7 +3368,7 @@ def extract_local_master_subgraph(master_G, lat, lon, radius_meters):
     if left >= right or bottom >= top:
         raise HTTPException(
             status_code=400,
-            detail="No TIFF-covered search area exists around this start coordinate.",
+            detail="No routing-covered search area exists around this start coordinate.",
         )
 
     try:
@@ -3868,8 +4023,8 @@ def workspace_cache_key(lat, lon, radius_m):
         round(float(lat), 5),
         round(float(lon), 5),
         radius_bucket,
-        os.path.basename(DEM_PATH),
-        "start-workspace-v39",
+        str(load_routing_tile_manifest().get("dem_signature", "dem-free")),
+        "start-workspace-v49",
     )
 
 
@@ -3987,7 +4142,7 @@ def get_start_workspace(lat, lon, requested_radius_m=None, force_rebuild=False):
         raise HTTPException(
             status_code=400,
             detail=(
-                "Start coordinate is outside TIFF coverage: "
+                "Start coordinate is outside routing coverage: "
                 f"west={left:.6f}, east={right:.6f}, "
                 f"south={bottom:.6f}, north={top:.6f}."
             ),
@@ -4953,6 +5108,108 @@ def big_loop_shape_penalty(
 # ROUTE SCORE / CONTINUOUS ELEVATION
 # ============================================================
 
+
+def baked_edge_profile(G, u, v, edge):
+    """Return oriented (lon,lat) samples + raw elevations stored on one edge."""
+    coords = list(edge.get("dem_sample_coords") or [])
+    elevations = list(edge.get("dem_raw_elevations_m") or [])
+    if not coords or not elevations or len(coords) != len(elevations):
+        return [], []
+
+    coords = [(float(lon), float(lat)) for lon, lat in coords]
+    elevations = [float(value) for value in elevations]
+
+    u_lon = float(G.nodes[u]["x"])
+    u_lat = float(G.nodes[u]["y"])
+    first_lon, first_lat = coords[0]
+    last_lon, last_lat = coords[-1]
+
+    first_distance = abs(first_lon - u_lon) + abs(first_lat - u_lat)
+    last_distance = abs(last_lon - u_lon) + abs(last_lat - u_lat)
+    if last_distance < first_distance:
+        coords.reverse()
+        elevations.reverse()
+
+    return coords, elevations
+
+
+def route_baked_elevation_metrics(G, route_nodes):
+    """Build continuous route elevation metrics without opening a DEM TIFF."""
+    all_coords = []
+    all_elevations = []
+
+    for i in range(len(route_nodes) - 1):
+        u = route_nodes[i]
+        v = route_nodes[i + 1]
+        edge = get_shortest_edge(G, u, v)
+        if edge is None:
+            continue
+
+        coords, elevations = baked_edge_profile(G, u, v, edge)
+
+        # Connector edges may not have detailed DEM samples. Fall back to
+        # endpoint node elevation when present and otherwise carry the nearest
+        # known elevation forward. This keeps the runtime DEM-free.
+        if not coords:
+            coords = oriented_edge_coords(G, u, v, edge)
+            if len(coords) < 2:
+                continue
+            eu = G.nodes[u].get("elevation")
+            ev = G.nodes[v].get("elevation")
+            if eu is None and all_elevations:
+                eu = all_elevations[-1]
+            if ev is None:
+                ev = eu if eu is not None else 0.0
+            if eu is None:
+                eu = ev
+            elevations = [
+                float(eu) + (float(ev) - float(eu)) * (j / max(len(coords) - 1, 1))
+                for j in range(len(coords))
+            ]
+
+        if all_coords and coords:
+            if (
+                haversine_meters(
+                    all_coords[-1][1], all_coords[-1][0],
+                    coords[0][1], coords[0][0],
+                ) < 0.25
+            ):
+                coords = coords[1:]
+                elevations = elevations[1:]
+
+        all_coords.extend(coords)
+        all_elevations.extend(elevations)
+
+    if len(all_coords) < 2 or len(all_elevations) < 2:
+        return {
+            "distance_meters": path_distance_meters(G, route_nodes),
+            "gain_meters": path_gain_meters(G, route_nodes),
+            "descent_meters": 0.0,
+            "dem_sample_points": len(all_coords),
+            "elevation_profile": [],
+        }
+
+    smoothed = smooth_elevations(
+        all_elevations,
+        radius=ELEVATION_SMOOTHING_RADIUS,
+    )
+    ascent_m, descent_m = calculate_ascent_descent(smoothed)
+
+    distance_m = 0.0
+    for i in range(len(all_coords) - 1):
+        lon1, lat1 = all_coords[i]
+        lon2, lat2 = all_coords[i + 1]
+        distance_m += haversine_meters(lat1, lon1, lat2, lon2)
+
+    return {
+        "distance_meters": float(distance_m),
+        "gain_meters": float(ascent_m),
+        "descent_meters": float(descent_m),
+        "dem_sample_points": len(all_coords),
+        "elevation_profile": build_elevation_profile(all_coords, smoothed),
+    }
+
+
 def build_elevation_profile(dense_lonlat, smoothed_elevations, max_points=240):
     """Return a compact distance/elevation profile for browser rendering.
 
@@ -5038,6 +5295,27 @@ def route_geometry_metrics(coords):
     }
 
 
+def coordinate_distance_only_metrics(coords):
+    """Compute exact coordinate distance without touching the DEM."""
+    lonlat = [
+        (float(point["lon"]), float(point["lat"]))
+        for point in (coords or [])
+    ]
+    distance_m = 0.0
+    for i in range(len(lonlat) - 1):
+        lon1, lat1 = lonlat[i]
+        lon2, lat2 = lonlat[i + 1]
+        distance_m += haversine_meters(lat1, lon1, lat2, lon2)
+
+    return {
+        "distance_meters": float(distance_m),
+        "gain_meters": 0.0,
+        "descent_meters": 0.0,
+        "dem_sample_points": 0,
+        "elevation_profile": [],
+    }
+
+
 def score_route_coordinates(
     G,
     coords,
@@ -5046,7 +5324,23 @@ def score_route_coordinates(
     target_gain_meters,
     partial_added_distance_m=0.0,
 ):
-    geometry = route_geometry_metrics(coords)
+    if route_nodes:
+        geometry = route_baked_elevation_metrics(G, route_nodes)
+        # Preserve exact displayed route distance from the route geometry.
+        if coords:
+            lonlat = [
+                (float(point["lon"]), float(point["lat"]))
+                for point in coords
+            ]
+            exact_distance_m = 0.0
+            for i in range(len(lonlat) - 1):
+                lon1, lat1 = lonlat[i]
+                lon2, lat2 = lonlat[i + 1]
+                exact_distance_m += haversine_meters(lat1, lon1, lat2, lon2)
+            geometry["distance_meters"] = float(exact_distance_m)
+    else:
+        # V48: production route generation must never reopen the TIFF.
+        geometry = coordinate_distance_only_metrics(coords)
     total_distance = geometry["distance_meters"]
     actual_gain = geometry["gain_meters"]
 
@@ -8040,7 +8334,13 @@ def classify_route_geometry_against_graph(G, coords):
 
 
 def build_stitched_route_option(G, coords, request, replacement_route_nodes):
-    geometry = route_geometry_metrics(coords)
+    if replacement_route_nodes:
+        geometry = route_baked_elevation_metrics(G, replacement_route_nodes)
+    else:
+        # Direct-splice edits may not have exact node IDs for every coordinate.
+        # Classify against the graph and use nearest edge baked elevations only
+        # when available; distance remains exact from coords.
+        geometry = coordinate_distance_only_metrics(coords)
     total_m = float(geometry["distance_meters"])
     gain_m = float(geometry["gain_meters"])
     classification = classify_route_geometry_against_graph(G, coords)
@@ -8380,7 +8680,9 @@ def replace_route_section(request: RouteSectionReplacementRequest):
 
         option = build_stitched_route_option(G, stitched, request, new_path_nodes)
         option["replacement_distance_miles"] = round(
-            route_geometry_metrics(replacement_coords)["distance_meters"] / METERS_PER_MILE, 2
+            coordinate_distance_only_metrics(replacement_coords)["distance_meters"]
+            / METERS_PER_MILE,
+            2,
         )
         option["replaced_route_points"] = int(cut_b - cut_a + 1)
 
