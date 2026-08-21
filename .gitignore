@@ -10,3 +10,9 @@ output_hh.tif
 arizona_tile_grid.geojson
 tile-*.osm.pbf
 main_new.py
+
+# DEM build sources - offline only
+output_hh.tif
+output_USGS10m.tif
+output_30m_backup.tif
+output_hh_BUILD_ONLY.tif
