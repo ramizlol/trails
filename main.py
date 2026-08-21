@@ -727,12 +727,54 @@ def edge_attributes_for_split_part(original_data, coords):
     if len(samples) < 2:
         samples = list(coords)
 
-    original_coords, original_elev = baked_edge_profile(
-        H,
-        original_u,
-        original_v,
-        original_data,
+    # V52 fix: this helper does not have a graph/u/v context. Reconstruct
+    # the original 10 m sample positions directly from the stored edge geometry
+    # and pair them with the compact float32 elevation array.
+    original_elev = [
+        float(value)
+        for value in (original_data.get("dem_elevations_f32") or [])
+    ]
+
+    original_geometry = original_data.get("geometry")
+    if original_geometry is not None:
+        original_line_coords = [
+            (float(lon), float(lat))
+            for lon, lat in original_geometry.coords
+        ]
+    else:
+        original_line_coords = list(coords)
+
+    spacing = float(
+        original_data.get(
+            "dem_sample_spacing_m",
+            ELEVATION_SAMPLE_SPACING_M,
+        )
+        or ELEVATION_SAMPLE_SPACING_M
     )
+
+    original_coords = densify_polyline(
+        original_line_coords,
+        spacing,
+    )
+
+    if len(original_coords) != len(original_elev) and original_elev:
+        dense = densify_polyline(
+            original_line_coords,
+            max(spacing / 2.0, 1.0),
+        )
+
+        if len(original_elev) == 1:
+            original_coords = [dense[0]]
+        elif dense:
+            original_coords = []
+            last = len(dense) - 1
+            for i in range(len(original_elev)):
+                idx = int(
+                    round(
+                        i * last / (len(original_elev) - 1)
+                    )
+                )
+                original_coords.append(dense[idx])
 
     if original_coords and original_elev and len(original_coords) == len(original_elev):
         elevations = []
