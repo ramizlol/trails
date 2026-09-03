@@ -10714,9 +10714,11 @@ function persistentBlockCountText() {
 function savePersistentBlocklist(announce = false) {
     try {
         localStorage.setItem(PERSISTENT_BLOCKLIST_STORAGE_KEY, JSON.stringify(persistentBlocklistPayload()));
-        if (announce) {
-            setPersistentBlocklistStatus(`Saved ${persistentBlockCountText()} permanently in this browser.`);
-        }
+        setPersistentBlocklistStatus(
+            avoidAreas.length || avoidSegments.length
+                ? `Saved ${persistentBlockCountText()} permanently in this browser.`
+                : "No permanent personal blocks saved yet."
+        );
         return true;
     } catch (error) {
         setPersistentBlocklistStatus("Could not save permanent blocks in this browser: " + error.message, true);
@@ -10779,8 +10781,12 @@ function normalizePersistentBlocklist(value) {
             lon: Number(lon.toFixed(7)),
             geometry,
             tile_id: typeof segment.tile_id === "string" ? segment.tile_id : null,
-            edge_u: Number.isFinite(Number(segment.edge_u)) ? Number(segment.edge_u) : null,
-            edge_v: Number.isFinite(Number(segment.edge_v)) ? Number(segment.edge_v) : null,
+            edge_u: segment.edge_u === null || segment.edge_u === undefined
+                ? null
+                : (Number.isFinite(Number(segment.edge_u)) ? Number(segment.edge_u) : null),
+            edge_v: segment.edge_v === null || segment.edge_v === undefined
+                ? null
+                : (Number.isFinite(Number(segment.edge_v)) ? Number(segment.edge_v) : null),
             edge_key: segment.edge_key === null || segment.edge_key === undefined ? null : String(segment.edge_key)
         };
     });
