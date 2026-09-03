@@ -10157,6 +10157,21 @@ input[type="range"] {
             <div id="segmentStatus" class="small"></div>
             <div id="segmentRows"></div>
         </div>
+
+        <div id="persistent-blocklist-panel" class="tool-block">
+            <div class="tool-heading">Permanent personal blocks</div>
+            <div class="small">
+                Avoided areas and avoided trail segments are saved automatically in this browser.
+                Export a backup to move them to another browser or device.
+            </div>
+            <div class="segment-button-row">
+                <button id="exportBlocklistButton" type="button" class="secondary-button">Export blocks</button>
+                <button id="importBlocklistButton" type="button" class="secondary-button">Import blocks</button>
+                <button id="clearBlocklistButton" type="button" class="secondary-button">Clear blocks</button>
+            </div>
+            <input id="importBlocklistInput" type="file" accept=".json,application/json" style="display:none">
+            <div id="persistentBlocklistStatus" class="small"></div>
+        </div>
     </div>
 </details>
 
@@ -10550,6 +10565,9 @@ let redoStack = [];
 let currentPlannerState = null;
 let restoringPlannerState = false;
 
+const PERSISTENT_BLOCKLIST_STORAGE_KEY = "trail-running-creator.personal-blocklist.v1";
+const PERSISTENT_BLOCKLIST_SCHEMA = "trail-running-creator-personal-blocklist-v1";
+
 const generateButton = document.getElementById("generateButton");
 const findMoreButton = document.getElementById("findMoreButton");
 const downloadGpxButton = document.getElementById("downloadGpxButton");
@@ -10560,6 +10578,11 @@ const addPassPointButton = document.getElementById("addPassPointButton");
 const addAvoidAreaButton = document.getElementById("addAvoidAreaButton");
 const avoidTrailSegmentButton = document.getElementById("avoidTrailSegmentButton");
 const preferTrailSegmentButton = document.getElementById("preferTrailSegmentButton");
+const exportBlocklistButton = document.getElementById("exportBlocklistButton");
+const importBlocklistButton = document.getElementById("importBlocklistButton");
+const clearBlocklistButton = document.getElementById("clearBlocklistButton");
+const importBlocklistInput = document.getElementById("importBlocklistInput");
+const persistentBlocklistStatus = document.getElementById("persistentBlocklistStatus");
 const routeDiversityInput = document.getElementById("routeDiversity");
 const diversityValue = document.getElementById("diversityValue");
 const editRouteButton = document.getElementById("editRouteButton");
@@ -10587,6 +10610,10 @@ addPassPointButton.addEventListener("click", beginPassPointPlacement);
 addAvoidAreaButton.addEventListener("click", beginAvoidAreaPlacement);
 avoidTrailSegmentButton.addEventListener("click", () => beginTrailSegmentPlacement("avoid"));
 preferTrailSegmentButton.addEventListener("click", () => beginTrailSegmentPlacement("prefer"));
+exportBlocklistButton.addEventListener("click", exportPersistentBlocklist);
+importBlocklistButton.addEventListener("click", () => importBlocklistInput.click());
+importBlocklistInput.addEventListener("change", importPersistentBlocklist);
+clearBlocklistButton.addEventListener("click", clearPersistentBlocklist);
 editRouteButton.addEventListener("click", beginRouteEditMode);
 clearRouteEditsButton.addEventListener("click", clearRouteEditPoints);
 replaceSectionButton.addEventListener("click", beginRouteSectionReplacement);
@@ -10651,6 +10678,194 @@ function deepClonePlannerValue(value) {
 }
 
 
+function persistentBlocklistPayload() {
+    return {
+        schema: PERSISTENT_BLOCKLIST_SCHEMA,
+        version: 1,
+        saved_at: new Date().toISOString(),
+        avoid_areas: avoidAreas.map(area => ({
+            lat: Number(area.lat),
+            lon: Number(area.lon),
+            radius_miles: Number(area.radius_miles)
+        })),
+        avoid_segments: avoidSegments.map(item => ({
+            lat: Number(item.lat),
+            lon: Number(item.lon),
+            geometry: deepClonePlannerValue(item.geometry || []),
+            tile_id: item.tile_id ?? null,
+            edge_u: item.edge_u ?? null,
+            edge_v: item.edge_v ?? null,
+            edge_key: item.edge_key ?? null
+        }))
+    };
+}
+
+function setPersistentBlocklistStatus(message, isError = false) {
+    persistentBlocklistStatus.textContent = message;
+    persistentBlocklistStatus.className = isError ? "small error" : "small";
+}
+
+function persistentBlockCountText() {
+    const areaCount = avoidAreas.length;
+    const segmentCount = avoidSegments.length;
+    return `${areaCount} area${areaCount === 1 ? "" : "s"} and ${segmentCount} trail segment${segmentCount === 1 ? "" : "s"}`;
+}
+
+function savePersistentBlocklist(announce = false) {
+    try {
+        localStorage.setItem(PERSISTENT_BLOCKLIST_STORAGE_KEY, JSON.stringify(persistentBlocklistPayload()));
+        if (announce) {
+            setPersistentBlocklistStatus(`Saved ${persistentBlockCountText()} permanently in this browser.`);
+        }
+        return true;
+    } catch (error) {
+        setPersistentBlocklistStatus("Could not save permanent blocks in this browser: " + error.message, true);
+        return false;
+    }
+}
+
+function normalizePersistentBlocklist(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+        throw new Error("The blocklist file must contain a JSON object.");
+    }
+    if (value.schema !== PERSISTENT_BLOCKLIST_SCHEMA || Number(value.version) !== 1) {
+        throw new Error("This is not a supported Trail Running Creator blocklist file.");
+    }
+    if (!Array.isArray(value.avoid_areas) || !Array.isArray(value.avoid_segments)) {
+        throw new Error("The blocklist is missing its avoided areas or trail segments.");
+    }
+    if (value.avoid_areas.length > 500 || value.avoid_segments.length > 500) {
+        throw new Error("The blocklist is too large to import safely.");
+    }
+
+    const areas = value.avoid_areas.map((area, index) => {
+        const lat = Number(area?.lat);
+        const lon = Number(area?.lon);
+        const radius = Number(area?.radius_miles);
+        if (!Number.isFinite(lat) || lat < -90 || lat > 90 ||
+            !Number.isFinite(lon) || lon < -180 || lon > 180 ||
+            !Number.isFinite(radius) || radius < 0.01 || radius > 10) {
+            throw new Error(`Avoid area ${index + 1} has invalid coordinates or radius.`);
+        }
+        return {
+            id: index + 1,
+            lat: Number(lat.toFixed(7)),
+            lon: Number(lon.toFixed(7)),
+            radius_miles: Number(radius.toFixed(3))
+        };
+    });
+
+    const segments = value.avoid_segments.map((segment, index) => {
+        const lat = Number(segment?.lat);
+        const lon = Number(segment?.lon);
+        const rawGeometry = segment?.geometry;
+        if (!Number.isFinite(lat) || lat < -90 || lat > 90 ||
+            !Number.isFinite(lon) || lon < -180 || lon > 180 ||
+            !Array.isArray(rawGeometry) || rawGeometry.length < 2 || rawGeometry.length > 10000) {
+            throw new Error(`Avoided trail segment ${index + 1} is invalid.`);
+        }
+        const geometry = rawGeometry.map((point, pointIndex) => {
+            const pointLat = Number(point?.[0]);
+            const pointLon = Number(point?.[1]);
+            if (!Number.isFinite(pointLat) || pointLat < -90 || pointLat > 90 ||
+                !Number.isFinite(pointLon) || pointLon < -180 || pointLon > 180) {
+                throw new Error(`Avoided trail segment ${index + 1}, point ${pointIndex + 1} is invalid.`);
+            }
+            return [Number(pointLat.toFixed(7)), Number(pointLon.toFixed(7))];
+        });
+        return {
+            id: areas.length + index + 1,
+            lat: Number(lat.toFixed(7)),
+            lon: Number(lon.toFixed(7)),
+            geometry,
+            tile_id: typeof segment.tile_id === "string" ? segment.tile_id : null,
+            edge_u: Number.isFinite(Number(segment.edge_u)) ? Number(segment.edge_u) : null,
+            edge_v: Number.isFinite(Number(segment.edge_v)) ? Number(segment.edge_v) : null,
+            edge_key: segment.edge_key === null || segment.edge_key === undefined ? null : String(segment.edge_key)
+        };
+    });
+    return {areas, segments};
+}
+
+function applyPersistentBlocklist(value, announce = true) {
+    const normalized = normalizePersistentBlocklist(value);
+    avoidAreas = normalized.areas;
+    avoidSegments = normalized.segments;
+    nextAvoidAreaId = avoidAreas.length + 1;
+    nextTrailSegmentId = Math.max(0, ...avoidSegments.concat(preferSegments).map(item => Number(item.id) || 0)) + 1;
+    renderAvoidAreaRows();
+    drawAvoidAreaLayers();
+    renderTrailSegmentRows();
+    drawTrailSegmentLayers();
+    savePersistentBlocklist(false);
+    if (announce) {
+        setPersistentBlocklistStatus(`Loaded ${persistentBlockCountText()}. These blocks now apply to future routes.`);
+    }
+}
+
+function loadPersistentBlocklist() {
+    let raw;
+    try {
+        raw = localStorage.getItem(PERSISTENT_BLOCKLIST_STORAGE_KEY);
+    } catch (error) {
+        setPersistentBlocklistStatus("Permanent browser storage is unavailable: " + error.message, true);
+        return;
+    }
+    if (!raw) {
+        setPersistentBlocklistStatus("No permanent personal blocks saved yet.");
+        return;
+    }
+    try {
+        applyPersistentBlocklist(JSON.parse(raw), true);
+    } catch (error) {
+        setPersistentBlocklistStatus("Saved permanent blocks could not be loaded: " + error.message, true);
+    }
+}
+
+function exportPersistentBlocklist() {
+    const payload = persistentBlocklistPayload();
+    payload.exported_at = new Date().toISOString();
+    triggerTextDownload(
+        "trail-running-permanent-blocks.json",
+        JSON.stringify(payload, null, 2) + "\n",
+        "application/json;charset=utf-8"
+    );
+    setPersistentBlocklistStatus(`Exported ${persistentBlockCountText()}.`);
+}
+
+async function importPersistentBlocklist() {
+    const file = importBlocklistInput.files?.[0];
+    if (!file) return;
+    try {
+        const value = JSON.parse(await file.text());
+        applyPersistentBlocklist(value, false);
+        commitPlannerState();
+        setPersistentBlocklistStatus(`Imported and saved ${persistentBlockCountText()} permanently in this browser.`);
+    } catch (error) {
+        setPersistentBlocklistStatus("Could not import blocklist: " + error.message, true);
+    } finally {
+        importBlocklistInput.value = "";
+    }
+}
+
+function clearPersistentBlocklist() {
+    if (!avoidAreas.length && !avoidSegments.length) {
+        setPersistentBlocklistStatus("There are no permanent personal blocks to clear.");
+        return;
+    }
+    if (!window.confirm("Clear every permanently avoided area and trail segment from this browser?")) return;
+    avoidAreas = [];
+    avoidSegments = [];
+    nextAvoidAreaId = 1;
+    nextTrailSegmentId = Math.max(0, ...preferSegments.map(item => Number(item.id) || 0)) + 1;
+    renderAvoidAreaRows();
+    drawAvoidAreaLayers();
+    renderTrailSegmentRows();
+    drawTrailSegmentLayers();
+    commitPlannerState();
+    setPersistentBlocklistStatus("Permanent personal blocks cleared.");
+}
+
 function capturePlannerState() {
     return {
         start_lat: document.getElementById("start_lat").value,
@@ -10696,6 +10911,7 @@ function resetPlannerHistory() {
 
 function commitPlannerState() {
     if (restoringPlannerState) return;
+    savePersistentBlocklist(false);
     const nextState = capturePlannerState();
     if (currentPlannerState === null) {
         currentPlannerState = nextState;
@@ -10773,6 +10989,7 @@ function applyPlannerState(state) {
     } finally {
         restoringPlannerState = false;
     }
+    savePersistentBlocklist(false);
 }
 
 
@@ -12135,7 +12352,11 @@ function addClickedTrailSegment(kind, latlng) {
         id: nextTrailSegmentId++,
         lat: Number(nearest.lat.toFixed(7)),
         lon: Number(nearest.lon.toFixed(7)),
-        geometry: nearest.geometry
+        geometry: nearest.geometry,
+        tile_id: nearest.tile_id,
+        edge_u: nearest.edge_u,
+        edge_v: nearest.edge_v,
+        edge_key: nearest.edge_key
     });
 
     trailSegmentPlacementMode = null;
@@ -13505,6 +13726,7 @@ async function findMoreRoutes() {
 // user's start point, then Generate/Load prepares that start workspace.
 updateQualityFilterUi();
 renderRouteEditRows();
+loadPersistentBlocklist();
 resetPlannerHistory();
 loadMasterTrailOverlayOnce().catch(error => {
     console.warn("Trail overlay load failed:", error);
