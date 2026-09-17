@@ -236,6 +236,9 @@ def normalize_tile_metadata(app, G, source_path, tile_id, dem_samples, connector
     G.graph["master_elevation_precomputed"] = "1"
     G.graph["tile_elevation_unique_samples"] = int(dem_samples)
     G.graph["embedded_dem_edge_profiles"] = "compact-float32-v52"
+    G.graph["elevation_processing_version"] = app.ELEVATION_PROCESSING_VERSION
+    G.graph["elevation_smoothing_radius"] = int(app.ELEVATION_SMOOTHING_RADIUS)
+    G.graph["elevation_gain_threshold_m"] = float(app.ELEVATION_GAIN_THRESHOLD_M)
     G.graph["offline_connectors_prebuilt"] = "1"
     G.graph["offline_connector_count"] = int(connector_info["connector_count"])
     G.graph["offline_connector_checks"] = int(connector_info["connector_checks"])
@@ -342,6 +345,9 @@ def write_manifest(app, rows, started):
     manifest = {
         "schema": "trail-routing-tile-manifest-v1",
         "elevation_storage": "compact-float32-v52",
+        "elevation_processing_version": app.ELEVATION_PROCESSING_VERSION,
+        "elevation_smoothing_radius": int(app.ELEVATION_SMOOTHING_RADIUS),
+        "elevation_gain_threshold_m": float(app.ELEVATION_GAIN_THRESHOLD_M),
         "generated_unix": time.time(),
         "dem_file": os.path.basename(app.DEM_PATH),
         "dem_signature": app.get_dem_signature(),
