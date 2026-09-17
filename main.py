@@ -118,9 +118,16 @@ DEM_BOUNDS_WGS84_CACHE = None
 DEM_POINT_CACHE = {}
 MAX_DEM_POINT_CACHE = 50000
 
-APP_VERSION = "2026-08-20-v52-compact-elevation-profiles"
+APP_VERSION = "2026-09-17-v53-noise-aware-elevation-gain"
 MASTER_NETWORK_SCHEMA = "trail-only-v15-local-pbf-precomputed"
-ELEVATION_SMOOTHING_RADIUS = 5  # 11 points total ~= 55 m at 5 m spacing
+# Five points at 5 m spacing retain short Phoenix trail undulations while
+# suppressing single-cell DEM artifacts.
+ELEVATION_SMOOTHING_RADIUS = 2  # 5 points total ~= 25 m at 5 m spacing
+# Require this much accumulated vertical movement before accepting a reversal.
+# Unlike filtering each sample-to-sample delta, hysteresis preserves gradual
+# climbs whose individual 5 m steps are smaller than the threshold.
+ELEVATION_GAIN_THRESHOLD_M = 1.5
+ELEVATION_PROCESSING_VERSION = "smooth-25m-hysteresis-1.5m-v1"
 PARTIAL_TUNING_MAX_DEFICIT_M = 0.75 * METERS_PER_MILE
 TRAIL_HIGHWAYS = {"path", "track", "steps"}
 HARD_TRAIL_SURFACES = {"asphalt", "concrete", "concrete:lanes", "concrete:plates", "paving_stones", "sett", "cobblestone"}
@@ -1840,19 +1847,118 @@ def smooth_elevations(values, radius=2):
     return result
 
 
-def calculate_ascent_descent(elevations):
+def calculate_ascent_descent(
+    elevations,
+    noise_threshold_m=ELEVATION_GAIN_THRESHOLD_M,
+):
+    """Return ascent/descent with a vertical hysteresis noise filter.
+
+    The threshold is applied to accumulated movement between confirmed turning
+    points, not to individual samples. A gradual climb therefore still counts,
+    while sub-threshold DEM chatter does not repeatedly add false gain.
+    """
+    values = [float(value) for value in elevations]
+    if len(values) < 2:
+        return 0.0, 0.0
+
+    threshold = max(0.0, float(noise_threshold_m))
+    if threshold == 0.0:
+        ascent = 0.0
+        descent = 0.0
+        for previous, current in zip(values, values[1:]):
+            delta = current - previous
+            if delta > 0:
+                ascent += delta
+            elif delta < 0:
+                descent += -delta
+        return ascent, descent
+
     ascent = 0.0
     descent = 0.0
+    anchor = values[0]
+    high = values[0]
+    low = values[0]
+    direction = 0  # 1 = climbing, -1 = descending, 0 = not confirmed
 
-    for i in range(len(elevations) - 1):
-        delta = elevations[i + 1] - elevations[i]
+    for value in values[1:]:
+        if direction >= 0:
+            high = max(high, value)
+        if direction <= 0:
+            low = min(low, value)
 
-        if delta > 0:
-            ascent += delta
-        elif delta < 0:
-            descent += -delta
+        if direction == 0:
+            if value - low >= threshold:
+                direction = 1
+                anchor = low
+                high = value
+            elif high - value >= threshold:
+                direction = -1
+                anchor = high
+                low = value
+        elif direction == 1 and high - value >= threshold:
+            ascent += high - anchor
+            direction = -1
+            anchor = high
+            low = value
+        elif direction == -1 and value - low >= threshold:
+            descent += anchor - low
+            direction = 1
+            anchor = low
+            high = value
+
+    if direction == 1:
+        ascent += high - anchor
+    elif direction == -1:
+        descent += anchor - low
+    else:
+        # Preserve a real small net endpoint change (important on short graph
+        # edges) while still ignoring the intervening sub-threshold oscillation.
+        net_change = values[-1] - values[0]
+        if net_change > 0:
+            ascent += net_change
+        elif net_change < 0:
+            descent += -net_change
 
     return ascent, descent
+
+
+def refresh_precomputed_elevation_metrics(G, force=False):
+    """Refresh baked per-edge ascent heuristics using the current algorithm."""
+    if (
+        not force
+        and str(G.graph.get("elevation_processing_version", ""))
+        == ELEVATION_PROCESSING_VERSION
+    ):
+        return G
+
+    refreshed = 0
+    for _, _, _, data in G.edges(keys=True, data=True):
+        packed = data.get("dem_elevations_f32")
+        if packed is None:
+            packed = data.get("dem_raw_elevations_m")
+
+        try:
+            elevations = [float(value) for value in (packed or [])]
+        except (TypeError, ValueError):
+            continue
+
+        if len(elevations) < 2:
+            continue
+
+        smoothed = smooth_elevations(
+            elevations,
+            radius=ELEVATION_SMOOTHING_RADIUS,
+        )
+        ascent_m, descent_m = calculate_ascent_descent(smoothed)
+        data["ascent_m"] = float(ascent_m)
+        data["descent_m"] = float(descent_m)
+        refreshed += 1
+
+    G.graph["elevation_processing_version"] = ELEVATION_PROCESSING_VERSION
+    G.graph["elevation_smoothing_radius"] = int(ELEVATION_SMOOTHING_RADIUS)
+    G.graph["elevation_gain_threshold_m"] = float(ELEVATION_GAIN_THRESHOLD_M)
+    G.graph["elevation_metrics_refreshed_edges"] = int(refreshed)
+    return G
 
 
 def dem_value_to_meters(src, value):
@@ -2335,6 +2441,7 @@ def try_load_saved_master_graph():
             with open(MASTER_GRAPH_PICKLE_PATH, "rb") as f:
                 G = pickle.load(f)
             if _validate_offline_master_graph(G):
+                G = refresh_precomputed_elevation_metrics(G)
                 G.graph["master_loaded_source"] = MASTER_GRAPH_PICKLE_PATH
                 return G
         except Exception:
@@ -2344,6 +2451,7 @@ def try_load_saved_master_graph():
         try:
             G = ox.io.load_graphml(filepath=MASTER_GRAPH_GRAPHML_PATH)
             if _validate_offline_master_graph(G):
+                G = refresh_precomputed_elevation_metrics(G)
                 G.graph["master_loaded_source"] = MASTER_GRAPH_GRAPHML_PATH
                 # Best-effort local binary cache. It is not required in Git.
                 try:
@@ -2715,6 +2823,8 @@ def build_master_trail_graph(local_source_graph=None):
     G.graph["master_elevation_unique_samples"] = int(unique_samples)
     G.graph["master_elevation_spacing_m"] = float(ELEVATION_SAMPLE_SPACING_M)
     G.graph["master_elevation_smoothing_radius"] = int(ELEVATION_SMOOTHING_RADIUS)
+    G.graph["elevation_processing_version"] = ELEVATION_PROCESSING_VERSION
+    G.graph["elevation_gain_threshold_m"] = float(ELEVATION_GAIN_THRESHOLD_M)
     G.graph["local_osm_source"] = os.path.basename(LOCAL_OSM_PBF_PATH)
     G.graph["overpass_used"] = "0"
 
@@ -2791,7 +2901,7 @@ def _validate_offline_routing_graph(G):
 
 
 def _normalize_loaded_routing_graph(G):
-    """Normalize numeric edge attributes once when the runtime graph loads."""
+    """Normalize edge attributes and apply the current elevation algorithm."""
     for _, _, _, data in G.edges(keys=True, data=True):
         data["length"] = float(data.get("length", 0) or 0)
         data["ascent_m"] = float(data.get("ascent_m", 0) or 0)
@@ -2800,7 +2910,7 @@ def _normalize_loaded_routing_graph(G):
             float(data.get("elevation_sample_count", 0) or 0)
         )
         data["routing_cost"] = float(edge_routing_cost(data))
-    return G
+    return refresh_precomputed_elevation_metrics(G)
 
 
 def try_load_saved_routing_graph():
@@ -3242,7 +3352,7 @@ def _load_routing_tile_uncached(row):
         # OSMnx graphs are MultiDiGraph. Converting here keeps the runtime API
         # consistent if an older builder emitted another NetworkX graph class.
         G = nx.MultiDiGraph(G)
-    return G
+    return _normalize_loaded_routing_graph(G)
 
 
 def load_routing_tile(row):
@@ -7859,6 +7969,8 @@ async def analyze_gpx(
             "elevation_sample_spacing_m": ELEVATION_SAMPLE_SPACING_M,
             "elevation_smoothing_window_points": 2 * ELEVATION_SMOOTHING_RADIUS + 1,
             "elevation_smoothing_distance_m": (2 * ELEVATION_SMOOTHING_RADIUS + 1) * ELEVATION_SAMPLE_SPACING_M,
+            "elevation_gain_threshold_m": ELEVATION_GAIN_THRESHOLD_M,
+            "elevation_processing_version": ELEVATION_PROCESSING_VERSION,
             "elevation_source": os.path.basename(DEM_PATH),
             "version": APP_VERSION,
             "route": [
@@ -9298,6 +9410,8 @@ def generate_route(request: RouteRequest):
             "elevation_sample_spacing_m": ELEVATION_SAMPLE_SPACING_M,
             "elevation_smoothing_window_points": 2 * ELEVATION_SMOOTHING_RADIUS + 1,
             "elevation_smoothing_distance_m": (2 * ELEVATION_SMOOTHING_RADIUS + 1) * ELEVATION_SAMPLE_SPACING_M,
+            "elevation_gain_threshold_m": ELEVATION_GAIN_THRESHOLD_M,
+            "elevation_processing_version": ELEVATION_PROCESSING_VERSION,
             "elevation_source": os.path.basename(DEM_PATH),
             "route_elevation_sample_count": metrics.get("route_elevation_sample_count"),
             "partial_edge_used": metrics.get("partial_edge_used", False),
